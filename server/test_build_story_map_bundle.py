@@ -423,6 +423,13 @@ class StoryMapBundleTests(unittest.TestCase):
             self.assertEqual(profile["output"], str((out_dir / "field_geometry.parquet").resolve()))
             self.assertEqual(profile["valid_geometry_coverage"], 1.0)
             self.assertEqual(profile["frame_geometry_coverage"], 1.0)
+            manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(manifest["run"]["viewer_ready"])
+            self.assertEqual(manifest["outputs"]["frame_fields"], "frame_fields.parquet")
+            self.assertEqual(manifest["outputs"]["field_geometry"], "field_geometry.parquet")
+            self.assertTrue(
+                all((out_dir / name).is_file() for name in manifest["outputs"].values())
+            )
 
 
 if __name__ == "__main__":

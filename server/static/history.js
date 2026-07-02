@@ -4,6 +4,10 @@ export function historySupported(manifest) {
   return manifest?.server?.optimized_geometry !== false;
 }
 
+export function shouldLoadHistory(manifest, filters, checked) {
+  return Boolean(checked && historySupported(manifest) && Object.keys(filters || {}).length > 0);
+}
+
 export function unavailableHistory() {
   return {
     type: "FeatureCollection",

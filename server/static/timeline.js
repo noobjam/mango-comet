@@ -8,11 +8,15 @@ export class TimelineController {
     this.playing = false;
     this.timer = null;
     this.inputTimer = null;
+    this.reducedMotion = Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
     this.elements = Object.fromEntries([
       "timelineSlider", "timelineLabel", "timelineHistogram", "timelineStart", "timelineEnd",
       "frameStats", "playTimeline", "playbackSpeed", "previousBucket", "nextBucket",
     ].map((id) => [id, document.getElementById(id)]));
     this.bind();
+    if (this.reducedMotion) {
+      this.elements.playTimeline.title = "Reduced-motion mode: playback uses discrete, slower frame changes.";
+    }
   }
 
   bind() {
@@ -138,6 +142,7 @@ export class TimelineController {
   schedule(delay = Number(this.elements.playbackSpeed.value || 1000)) {
     window.clearTimeout(this.timer);
     if (!this.playing) return;
+    const effectiveDelay = this.reducedMotion ? Math.max(1600, delay) : delay;
     this.timer = window.setTimeout(async () => {
       const next = (this.pendingIndex + 1) % this.buckets.length;
       this.select(next);
@@ -146,7 +151,7 @@ export class TimelineController {
       } finally {
         if (this.playing) this.schedule();
       }
-    }, delay);
+    }, effectiveDelay);
   }
 }
 

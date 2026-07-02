@@ -1,24 +1,36 @@
-import { ApiClient, isAbortError, withQuery } from "./api.js";
+import { ApiClient, isAbortError, isUnsupportedError, withQuery } from "./api.js";
 import { computeActivityStats } from "./activity.js";
+import { EvolutionController } from "./evolution-controller.js";
 import { FilterController } from "./filters.js";
-import { historySupported, loadHistory } from "./history.js";
+import { FrameDataLoader } from "./frame-data.js";
+import { historySupported, loadHistory, shouldLoadHistory, unavailableHistory } from "./history.js";
 import { Inspector } from "./inspector.js";
 import { MapView } from "./map-view.js";
 import { legendEntries } from "./palette.js";
 import { TimelineController } from "./timeline.js";
 const api = new ApiClient({ cacheLimit: 24 });
+const frameData = new FrameDataLoader(api);
 const inspector = new Inspector();
 const ui = elementMap([
   "runSummary", "loadingStatus", "loadingStatusText", "colorMode", "showHistory", "legend",
   "affectedCount", "enteringCount", "persistingCount", "inactiveCount", "activityScope",
   "panelToggle", "panelClose", "explorerPanel", "familyColorOption", "historyLabel",
+  "evolutionSection", "evolutionSummary", "evolutionStatus", "runMode", "explorerMode",
 ]);
+const evolutionController = new EvolutionController(api, {
+  section: ui.evolutionSection,
+  summary: ui.evolutionSummary,
+  status: ui.evolutionStatus,
+});
 const state = {
   manifest: null, map: null, filters: null, timeline: null, frame: null, trail: null,
   generation: 0,
   filterGeneration: 0,
+  selectionGeneration: 0,
+  selectionBucket: "",
   viewportTimer: null,
   lastRequestKey: "",
+  evolution: null,
 };
 
 boot().catch((error) => fail(error, "The story explorer could not start"));
@@ -33,6 +45,7 @@ async function boot() {
     getActivity({}),
   ]);
   state.manifest = manifest;
+  if (manifest.server?.optimized_geometry === false) frameData.compactSupported = false;
   state.filters = new FilterController({ onChange: filtersChanged, onSearch: searchStories });
   state.filters.setData(motifData);
   if (motifData.taxonomy?.source === "hazard_signature_fallback") {
@@ -65,7 +78,10 @@ function bindUi() {
   });
   ui.showHistory.addEventListener("change", () => {
     const hasFilters = Object.keys(state.filters.filters()).length > 0;
-    state.map.setHistoryVisible(historySupported(state.manifest) && hasFilters && ui.showHistory.checked);
+    const visible = historySupported(state.manifest) && hasFilters && ui.showHistory.checked;
+    state.map.setHistoryVisible(visible);
+    if (!visible) api.abort("trail");
+    loadFrame({ force: true });
   });
   ui.panelToggle.addEventListener("click", () => togglePanel(true));
   ui.panelClose.addEventListener("click", () => togglePanel(false));
@@ -79,8 +95,21 @@ function bindUi() {
 
 async function filtersChanged(filters) {
   const generation = ++state.filterGeneration;
+  state.generation += 1;
+  state.selectionGeneration += 1;
+  state.selectionBucket = "";
+  state.lastRequestKey = "";
+  frameData.api.abortPrefix("frame-data:");
+  api.abort("trail");
+  api.abort("field-events");
+  api.abort("field-trajectory");
+  state.map?.setSelectedField("");
+  inspector.clear("Select a field matching the new filters to inspect its event lanes.");
+  state.evolution = null;
+  state.map?.setEvolution(null, "");
   state.timeline.stop();
   setStatus("Updating retrospective", "loading");
+  refreshEvolution(filters, generation);
   try {
     const activity = await getActivity(filters);
     if (generation !== state.filterGeneration) return;
@@ -125,7 +154,8 @@ async function loadFrame({ force = false } = {}) {
   const query = { ...filters, bbox };
   const frameUrl = withQuery(`/api/frame/${encodeURIComponent(bucket.timeline_bucket)}`, query);
   const trailUrl = withQuery("/api/trail", { ...query, bucket: bucket.timeline_bucket, lookback: 5 });
-  const requestKey = `${frameUrl}|${trailUrl}`;
+  const wantsHistory = shouldLoadHistory(state.manifest, filters, ui.showHistory.checked);
+  const requestKey = `${frameUrl}|history:${wantsHistory}`;
   if (!force && requestKey === state.lastRequestKey) return;
   state.lastRequestKey = requestKey;
   const generation = ++state.generation;
@@ -133,14 +163,18 @@ async function loadFrame({ force = false } = {}) {
   setStatus(`Loading ${bucket.timeline_bucket}`, "loading");
   try {
     const [frame, trail] = await Promise.all([
-      api.get(frameUrl, { channel: "frame", cache: true }),
-      loadHistory(state.manifest, () => api.get(trailUrl, { channel: "trail", cache: true })),
+      frameData.load({ bucket: bucket.timeline_bucket, query, legacyUrl: frameUrl }),
+      wantsHistory
+        ? loadHistory(state.manifest, () => api.get(trailUrl, { channel: "trail", cache: true }))
+        : Promise.resolve(unavailableHistory()),
     ]);
     if (generation !== state.generation || requestedIndex !== state.timeline.pendingIndex) return;
     state.frame = frame;
     state.trail = trail;
-    state.map.setData(frame, trail);
+    state.map.setData(frame, trail, state.evolution, bucket.timeline_bucket);
     renderActivityStats(frame, trail);
+    evolutionController.render(filters, state.evolution, bucket.timeline_bucket);
+    refreshEvolution(filters, state.filterGeneration);
     renderLegend();
     const count = Number(frame.meta?.feature_count ?? frame.features?.length ?? 0);
     const stories = Number(frame.meta?.motif_count ?? frame.meta?.story_cluster_count ?? 0);
@@ -150,8 +184,14 @@ async function loadFrame({ force = false } = {}) {
     const capNote = capNotes.length ? ` · ${capNotes.join(" + ")} to protect rendering` : "";
     state.timeline.commit(
       requestedIndex,
-      `${count.toLocaleString()} visible fields · ${stories.toLocaleString()} exact stories${capNote}`
+      `${count.toLocaleString()} visible fields · ${stories.toLocaleString()} ${state.manifest.run?.motif_count ? "motifs" : "exact signatures"}${capNote}`
     );
+    if (state.selectionBucket && state.selectionBucket !== bucket.timeline_bucket) {
+      state.selectionGeneration += 1;
+      state.selectionBucket = "";
+      state.map.setSelectedField("");
+      inspector.clear("Select a field to inspect this week’s concurrent event lanes.");
+    }
     setStatus(count ? "Map is current" : "No matching fields", "ready");
     prefetchAdjacent(filters, bbox);
   } catch (error) {
@@ -179,13 +219,44 @@ function viewportChanged() {
 async function selectField(properties) {
   if (!properties?.field_id) return;
   state.map.setSelectedField(properties.field_id);
+  state.selectionBucket = String(properties.timeline_bucket || "");
+  const selectionGeneration = ++state.selectionGeneration;
   inspector.loading(properties);
   togglePanel(true);
   try {
-    const payload = await api.get(`/api/field/${encodeURIComponent(properties.field_id)}/events?limit=12`, { channel: "field" });
-    inspector.showSelection(properties, payload.events || []);
+    const fieldId = encodeURIComponent(properties.field_id);
+    const [eventsResult, trajectoryResult] = await Promise.allSettled([
+      api.get(`/api/field/${fieldId}/events?limit=12`, { channel: "field-events" }),
+      api.get(`/api/field/${fieldId}/trajectory?limit=250`, { channel: "field-trajectory" })
+        .catch((error) => isUnsupportedError(error) ? { states: [] } : Promise.reject(error)),
+    ]);
+    if (selectionGeneration !== state.selectionGeneration) return;
+    if (eventsResult.status === "rejected" && trajectoryResult.status === "rejected") {
+      throw eventsResult.reason;
+    }
+    const payload = eventsResult.status === "fulfilled" ? eventsResult.value : { events: [] };
+    const trajectory = trajectoryResult.status === "fulfilled" ? trajectoryResult.value : { states: [] };
+    inspector.showSelection(properties, payload.events || [], trajectory.states || [], {
+      eventsError: eventsResult.status === "rejected" ? eventsResult.reason : null,
+      trajectoryError: trajectoryResult.status === "rejected" ? trajectoryResult.reason : null,
+    });
   } catch (error) {
     if (!isAbortError(error)) inspector.showError(properties, error);
+  }
+}
+
+async function refreshEvolution(filters, filterGeneration) {
+  try {
+    const pending = evolutionController.load(filters);
+    evolutionController.render(filters, state.evolution, state.timeline?.currentBucket()?.timeline_bucket);
+    const payload = await pending;
+    if (filterGeneration !== state.filterGeneration) return;
+    state.evolution = payload;
+    const bucket = state.timeline?.currentBucket()?.timeline_bucket || "";
+    state.map?.setEvolution(payload, bucket);
+    evolutionController.render(filters, payload, bucket);
+  } catch (error) {
+    if (!isAbortError(error)) console.warn("Could not load aggregate evolution", error);
   }
 }
 
@@ -195,7 +266,9 @@ function renderActivityStats(frame, trail) {
   ui.enteringCount.textContent = formatCount(stats.entering);
   ui.persistingCount.textContent = formatCount(stats.persisting);
   ui.inactiveCount.textContent = formatCount(stats.inactive);
-  ui.activityScope.textContent = frame.meta?.bbox ? "Current viewport" : "All mapped fields";
+  ui.activityScope.textContent = frame.meta?.bbox || frame.meta?.bbox_applied
+    ? "Current viewport"
+    : "All mapped fields";
 }
 
 function renderLegend() {
@@ -216,19 +289,28 @@ function renderSummary() {
   const geometry = state.manifest.map_geometry || {};
   const motifCount = Number(run.motif_count || 0);
   const taxonomySummary = motifCount
-    ? `${motifCount.toLocaleString()} product motifs`
+    ? `${motifCount.toLocaleString()} discovered motifs (unreviewed)`
     : `${Number(run.story_cluster_count || 0).toLocaleString()} exact signatures`;
   ui.runSummary.textContent = [
     `${Number(run.event_count || 0).toLocaleString()} event windows`,
     taxonomySummary,
     `${Number(geometry.mappable_event_field_count || geometry.mappable_selected_field_count || 0).toLocaleString()} mapped fields`,
   ].join(" · ");
+  const causalSnapshot = Boolean(run.generation_id);
+  ui.runMode.textContent = causalSnapshot ? "Causal snapshot" : "Retrospective";
+  ui.runMode.classList.toggle("is-causal", causalSnapshot);
+  ui.explorerMode.textContent = causalSnapshot ? "As-of story snapshot" : "Retrospective explorer";
 }
 
 function prefetchAdjacent(filters, bbox) {
   const next = state.timeline.buckets[state.timeline.pendingIndex + 1];
   if (!next) return;
-  api.preload(withQuery(`/api/frame/${encodeURIComponent(next.timeline_bucket)}`, { ...filters, bbox }));
+  const query = { ...filters, bbox };
+  frameData.preload({
+    bucket: next.timeline_bucket,
+    query,
+    legacyUrl: withQuery(`/api/frame/${encodeURIComponent(next.timeline_bucket)}`, query),
+  });
 }
 
 function setStatus(message, kind) {

@@ -6,24 +6,25 @@ artifacts with DuckDB.
 
 ## Interpretation
 
-Two related identifiers may be present:
+Three related identifiers may be present:
 
 - An exact story cluster is a deterministic audit fingerprint of an event's
   encoded sequence. It is useful for traceability, but is usually too granular
   for a product legend.
-- A motif is a coarser deterministic taxonomy, with a motif family above it,
-  intended for review, filtering, and reusable narration. These are rule-based
-  archetypes, not clusters learned from validated outcomes.
+- Older motif runs contain a coarser deterministic taxonomy. New monitor runs
+  can instead contain HDBSCAN-discovered causal prefix motifs, frozen into a
+  versioned prototype/radius model with an explicit `novel_unassigned` result.
+- An event ID identifies one field episode. It is not a cluster ID.
 
 Crop is retained as event metadata rather than forced into the cross-crop key.
 That design permits cross-crop motifs; it does not by itself prove that a motif
 generalizes across crops.
 
-Important: the currently generated event and motif artifacts summarize complete
-observed events. They are retrospective and are not causal, day-by-day story
-prefixes. The map therefore shows retrospective story activity and historical
-field footprints. Weekly counts summarize matching fields; they do not imply
-physical movement or an inferred trajectory.
+Important: legacy runs summarize complete observed events and remain
+retrospective. Generations built by `weekly_story_monitor.py` instead publish
+causal weekly event prefixes. The viewer exposes the active generation's mode;
+it must never project a complete-event label backward. Weekly footprints and
+aggregate centers do not imply physical movement or propagation.
 
 ### Council concept audit
 
@@ -45,6 +46,151 @@ and crops, agronomist agreement, and useful outcome separation. A live product
 would also need prefix-safe identities that use only evidence available by the
 selected date.
 
+The new `weekly_story_monitor.py` path provides those causal prefixes for
+ordinary append-only updates. Its starter thresholds and discovered motifs are
+still uncalibrated and require agronomist/outcome validation. Read
+[`MONITORING_STORIES.md`](MONITORING_STORIES.md) before presenting the method.
+
+## Build monitoring data on the VM
+
+Use the echo-aware deliverable and the matching geometry:
+
+```bash
+DATA=/mnt/KSA-Oasis/fields_health_v2/rwanda_crop_risk_kb/final_field_daily_v4/rwanda_2025_2026_field_daily_risk_DELIVERABLE_WITH_CROP_AND_RISK_DRIVER_v4_WITH_SPECTRAL_ECHO_DAYS.parquet
+GEOM=/mnt/KSA-Oasis/fields_health_v2/spatial/rwanda_2025_v3_deliverable_field_geometries_with_admin_hierarchy.parquet
+ROOT=/mnt/KSA-Oasis/fields_health_v2/clusters/runs/weekly_monitor_v1
+AS_OF=2026-05-17
+```
+
+Run a bounded acceptance test first:
+
+```bash
+python server/weekly_story_monitor.py update \
+  --input-parquet "$DATA" \
+  --geometry-parquet "$GEOM" \
+  --output-dir "$ROOT/smoke" \
+  --as-of "$AS_OF" \
+  --max-fields 500 \
+  --threads 8
+```
+
+For all fields, DuckDB scans the source once into deterministic field-hash
+partitions. Workers load bounded partitions rather than the complete 39.7M rows
+into one DataFrame:
+
+```bash
+mkdir -p "$ROOT/duckdb_tmp"
+
+UPDATE_RESULT=$(python server/weekly_story_monitor.py update \
+  --input-parquet "$DATA" \
+  --geometry-parquet "$GEOM" \
+  --output-dir "$ROOT" \
+  --as-of "$AS_OF" \
+  --partitions 128 \
+  --workers 8 \
+  --threads 32 \
+  --memory-limit 96GB \
+  --temp-dir "$ROOT/duckdb_tmp")
+
+printf '%s\n' "$UPDATE_RESULT"
+GEN=$(printf '%s' "$UPDATE_RESULT" | python -c 'import json,sys; print(json.load(sys.stdin)["generation"]["generation_dir"])')
+test -n "$GEN"
+test -d "$GEN"
+echo "$GEN"
+```
+
+That generation already contains causal weekly snapshots. Do not rescan the
+full source once per historical week; `replay` is intended for bounded
+acceptance fixtures.
+
+This command is an immutable batch update, not a continuously mutating stream.
+For each new weekly delivery, build a new generation, run validation, export
+with the same frozen motif model, build a new bundle, then promote that release
+and restart the service. The browser does not poll for a new generation. The
+current full update also rescans and repartitions retained history; a persistent
+incremental event registry and automatic late-correction lineage remain future
+production work.
+
+Discover motifs on 2025 prefixes, leaving 2026 available for validation. One
+H100 is enough for the initial hazard-stratified discovery:
+
+```bash
+MODEL="$ROOT/models/motif_v1_train_2025"
+
+CUDA_VISIBLE_DEVICES=0 python server/weekly_story_monitor.py train-motifs \
+  --generation-dir "$GEN" \
+  --training-through 2025-12-31 \
+  --model-dir "$MODEL" \
+  --engine gpu \
+  --min-cluster-size 100 \
+  --min-samples 20 \
+  --radius-quantile 0.95 \
+  --assignment-margin 0.05
+```
+
+The cutoff is applied to source observation dates, and only fully completed
+Monday-Sunday buckets are admitted. Therefore `2025-12-31` safely ends on the
+week of `2025-12-22`; the partial `2025-12-29` week is excluded rather than
+borrowing January 2026 evidence. Concurrent hazards use event-specific daily
+pressure/response columns, so one field's heat event cannot inherit its drought
+event's pressure signal.
+
+Use `--engine cpu` when RAPIDS is unavailable or for a canonical
+reproducibility run. In either case, weekly assignment uses the frozen model;
+it does not recluster as new weeks arrive.
+
+Export motif assignments and build the geometry-optimized bundle used by the
+app:
+
+```bash
+MOTIF_RUN="$ROOT/releases/${AS_OF}_motifs"
+BUNDLE="$ROOT/releases/${AS_OF}_bundle"
+
+python server/weekly_story_monitor.py export-motifs \
+  --generation-dir "$GEN" \
+  --model-dir "$MODEL" \
+  --output-dir "$MOTIF_RUN"
+
+python server/build_story_map_bundle.py \
+  --run-dir "$MOTIF_RUN" \
+  --out-dir "$BUNDLE"
+```
+
+Use this `.env` block for that release:
+
+```dotenv
+STORY_MAP_RUN_DIR=/mnt/KSA-Oasis/fields_health_v2/clusters/runs/weekly_monitor_v1/releases/2026-05-17_bundle
+STORY_MAP_STATIC_DIR=./static
+STORY_MAP_HOST=127.0.0.1
+STORY_MAP_PORT=8877
+STORY_MAP_LOG_LEVEL=INFO
+STORY_MAP_RASTER_TILES=https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}
+STORY_MAP_RASTER_ATTRIBUTION=Tiles (C) Esri, Maxar, Earthstar Geographics, and the GIS User Community
+STORY_MAP_DEFAULT_FEATURE_LIMIT=5000
+STORY_MAP_MAX_FEATURE_LIMIT=20000
+STORY_MAP_CACHE_SECONDS=300
+STORY_MAP_CACHE_ENTRIES=256
+STORY_MAP_QUERY_CONCURRENCY=8
+STORY_MAP_GZIP_MIN_BYTES=1024
+```
+
+After starting the server, measure the real VM rather than guessing:
+
+```bash
+python server/benchmark_timeline.py \
+  --base-url http://127.0.0.1:8877 \
+  --weeks 20 \
+  --output "$ROOT/timeline_benchmark.json"
+```
+
+The acceptance gate is subsequent-week p95 below 300 ms and at least 70% fewer
+compressed bytes than geometry-every-frame playback.
+
+The development fixture measured 76% fewer compressed timeline bytes after
+splitting static geometry from dynamic state. That is evidence for the transport
+design, not a VM acceptance result; record the VM benchmark before presenting a
+latency number.
+
 ## Artifacts
 
 The legacy exact-story path reads:
@@ -58,6 +204,11 @@ The legacy exact-story path reads:
 
 A newer motif run can additionally contain:
 
+- `daily_causal_signals.parquet`
+- `crop_instances.parquet`
+- `event_state_snapshots.parquet` (generation-local records; no automatic
+  cross-generation supersession lineage yet)
+- `motif_assignments.parquet` and `motif_catalog.parquet`
 - `event_motif_membership.parquet`
 - `field_motif_timeline.parquet`
 - `story_motifs.parquet`
@@ -136,9 +287,15 @@ errors, but a generation-directory switch is the safe deployment boundary.
 Useful endpoints include:
 
 - `GET /api/timeline` for available reporting buckets.
-- `GET /api/motifs` for mappable exact-story labels and situation facets.
+- `GET /api/motifs` for mappable exact-story labels and situation facets,
+  including the live `current_risk_band` facet (peak risk remains audit context).
 - `GET /api/frame/<bucket>?bbox=minLon,minLat,maxLon,maxLat&limit=N` for field
   GeoJSON in the current viewport.
+- `GET /api/frame-state/<bucket>?bbox=...` for one canonical, highest-urgency
+  state per field without geometry, coordinates, or static administration
+  fields. `concurrent_event_count` flags additional same-week event lanes.
+- `POST /api/geometry` for at most 2,000 missing field geometries, pinned to an
+  immutable geometry version and cached across dates by the browser.
 - `GET /api/activity?...filters` for non-spatial retrospective counts per
   active bucket. It contains no representative point or traveled path.
 - `GET /api/trail?bucket=YYYY-MM-DD&lookback=5&limit=N&...filters` for bounded
@@ -146,6 +303,14 @@ Useful endpoints include:
   after choosing an exact story or shared-evidence filter. It requires the
   optimized bundle geometry; the raw-run UI disables history while keeping
   current-frame filtering available.
+- `GET /api/evolution?...filters` for a selected motif/signature's spherical
+  activity center, p50/p90 dispersion, field-set overlap, and explicit segment
+  breaks across the full mapped extent. It is serialized and loaded outside the
+  frame critical path. It is an aggregate footprint summary, not physical
+  movement.
+- `GET /api/field/<field_id>/trajectory` for causal weekly event-prefix states
+  when monitoring snapshots are present. Concurrent hazards remain separate
+  event/hazard lanes rather than being drawn as one sequential story.
 
 Use `bbox` and a finite `limit` for interactive requests. Unbounded GeoJSON is
 acceptable for small development samples only: parsing every polygon on every

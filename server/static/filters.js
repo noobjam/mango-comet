@@ -1,6 +1,6 @@
 const FACETS = [
   ["familyFilter", "motif_family", "All families"],
-  ["riskFilter", "max_risk_band", "All risks"],
+  ["riskFilter", "current_risk_band", "All current risks"],
   ["hazardFilter", "hazard_signature", "All hazards"],
   ["responseFilter", "response_signature", "All responses"],
 ];
@@ -136,7 +136,7 @@ export class FilterController {
     const filters = this.filters();
     card.replaceChildren();
     const kicker = element("div", "story-card-kicker", this.mode === "exact" ? "Exact story" : "Similar situations");
-    let title = "Every active story in the selected week";
+    let title = "Every story state in the selected week";
     let text = "Choose shared evidence or an exact story to narrow the retrospective.";
     const chips = [];
     if (this.mode === "exact" && !story) {

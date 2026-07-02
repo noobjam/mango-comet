@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -22,6 +23,50 @@ import duckdb
 
 
 LOGGER = logging.getLogger("story_map_server")
+
+MAX_GEOMETRY_IDS = 2000
+MAX_GEOMETRY_REQUEST_BYTES = 256 * 1024
+
+FRAME_STATE_FIELDS = (
+    "timeline_bucket",
+    "field_id",
+    "story_cluster_id",
+    "event_id",
+    "event_state",
+    "motif_id",
+    "max_risk_band",
+    "current_risk_band",
+    "hazard_signature",
+    "response_signature",
+    "reportable_day_count",
+    "event_count",
+    "max_risk_rank",
+    "current_risk_rank",
+    "response_day_count",
+    "motif_family",
+    "short_label",
+    "assignment_distance",
+    "distance_ratio",
+    "assignment_reason",
+    "motif_model_version",
+    "concurrent_event_count",
+)
+
+FRAME_STATE_META_FIELDS = (
+    "timeline_bucket",
+    "source_row_count",
+    "query_row_count",
+    "story_cluster_count",
+    "reportable_day_count",
+    "event_count",
+    "limit",
+    "requested_limit",
+    "unlimited",
+    "limit_hit",
+    "truncated",
+    "optimized_geometry",
+    "filters",
+)
 
 STORY_PALETTE = [
     "#2563eb",
@@ -54,6 +99,10 @@ MOTIF_FAMILY_TAXONOMY = [
 
 PUBLIC_MANIFEST_SECTIONS = {
     "run",
+    "policy",
+    "semantics",
+    "motifs",
+    "limitations",
     "event_window_rules",
     "parameters",
     "eligibility",
@@ -86,6 +135,14 @@ class RequestValidationError(ValueError):
 
 class ServerBusyError(RuntimeError):
     """The bounded query executor has no immediately available capacity."""
+
+
+class GeometryVersionMismatchError(RuntimeError):
+    """The client requested geometry from a different immutable artifact."""
+
+
+class RequestBodyTooLargeError(RuntimeError):
+    """A public request exceeded an explicitly bounded request size."""
 
 
 @dataclass(frozen=True)
@@ -204,6 +261,7 @@ class StoryMapStore:
         self.labels_path = self._pick("cluster_labels.parquet", "event_story_cluster_labels.parquet")
         self.events_path = self._pick("event_windows.parquet")
         self.story_days_path = self._pick("story_day_membership.parquet")
+        self.state_snapshots_path = self.run_dir / "event_state_snapshots.parquet"
         self.manifest_path = self._pick("manifest.json")
         self.timeline_summary_path = self.run_dir / "gpu_summaries" / "timeline_summary.parquet"
         self.frame_columns = self._parquet_columns(self.frame_path)
@@ -276,6 +334,16 @@ class StoryMapStore:
             fallback = _hazard_family_sql(f"{alias}.hazard_signature")
             return f"COALESCE(NULLIF(TRIM(CAST({alias}.motif_family AS VARCHAR)), ''), {fallback})"
         return _hazard_family_sql(f"{alias}.hazard_signature")
+
+    def _optional_frame_sql(self, alias: str, name: str, fallback: str = "NULL") -> str:
+        return f"{alias}.{name} AS {name}" if name in self.frame_columns else f"{fallback} AS {name}"
+
+    def _effective_frame_filters(self, filters: dict[str, str] | None) -> dict[str, str]:
+        """Map the live-risk filter to old bundles without changing new semantics."""
+        clean = _clean_filters(filters)
+        if "current_risk_band" in clean and "current_risk_band" not in self.frame_columns:
+            clean["max_risk_band"] = clean.pop("current_risk_band")
+        return clean
 
     def motif_taxonomy(self) -> dict[str, Any]:
         return {
@@ -470,7 +538,7 @@ class StoryMapStore:
         started = time.perf_counter()
         requested_limit = limit
         effective_limit = _feature_limit(limit, self.settings.max_feature_limit)
-        filters = _clean_filters(filters)
+        filters = self._effective_frame_filters(filters)
         optimized = self._has_optimized_geometry()
         python_bbox_filter = bool(bbox and not optimized)
         bbox_clause = ""
@@ -488,7 +556,6 @@ class StoryMapStore:
         if self.labels_path.exists():
             label_join = "LEFT JOIN read_parquet(?) AS l USING (story_cluster_id)"
             label_select = "l.short_label"
-
         geometry_select = (
             "g.geometry_geojson, 'geojson' AS geometry_format, "
             "g.min_lon, g.min_lat, g.max_lon, g.max_lat, g.centroid_lon, g.centroid_lat"
@@ -496,12 +563,42 @@ class StoryMapStore:
             else "g.geometry_text, g.geometry_format, NULL AS min_lon, NULL AS min_lat, "
             "NULL AS max_lon, NULL AS max_lat, NULL AS centroid_lon, NULL AS centroid_lat"
         )
+        optional_frame_select = ",\n                ".join(
+            self._optional_frame_sql("f", name, fallback)
+            for name, fallback in (
+                ("event_id", "NULL"),
+                ("event_state", "NULL"),
+                ("motif_id", "NULL"),
+                ("current_risk_band", "f.max_risk_band"),
+                ("current_risk_rank", "f.max_risk_rank"),
+                ("assignment_distance", "NULL"),
+                ("distance_ratio", "NULL"),
+                ("assignment_reason", "NULL"),
+                ("motif_model_version", "NULL"),
+            )
+        )
+        current_rank_sql = (
+            "COALESCE(TRY_CAST(f.current_risk_rank AS INTEGER), "
+            "TRY_CAST(f.max_risk_rank AS INTEGER), 0)"
+            if "current_risk_rank" in self.frame_columns
+            else "COALESCE(TRY_CAST(f.max_risk_rank AS INTEGER), 0)"
+        )
+        state_sql = (
+            "UPPER(COALESCE(CAST(f.event_state AS VARCHAR), ''))"
+            if "event_state" in self.frame_columns
+            else "''"
+        )
+        state_priority_sql = f"""CASE {state_sql}
+            WHEN 'SEVERE' THEN 6 WHEN 'ACTIVE' THEN 5 WHEN 'WATCH' THEN 4
+            WHEN 'RECOVERING' THEN 3 WHEN 'QUIET_PENDING' THEN 2
+            WHEN 'DATA_GAP' THEN 1 ELSE 0 END"""
 
         sql = f"""
             SELECT
                 f.timeline_bucket,
                 f.field_id,
                 f.story_cluster_id,
+                {optional_frame_select},
                 f.max_risk_band,
                 f.hazard_signature,
                 f.response_signature,
@@ -516,17 +613,25 @@ class StoryMapStore:
                 g.cell,
                 g.village,
                 {geometry_select},
-                COUNT(*) OVER () AS _source_row_count,
+                COUNT(DISTINCT f.field_id) OVER () AS _source_row_count,
                 COUNT(DISTINCT f.story_cluster_id) OVER () AS _source_story_cluster_count,
                 SUM(f.reportable_day_count) OVER () AS _source_reportable_day_count,
-                SUM(f.event_count) OVER () AS _source_event_count
+                SUM(f.event_count) OVER () AS _source_event_count,
+                COUNT(*) OVER (PARTITION BY f.field_id) AS concurrent_event_count
             FROM read_parquet(?) AS f
             JOIN read_parquet(?) AS g USING (field_id)
             {label_join}
             WHERE f.timeline_bucket = ?
             {filter_clause}
             {bbox_clause}
-            ORDER BY f.max_risk_rank DESC, f.reportable_day_count DESC, f.field_id
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY f.field_id
+                ORDER BY {state_priority_sql} DESC, {current_rank_sql} DESC,
+                    f.max_risk_rank DESC, f.reportable_day_count DESC,
+                    CAST(f.story_cluster_id AS VARCHAR)
+            ) = 1
+            ORDER BY {state_priority_sql} DESC, {current_rank_sql} DESC,
+                f.reportable_day_count DESC, f.field_id
         """
         params: list[Any] = [str(self.frame_path), str(self.geometry_path)]
         if self.labels_path.exists():
@@ -599,15 +704,25 @@ class StoryMapStore:
                     "timeline_bucket",
                     "field_id",
                     "story_cluster_id",
+                    "event_id",
+                    "event_state",
+                    "motif_id",
                     "max_risk_band",
+                    "current_risk_band",
                     "hazard_signature",
                     "response_signature",
                     "reportable_day_count",
                     "event_count",
                     "max_risk_rank",
+                    "current_risk_rank",
                     "response_day_count",
                     "motif_family",
                     "short_label",
+                    "assignment_distance",
+                    "distance_ratio",
+                    "assignment_reason",
+                    "motif_model_version",
+                    "concurrent_event_count",
                     "district",
                     "sector",
                     "cell",
@@ -699,11 +814,333 @@ class StoryMapStore:
             "meta": meta,
         }
 
+    def geometry_version(self) -> str:
+        """Return a content-derived version for the immutable geometry artifact."""
+        stat = self.geometry_path.stat()
+        return _geometry_artifact_version(
+            str(self.geometry_path),
+            stat.st_size,
+            stat.st_mtime_ns,
+        )
+
+    def frame_state(
+        self,
+        *,
+        timeline_bucket: str,
+        bbox: tuple[float, float, float, float] | None,
+        limit: int,
+        filters: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Return dynamic field state without retransmitting static geometry."""
+        self.require_ready()
+        if not self._has_optimized_geometry():
+            return self._raw_frame_state(
+                timeline_bucket=timeline_bucket,
+                bbox=bbox,
+                limit=limit,
+                filters=filters,
+            )
+
+        started = time.perf_counter()
+        requested_limit = limit
+        effective_limit = _feature_limit(limit, self.settings.max_feature_limit)
+        filters = self._effective_frame_filters(filters)
+        motif_family_sql = self._motif_family_sql("f")
+        filter_clause, filter_params = _filter_sql(
+            filters,
+            "f",
+            motif_family_sql=motif_family_sql,
+        )
+        bbox_clause = ""
+        bbox_params: list[Any] = []
+        if bbox:
+            bbox_clause = """
+              AND NOT (
+                g.max_lon < ? OR g.min_lon > ? OR g.max_lat < ? OR g.min_lat > ?
+              )
+            """
+            min_lon, min_lat, max_lon, max_lat = bbox
+            bbox_params = [min_lon, max_lon, min_lat, max_lat]
+
+        label_join = ""
+        label_select = "NULL AS short_label"
+        if self.labels_path.exists():
+            label_join = "LEFT JOIN read_parquet(?) AS l USING (story_cluster_id)"
+            label_select = "l.short_label"
+        optional_frame_select = ",\n                ".join(
+            self._optional_frame_sql("f", name, fallback)
+            for name, fallback in (
+                ("event_id", "NULL"),
+                ("event_state", "NULL"),
+                ("motif_id", "NULL"),
+                ("current_risk_band", "f.max_risk_band"),
+                ("current_risk_rank", "f.max_risk_rank"),
+                ("assignment_distance", "NULL"),
+                ("distance_ratio", "NULL"),
+                ("assignment_reason", "NULL"),
+                ("motif_model_version", "NULL"),
+            )
+        )
+        current_rank_sql = (
+            "COALESCE(TRY_CAST(f.current_risk_rank AS INTEGER), "
+            "TRY_CAST(f.max_risk_rank AS INTEGER), 0)"
+            if "current_risk_rank" in self.frame_columns
+            else "COALESCE(TRY_CAST(f.max_risk_rank AS INTEGER), 0)"
+        )
+        state_sql = (
+            "UPPER(COALESCE(CAST(f.event_state AS VARCHAR), ''))"
+            if "event_state" in self.frame_columns
+            else "''"
+        )
+        state_priority_sql = f"""CASE {state_sql}
+            WHEN 'SEVERE' THEN 6 WHEN 'ACTIVE' THEN 5 WHEN 'WATCH' THEN 4
+            WHEN 'RECOVERING' THEN 3 WHEN 'QUIET_PENDING' THEN 2
+            WHEN 'DATA_GAP' THEN 1 ELSE 0 END"""
+
+        sql = f"""
+            SELECT
+                f.timeline_bucket,
+                f.field_id,
+                f.story_cluster_id,
+                {optional_frame_select},
+                f.max_risk_band,
+                f.hazard_signature,
+                f.response_signature,
+                f.reportable_day_count,
+                f.event_count,
+                f.max_risk_rank,
+                f.response_day_count,
+                {motif_family_sql} AS motif_family,
+                {label_select},
+                COUNT(DISTINCT f.field_id) OVER () AS _source_row_count,
+                COUNT(DISTINCT f.story_cluster_id) OVER () AS _source_story_cluster_count,
+                SUM(f.reportable_day_count) OVER () AS _source_reportable_day_count,
+                SUM(f.event_count) OVER () AS _source_event_count,
+                COUNT(*) OVER (PARTITION BY f.field_id) AS concurrent_event_count
+            FROM read_parquet(?) AS f
+            JOIN read_parquet(?) AS g USING (field_id)
+            {label_join}
+            WHERE f.timeline_bucket = ?
+            {filter_clause}
+            {bbox_clause}
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY f.field_id
+                ORDER BY {state_priority_sql} DESC, {current_rank_sql} DESC,
+                    f.max_risk_rank DESC, f.reportable_day_count DESC,
+                    CAST(f.story_cluster_id AS VARCHAR)
+            ) = 1
+            ORDER BY {state_priority_sql} DESC, {current_rank_sql} DESC,
+                f.reportable_day_count DESC, f.field_id
+        """
+        params: list[Any] = [str(self.frame_path), str(self.geometry_path)]
+        if self.labels_path.exists():
+            params.append(str(self.labels_path))
+        params.append(timeline_bucket)
+        params.extend(filter_params)
+        params.extend(bbox_params)
+        if effective_limit is not None:
+            sql += "\nLIMIT ?"
+            params.append(effective_limit + 1)
+
+        with duckdb.connect(":memory:") as con:
+            rows = con.execute(sql, params).fetchdf()
+
+        source_rows = _records(rows)
+        source_row_count = int(source_rows[0].get("_source_row_count") or 0) if source_rows else 0
+        source_story_cluster_count = (
+            int(source_rows[0].get("_source_story_cluster_count") or 0) if source_rows else 0
+        )
+        source_reportable_day_count = (
+            float(source_rows[0].get("_source_reportable_day_count") or 0) if source_rows else 0
+        )
+        source_event_count = float(source_rows[0].get("_source_event_count") or 0) if source_rows else 0
+        render_rows = source_rows[:effective_limit] if effective_limit is not None else source_rows
+        states = [
+            {key: row.get(key) for key in FRAME_STATE_FIELDS}
+            for row in render_rows
+        ]
+        truncated = effective_limit is not None and source_row_count > effective_limit
+        LOGGER.info(
+            (
+                "frame_state bucket=%s bbox=%s filters=%s requested_limit=%s "
+                "effective_limit=%s source_rows=%s states=%s limit_hit=%s elapsed_ms=%.1f"
+            ),
+            timeline_bucket,
+            _json_for_log(bbox),
+            _json_for_log(filters),
+            requested_limit,
+            effective_limit,
+            source_row_count,
+            len(states),
+            truncated,
+            (time.perf_counter() - started) * 1000,
+        )
+        return {
+            "geometry_version": self.geometry_version(),
+            "rows": states,
+            "meta": {
+                "timeline_bucket": timeline_bucket,
+                "state_count": len(states),
+                "source_row_count": source_row_count,
+                "query_row_count": len(source_rows),
+                "story_cluster_count": source_story_cluster_count,
+                "reportable_day_count": source_reportable_day_count,
+                "event_count": source_event_count,
+                "limit": effective_limit,
+                "requested_limit": requested_limit,
+                "unlimited": effective_limit is None,
+                "limit_hit": truncated,
+                "truncated": truncated,
+                "optimized_geometry": True,
+                "bbox_applied": bbox is not None,
+                "filters": filters,
+            },
+        }
+
+    def _raw_frame_state(
+        self,
+        *,
+        timeline_bucket: str,
+        bbox: tuple[float, float, float, float] | None,
+        limit: int,
+        filters: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        """Compatibility path; optimized bundles avoid this geometry parse."""
+        frame = self.frame_features(
+            timeline_bucket=timeline_bucket,
+            bbox=bbox,
+            limit=limit,
+            filters=filters,
+        )
+        states = [
+            {key: feature.get("properties", {}).get(key) for key in FRAME_STATE_FIELDS}
+            for feature in frame.get("features", [])
+        ]
+        legacy_meta = frame.get("meta", {})
+        meta = {
+            key: legacy_meta.get(key)
+            for key in FRAME_STATE_META_FIELDS
+        }
+        meta["state_count"] = len(states)
+        meta["bbox_applied"] = bbox is not None
+        return {
+            "geometry_version": self.geometry_version(),
+            "rows": states,
+            "meta": meta,
+        }
+
+    def geometry_features(
+        self,
+        *,
+        geometry_version: str,
+        field_ids: list[str],
+    ) -> dict[str, Any]:
+        """Return static geometry for a bounded, deduplicated field-ID request."""
+        self.require_ready()
+        current_version = self.geometry_version()
+        if geometry_version != current_version:
+            raise GeometryVersionMismatchError("geometry version does not match the active artifact")
+        if len(field_ids) > MAX_GEOMETRY_IDS:
+            raise RequestBodyTooLargeError(
+                f"field_ids may contain at most {MAX_GEOMETRY_IDS} items"
+            )
+        unique_ids = list(dict.fromkeys(field_ids))
+        if not unique_ids:
+            return {
+                "geometry_version": current_version,
+                "type": "FeatureCollection",
+                "features": [],
+                "meta": {
+                    "requested_field_count": 0,
+                    "feature_count": 0,
+                    "missing_field_ids": [],
+                },
+            }
+
+        optimized = self._has_optimized_geometry()
+        geometry_select = (
+            "g.geometry_geojson, 'geojson' AS geometry_format, "
+            "g.min_lon, g.min_lat, g.max_lon, g.max_lat"
+            if optimized
+            else "g.geometry_text, g.geometry_format, NULL AS min_lon, NULL AS min_lat, "
+            "NULL AS max_lon, NULL AS max_lat"
+        )
+        with duckdb.connect(":memory:") as con:
+            rows = con.execute(
+                f"""
+                SELECT
+                    g.field_id,
+                    {geometry_select},
+                    g.district,
+                    g.sector,
+                    g.cell,
+                    g.village
+                FROM read_parquet(?) AS g
+                JOIN UNNEST(?) AS wanted(field_id) USING (field_id)
+                """,
+                [str(self.geometry_path), unique_ids],
+            ).fetchdf()
+
+        by_field_id: dict[str, dict[str, Any]] = {}
+        for row in _records(rows):
+            field_id = str(row.get("field_id"))
+            if optimized:
+                raw_geometry = row.get("geometry_geojson")
+                geometry = json.loads(raw_geometry) if isinstance(raw_geometry, str) else raw_geometry
+                geom_bbox = [
+                    float(row["min_lon"]),
+                    float(row["min_lat"]),
+                    float(row["max_lon"]),
+                    float(row["max_lat"]),
+                ]
+            else:
+                geometry, geom_bbox = _geometry_to_geojson_and_bbox(
+                    row.get("geometry_text"),
+                    str(row.get("geometry_format") or "geojson"),
+                )
+            by_field_id[field_id] = {
+                "type": "Feature",
+                "geometry": geometry,
+                "properties": {
+                    "field_id": field_id,
+                    "bbox": geom_bbox,
+                    "district": row.get("district"),
+                    "sector": row.get("sector"),
+                    "cell": row.get("cell"),
+                    "village": row.get("village"),
+                },
+            }
+
+        features = [by_field_id[field_id] for field_id in unique_ids if field_id in by_field_id]
+        missing = [field_id for field_id in unique_ids if field_id not in by_field_id]
+        LOGGER.info(
+            "geometry_features requested=%s returned=%s missing=%s optimized_geometry=%s",
+            len(unique_ids),
+            len(features),
+            len(missing),
+            optimized,
+        )
+        return {
+            "geometry_version": current_version,
+            "type": "FeatureCollection",
+            "features": features,
+            "meta": {
+                "requested_field_count": len(unique_ids),
+                "feature_count": len(features),
+                "missing_field_ids": missing,
+            },
+        }
+
     def motifs(self, q: str | None, limit: int) -> dict[str, Any]:
         self.require_ready()
         limit = max(1, min(limit, 1000))
         frame_family_sql = self._motif_family_sql("f")
         label_fallback_sql = _hazard_family_sql("l.hazard_signature")
+        current_risk_sql = (
+            "COALESCE(current_risk_band, max_risk_band)"
+            if "current_risk_band" in self.frame_columns
+            else "max_risk_band"
+        )
         enriched_cte = f"""
             WITH frame_families AS (
                 SELECT f.story_cluster_id, MIN({frame_family_sql}) AS motif_family
@@ -765,14 +1202,16 @@ class StoryMapStore:
                 params,
             ).fetchdf()
             risks = con.execute(
-                """
-                SELECT max_risk_band, SUM(event_count) AS event_count
+                f"""
+                SELECT {current_risk_sql} AS current_risk_band,
+                    COUNT(DISTINCT field_id) AS field_count,
+                    COUNT(*) AS event_count
                 FROM read_parquet(?)
-                WHERE max_risk_band IS NOT NULL
-                GROUP BY max_risk_band
-                ORDER BY event_count DESC, max_risk_band
+                WHERE {current_risk_sql} IS NOT NULL
+                GROUP BY {current_risk_sql}
+                ORDER BY field_count DESC, current_risk_band
                 """,
-                [str(self.labels_path)],
+                [str(self.frame_path)],
             ).fetchdf()
             hazards = con.execute(
                 """
@@ -813,7 +1252,7 @@ class StoryMapStore:
             "motifs": motif_records,
             "exact_stories": motif_records,
             "facets": {
-                "max_risk_band": _records(risks),
+                "current_risk_band": _records(risks),
                 "hazard_signature": _records(hazards),
                 "response_signature": _records(responses),
                 "motif_family": _records(motif_families),
@@ -823,8 +1262,13 @@ class StoryMapStore:
 
     def activity(self, filters: dict[str, str] | None) -> dict[str, Any]:
         self.require_ready()
-        filters = _clean_filters(filters)
+        filters = self._effective_frame_filters(filters)
         motif_family_sql = self._motif_family_sql("f")
+        current_rank_sql = (
+            "COALESCE(f.current_risk_rank, f.max_risk_rank)"
+            if "current_risk_rank" in self.frame_columns
+            else "f.max_risk_rank"
+        )
         filter_clause, filter_params = _filter_sql(filters, "f", motif_family_sql=motif_family_sql)
         started = time.perf_counter()
         params: list[Any] = [str(self.frame_path)]
@@ -839,7 +1283,7 @@ class StoryMapStore:
                     COUNT(DISTINCT {motif_family_sql}) AS motif_family_count,
                     SUM(f.reportable_day_count) AS reportable_day_count,
                     SUM(f.event_count) AS event_count,
-                    MAX(f.max_risk_rank) AS max_risk_rank
+                    MAX({current_rank_sql}) AS max_risk_rank
                 FROM read_parquet(?) AS f
                 WHERE 1 = 1
                 {filter_clause}
@@ -869,6 +1313,217 @@ class StoryMapStore:
         }
         return result
 
+    def evolution(self, filters: dict[str, str] | None) -> dict[str, Any]:
+        """Summarize retrospective activity-center change without implying movement."""
+        self.require_ready()
+        filters = self._effective_frame_filters(filters)
+        if not filters:
+            raise RequestValidationError("at least one story or evidence filter is required")
+        if not self._has_optimized_geometry():
+            raise RequestValidationError("evolution requires optimized field_geometry.parquet")
+
+        motif_family_sql = self._motif_family_sql("f")
+        filter_clause, filter_params = _filter_sql(
+            filters,
+            "f",
+            motif_family_sql=motif_family_sql,
+        )
+        open_state_clause = (
+            "AND UPPER(CAST(f.event_state AS VARCHAR)) IN "
+            "('WATCH','ACTIVE','SEVERE','QUIET_PENDING','RECOVERING','DATA_GAP')"
+            if "event_state" in self.frame_columns
+            else ""
+        )
+        started = time.perf_counter()
+        with duckdb.connect(":memory:") as con:
+            rows = con.execute(
+                f"""
+                WITH all_buckets AS (
+                    SELECT
+                        timeline_bucket,
+                        ROW_NUMBER() OVER (ORDER BY timeline_bucket) - 1 AS bucket_index
+                    FROM (
+                        SELECT DISTINCT timeline_bucket
+                        FROM read_parquet(?)
+                    )
+                ),
+                selected AS (
+                    SELECT DISTINCT
+                        f.timeline_bucket,
+                        f.field_id,
+                        RADIANS(g.centroid_lat) AS latitude_radians,
+                        RADIANS(g.centroid_lon) AS longitude_radians
+                    FROM read_parquet(?) AS f
+                    JOIN read_parquet(?) AS g USING (field_id)
+                    WHERE g.centroid_lon IS NOT NULL
+                      AND g.centroid_lat IS NOT NULL
+                      {filter_clause}
+                      {open_state_clause}
+                ),
+                vectors AS (
+                    SELECT
+                        timeline_bucket,
+                        COUNT(*) AS field_count,
+                        AVG(COS(latitude_radians) * COS(longitude_radians)) AS mean_x,
+                        AVG(COS(latitude_radians) * SIN(longitude_radians)) AS mean_y,
+                        AVG(SIN(latitude_radians)) AS mean_z
+                    FROM selected
+                    GROUP BY timeline_bucket
+                ),
+                centers AS (
+                    SELECT
+                        timeline_bucket,
+                        field_count,
+                        ATAN2(mean_y, mean_x) AS center_longitude_radians,
+                        ATAN2(mean_z, SQRT(mean_x * mean_x + mean_y * mean_y)) AS center_latitude_radians
+                    FROM vectors
+                ),
+                distances AS (
+                    SELECT
+                        s.timeline_bucket,
+                        s.field_id,
+                        c.field_count,
+                        c.center_longitude_radians,
+                        c.center_latitude_radians,
+                        2.0 * 6371.0088 * ASIN(
+                            SQRT(
+                                LEAST(
+                                    1.0,
+                                    GREATEST(
+                                        0.0,
+                                        POWER(SIN((s.latitude_radians - c.center_latitude_radians) / 2.0), 2)
+                                        + COS(c.center_latitude_radians) * COS(s.latitude_radians)
+                                        * POWER(SIN((s.longitude_radians - c.center_longitude_radians) / 2.0), 2)
+                                    )
+                                )
+                            )
+                        ) AS distance_km
+                    FROM selected AS s
+                    JOIN centers AS c USING (timeline_bucket)
+                ),
+                bucket_stats AS (
+                    SELECT
+                        timeline_bucket,
+                        ANY_VALUE(field_count) AS field_count,
+                        DEGREES(ANY_VALUE(center_longitude_radians)) AS center_lon,
+                        DEGREES(ANY_VALUE(center_latitude_radians)) AS center_lat,
+                        QUANTILE_CONT(distance_km, 0.5) AS p50_dispersion_km,
+                        QUANTILE_CONT(distance_km, 0.9) AS p90_dispersion_km
+                    FROM distances
+                    GROUP BY timeline_bucket
+                ),
+                indexed AS (
+                    SELECT stats.*, buckets.bucket_index
+                    FROM bucket_stats AS stats
+                    JOIN all_buckets AS buckets USING (timeline_bucket)
+                ),
+                pairs AS (
+                    SELECT
+                        *,
+                        LAG(timeline_bucket) OVER (ORDER BY timeline_bucket) AS previous_timeline_bucket,
+                        LAG(bucket_index) OVER (ORDER BY timeline_bucket) AS previous_bucket_index,
+                        LAG(field_count) OVER (ORDER BY timeline_bucket) AS previous_field_count
+                    FROM indexed
+                ),
+                persistence AS (
+                    SELECT
+                        p.timeline_bucket,
+                        COUNT(prior.field_id) AS persisting_field_count
+                    FROM pairs AS p
+                    JOIN selected AS current_state
+                      ON current_state.timeline_bucket = p.timeline_bucket
+                    LEFT JOIN selected AS prior
+                      ON prior.timeline_bucket = p.previous_timeline_bucket
+                     AND prior.field_id = current_state.field_id
+                    GROUP BY p.timeline_bucket
+                )
+                SELECT
+                    p.timeline_bucket,
+                    p.previous_timeline_bucket,
+                    p.bucket_index,
+                    p.previous_bucket_index,
+                    p.field_count,
+                    p.previous_field_count,
+                    p.center_lon,
+                    p.center_lat,
+                    p.p50_dispersion_km,
+                    p.p90_dispersion_km,
+                    persistence.persisting_field_count
+                FROM pairs AS p
+                JOIN persistence USING (timeline_bucket)
+                ORDER BY p.timeline_bucket
+                """,
+                [str(self.frame_path), str(self.frame_path), str(self.geometry_path), *filter_params],
+            ).fetchdf()
+
+        points: list[dict[str, Any]] = []
+        for row in _records(rows):
+            field_count = int(row.get("field_count") or 0)
+            timeline_bucket = _clean(row.get("timeline_bucket"))
+            previous_bucket = _clean(row.get("previous_timeline_bucket"))
+            has_previous = previous_bucket is not None
+            previous_field_count_value = _clean(row.get("previous_field_count"))
+            previous_field_count = int(previous_field_count_value or 0)
+            persisting = int(row.get("persisting_field_count") or 0) if has_previous else 0
+            entering = max(0, field_count - persisting)
+            exiting = max(0, previous_field_count - persisting) if has_previous else 0
+            denominator = field_count + previous_field_count - persisting
+            jaccard = (persisting / denominator) if has_previous and denominator else None
+            adjacent_index = (
+                int(row.get("bucket_index") or 0)
+                - int(_clean(row.get("previous_bucket_index")) or 0)
+                == 1
+            )
+            consecutive = bool(
+                has_previous
+                and _weekly_buckets_are_consecutive(
+                    previous_bucket,
+                    timeline_bucket,
+                    fallback=adjacent_index,
+                )
+            )
+            if not has_previous:
+                break_reason = "start"
+            elif not consecutive:
+                break_reason = "timeline_gap"
+            elif persisting == 0:
+                break_reason = "zero_field_overlap"
+            else:
+                break_reason = None
+            points.append(
+                {
+                    "timeline_bucket": timeline_bucket,
+                    "previous_timeline_bucket": previous_bucket,
+                    "field_count": field_count,
+                    "center_lon": _rounded_float(row.get("center_lon"), 7),
+                    "center_lat": _rounded_float(row.get("center_lat"), 7),
+                    "p50_dispersion_km": _rounded_float(row.get("p50_dispersion_km"), 3),
+                    "p90_dispersion_km": _rounded_float(row.get("p90_dispersion_km"), 3),
+                    "entering_field_count": entering,
+                    "persisting_field_count": persisting,
+                    "exiting_field_count": exiting,
+                    "jaccard_overlap": _rounded_float(jaccard, 6),
+                    "consecutive": consecutive,
+                    "trail_segment_allowed": bool(consecutive and persisting > 0),
+                    "break_reason": break_reason,
+                }
+            )
+        LOGGER.info(
+            "evolution_loaded filters=%s buckets=%s elapsed_ms=%.1f",
+            _json_for_log(filters),
+            len(points),
+            (time.perf_counter() - started) * 1000,
+        )
+        return {
+            "kind": "aggregate_activity_center",
+            "is_physical_movement": False,
+            "center_method": "unweighted_spherical_mean_of_field_centroids",
+            "dispersion_method": "haversine_distance_to_activity_center",
+            "filters": filters,
+            "bucket_count": len(points),
+            "points": points,
+        }
+
     def trail_features(
         self,
         *,
@@ -879,7 +1534,7 @@ class StoryMapStore:
         limit: int = 0,
     ) -> dict[str, Any]:
         self.require_ready()
-        filters = _clean_filters(filters)
+        filters = self._effective_frame_filters(filters)
         requested_limit = limit
         effective_limit = _feature_limit(limit, self.settings.max_feature_limit)
         if not filters:
@@ -925,6 +1580,36 @@ class StoryMapStore:
         if self.labels_path.exists():
             label_join = "LEFT JOIN read_parquet(?) AS l USING (story_cluster_id)"
             label_select = "l.short_label"
+        optional_trail_select = ",\n                    ".join(
+            self._optional_frame_sql("f", name, fallback)
+            for name, fallback in (
+                ("event_id", "NULL"),
+                ("event_state", "NULL"),
+                ("current_risk_band", "f.max_risk_band"),
+                ("current_risk_rank", "f.max_risk_rank"),
+            )
+        )
+        current_rank_sql = (
+            "COALESCE(TRY_CAST(f.current_risk_rank AS INTEGER), "
+            "TRY_CAST(f.max_risk_rank AS INTEGER), 0)"
+            if "current_risk_rank" in self.frame_columns
+            else "COALESCE(TRY_CAST(f.max_risk_rank AS INTEGER), 0)"
+        )
+        state_sql = (
+            "UPPER(COALESCE(CAST(f.event_state AS VARCHAR), ''))"
+            if "event_state" in self.frame_columns
+            else "''"
+        )
+        state_priority_sql = f"""CASE {state_sql}
+            WHEN 'SEVERE' THEN 6 WHEN 'ACTIVE' THEN 5 WHEN 'WATCH' THEN 4
+            WHEN 'RECOVERING' THEN 3 WHEN 'QUIET_PENDING' THEN 2
+            WHEN 'DATA_GAP' THEN 1 ELSE 0 END"""
+        open_state_clause = (
+            "AND UPPER(CAST(f.event_state AS VARCHAR)) IN "
+            "('WATCH','ACTIVE','SEVERE','QUIET_PENDING','RECOVERING','DATA_GAP')"
+            if "event_state" in self.frame_columns
+            else ""
+        )
 
         sql = f"""
             WITH all_buckets AS (
@@ -960,6 +1645,18 @@ class StoryMapStore:
                 WHERE 1 = 1
                 {filter_clause}
                 {bbox_clause}
+                {open_state_clause}
+            ),
+            previous_open_fields AS (
+                SELECT DISTINCT f.field_id
+                FROM all_buckets AS a
+                CROSS JOIN target_bucket AS t
+                JOIN read_parquet(?) AS f ON f.timeline_bucket = a.timeline_bucket
+                JOIN read_parquet(?) AS g USING (field_id)
+                WHERE a.bucket_index = t.bucket_index - 1
+                {filter_clause}
+                {bbox_clause}
+                {open_state_clause}
             ),
             prior_ranked AS (
                 SELECT
@@ -968,6 +1665,7 @@ class StoryMapStore:
                     f.timeline_bucket,
                     f.field_id,
                     f.story_cluster_id,
+                    {optional_trail_select},
                     f.max_risk_band,
                     f.hazard_signature,
                     f.response_signature,
@@ -992,7 +1690,9 @@ class StoryMapStore:
                     c.field_id IS NOT NULL AS persists_to_current,
                     ROW_NUMBER() OVER (
                         PARTITION BY f.field_id
-                        ORDER BY s.bucket_index DESC, f.max_risk_rank DESC, f.reportable_day_count DESC
+                        ORDER BY s.bucket_index DESC, {state_priority_sql} DESC,
+                            {current_rank_sql} DESC, f.max_risk_rank DESC,
+                            f.reportable_day_count DESC, CAST(f.story_cluster_id AS VARCHAR)
                     ) AS prior_rank
                 FROM selected_prior_buckets AS s
                 JOIN read_parquet(?) AS f USING (timeline_bucket)
@@ -1002,6 +1702,7 @@ class StoryMapStore:
                 WHERE 1 = 1
                 {filter_clause}
                 {bbox_clause}
+                {open_state_clause}
             ),
             prior_features AS (
                 SELECT * EXCLUDE (prior_rank)
@@ -1012,8 +1713,17 @@ class StoryMapStore:
                 SELECT
                     (SELECT timeline_bucket FROM target_bucket) AS resolved_timeline_bucket,
                     (SELECT COUNT(*) FROM current_fields) AS current_field_count,
+                    (SELECT COUNT(*) FROM previous_open_fields) AS previous_field_count,
                     (SELECT COUNT(*) FROM prior_features) AS prior_field_count,
-                    (SELECT COUNT(*) FROM prior_features WHERE persists_to_current) AS persisting_field_count
+                    (
+                        SELECT COUNT(*)
+                        FROM current_fields AS current_state
+                        JOIN previous_open_fields AS previous_state USING (field_id)
+                    ) AS persisting_field_count,
+                    EXISTS (
+                        SELECT 1 FROM all_buckets AS a CROSS JOIN target_bucket AS t
+                        WHERE a.bucket_index = t.bucket_index - 1
+                    ) AS previous_bucket_available
             )
             SELECT p.*, s.*
             FROM stats AS s
@@ -1023,6 +1733,7 @@ class StoryMapStore:
         if effective_limit is not None:
             sql += "\nLIMIT ?"
         params: list[Any] = [str(self.frame_path), timeline_bucket, lookback]
+        params.extend([str(self.frame_path), str(self.geometry_path), *filter_params, *bbox_params])
         params.extend([str(self.frame_path), str(self.geometry_path), *filter_params, *bbox_params])
         params.extend([str(self.frame_path), str(self.geometry_path)])
         if self.labels_path.exists():
@@ -1065,12 +1776,16 @@ class StoryMapStore:
                     "timeline_bucket",
                     "field_id",
                     "story_cluster_id",
+                    "event_id",
+                    "event_state",
                     "max_risk_band",
+                    "current_risk_band",
                     "hazard_signature",
                     "response_signature",
                     "reportable_day_count",
                     "event_count",
                     "max_risk_rank",
+                    "current_risk_rank",
                     "response_day_count",
                     "motif_family",
                     "short_label",
@@ -1109,10 +1824,11 @@ class StoryMapStore:
                 "parse_failures": parse_failures,
                 "current_field_count": int(stats_row.get("current_field_count") or 0),
                 "prior_field_count": int(stats_row.get("prior_field_count") or 0),
+                "previous_field_count": int(stats_row.get("previous_field_count") or 0),
                 "persisting_field_count": int(stats_row.get("persisting_field_count") or 0),
                 "departed_field_count": max(
                     0,
-                    int(stats_row.get("prior_field_count") or 0)
+                    int(stats_row.get("previous_field_count") or 0)
                     - int(stats_row.get("persisting_field_count") or 0),
                 ),
                 "new_current_field_count": max(
@@ -1120,7 +1836,8 @@ class StoryMapStore:
                     int(stats_row.get("current_field_count") or 0)
                     - int(stats_row.get("persisting_field_count") or 0),
                 ),
-                "transition_counts_available": True,
+                "transition_counts_available": bool(stats_row.get("previous_bucket_available")),
+                "transition_scope": "open_previous_bucket",
                 "limit": effective_limit,
                 "requested_limit": requested_limit,
                 "truncated": truncated,
@@ -1144,6 +1861,69 @@ class StoryMapStore:
         records = _records(events)
         LOGGER.info("field_events field_id=%s limit=%s events=%s", field_id, limit, len(records))
         return {"field_id": field_id, "events": records}
+
+    def field_trajectory(self, field_id: str, limit: int) -> dict[str, Any]:
+        """Return causal weekly prefix states when the monitoring artifact exists."""
+        self.require_ready()
+        limit = max(1, min(limit, 1000))
+        if not self.state_snapshots_path.is_file():
+            return {
+                "field_id": field_id,
+                "available": False,
+                "mode": "retrospective_event_windows_only",
+                "states": [],
+            }
+        columns = self._parquet_columns(self.state_snapshots_path)
+
+        def optional(name: str, fallback: str = "NULL") -> str:
+            return f"{name}" if name in columns else f"{fallback} AS {name}"
+
+        with duckdb.connect(":memory:") as con:
+            rows = con.execute(
+                f"""
+                WITH latest_buckets AS (
+                    SELECT DISTINCT timeline_bucket
+                    FROM read_parquet(?)
+                    WHERE field_id = ?
+                    ORDER BY timeline_bucket DESC
+                    LIMIT ?
+                )
+                SELECT
+                    states.timeline_bucket,
+                    {optional('snapshot_as_of_date')},
+                    states.field_id,
+                    {optional('crop_name')},
+                    {optional('crop_season')},
+                    {optional('event_id')},
+                    {optional('event_state')},
+                    {optional('hazard_signature')},
+                    {optional('max_risk_rank', '0')},
+                    {optional('max_risk_band')},
+                    {optional('current_risk_rank', 'daily_pressure_rank')},
+                    {optional('current_risk_band', 'max_risk_band')},
+                    {optional('daily_pressure_rank', '0')},
+                    {optional('daily_response_class')},
+                    {optional('right_censored', 'FALSE')},
+                    {optional('requires_review', 'FALSE')},
+                    {optional('revision', '1')}
+                FROM read_parquet(?) AS states
+                JOIN latest_buckets USING (timeline_bucket)
+                WHERE states.field_id = ?
+                ORDER BY states.timeline_bucket, event_id
+                """,
+                [
+                    str(self.state_snapshots_path), field_id, limit,
+                    str(self.state_snapshots_path), field_id,
+                ],
+            ).fetchdf()
+        states = _records(rows)
+        return {
+            "field_id": field_id,
+            "available": True,
+            "mode": "causal_weekly_event_prefix",
+            "state_count": len(states),
+            "states": states,
+        }
 
     def cluster(self, story_cluster_id: str, limit: int) -> dict[str, Any]:
         self.require_ready()
@@ -1226,7 +2006,7 @@ class StoryMapStore:
         filters: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         diagnostics: dict[str, Any] = {}
-        filters = _clean_filters(filters)
+        filters = self._effective_frame_filters(filters)
         filter_clause, filter_params = _filter_sql(
             filters,
             "f",
@@ -1390,6 +2170,9 @@ def make_handler(store: StoryMapStore, settings: Settings) -> type[BaseHTTPReque
                 if path == "/api/activity":
                     self._json(self._query(lambda: store.activity(_filters_from_query(query))))
                     return
+                if path == "/api/evolution":
+                    self._json(self._query(lambda: store.evolution(_filters_from_query(query))))
+                    return
                 if path == "/api/trajectory":
                     self._json(self._query(lambda: store.trajectory(_filters_from_query(query))))
                     return
@@ -1404,6 +2187,24 @@ def make_handler(store: StoryMapStore, settings: Settings) -> type[BaseHTTPReque
                                 filters=_filters_from_query(query),
                                 lookback=_int_query(query, "lookback", 5, 24),
                                 bbox=_parse_bbox(_first(query, "bbox")),
+                                limit=_feature_limit_query(
+                                    query,
+                                    "limit",
+                                    settings.default_feature_limit,
+                                    settings.max_feature_limit,
+                                ),
+                            ),
+                        )
+                    )
+                    return
+                if path.startswith("/api/frame-state/"):
+                    bucket = unquote(path.removeprefix("/api/frame-state/"))
+                    self._json(
+                        self._query(
+                            lambda: store.frame_state(
+                                timeline_bucket=bucket,
+                                bbox=_parse_bbox(_first(query, "bbox")),
+                                filters=_filters_from_query(query),
                                 limit=_feature_limit_query(
                                     query,
                                     "limit",
@@ -1437,6 +2238,18 @@ def make_handler(store: StoryMapStore, settings: Settings) -> type[BaseHTTPReque
                     self._json(
                         self._query(
                             lambda: store.field_events(field_id, _int_query(query, "limit", 100, 500))
+                        )
+                    )
+                    return
+                if path.startswith("/api/field/") and path.endswith("/trajectory"):
+                    field_id = unquote(
+                        path.removeprefix("/api/field/").removesuffix("/trajectory")
+                    )
+                    self._json(
+                        self._query(
+                            lambda: store.field_trajectory(
+                                field_id, _int_query(query, "limit", 250, 1000)
+                            )
                         )
                     )
                     return
@@ -1493,8 +2306,112 @@ def make_handler(store: StoryMapStore, settings: Settings) -> type[BaseHTTPReque
                     status=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
+        def do_POST(self) -> None:  # noqa: N802
+            self._request_started = time.perf_counter()
+            self._api_cache_key = None
+            parsed = urlparse(self.path)
+            path = parsed.path
+            LOGGER.info(
+                "http_request method=POST path=%s remote=%s",
+                path,
+                self.client_address[0] if self.client_address else None,
+            )
+            try:
+                if path != "/api/geometry":
+                    self._json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
+                    return
+                payload = self._read_json_body()
+                geometry_version = payload.get("geometry_version")
+                if not isinstance(geometry_version, str) or not geometry_version:
+                    raise RequestValidationError("geometry_version must be a nonempty string")
+                field_ids = payload.get("field_ids")
+                if not isinstance(field_ids, list):
+                    raise RequestValidationError("field_ids must be an array")
+                if len(field_ids) > MAX_GEOMETRY_IDS:
+                    raise RequestBodyTooLargeError(
+                        f"field_ids may contain at most {MAX_GEOMETRY_IDS} items"
+                    )
+                validated_ids: list[str] = []
+                for value in field_ids:
+                    if not isinstance(value, str) or not value or value != value.strip():
+                        raise RequestValidationError(
+                            "field_ids must contain nonempty strings without surrounding whitespace"
+                        )
+                    if len(value) > 512:
+                        raise RequestValidationError("field_ids values may not exceed 512 characters")
+                    validated_ids.append(value)
+                self._json(
+                    self._query(
+                        lambda: store.geometry_features(
+                            geometry_version=geometry_version,
+                            field_ids=validated_ids,
+                        )
+                    )
+                )
+            except RequestBodyTooLargeError as exc:
+                LOGGER.warning("http_request_too_large method=POST path=%s error=%s", path, str(exc))
+                self._json(
+                    {"error": str(exc)},
+                    status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                )
+            except GeometryVersionMismatchError as exc:
+                LOGGER.info("http_geometry_version_conflict path=%s error=%s", path, str(exc))
+                self._json(
+                    {
+                        "error": str(exc),
+                        "geometry_version": store.geometry_version(),
+                    },
+                    status=HTTPStatus.CONFLICT,
+                )
+            except RequestValidationError as exc:
+                LOGGER.warning("http_bad_request method=POST path=%s error=%s", path, str(exc))
+                self._json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            except ServerBusyError:
+                LOGGER.warning("http_server_busy method=POST path=%s", path)
+                self._json(
+                    {"error": "The server is busy. Retry this request shortly."},
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    extra_headers={"Retry-After": "1"},
+                )
+            except Exception:
+                LOGGER.exception("http_error method=POST path=%s", path)
+                self._json(
+                    {"error": "The server could not complete this request."},
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+
         def log_message(self, format: str, *args: Any) -> None:
             return
+
+        def _read_json_body(self) -> dict[str, Any]:
+            raw_length = self.headers.get("Content-Length")
+            if raw_length is None:
+                raise RequestValidationError("Content-Length is required")
+            try:
+                content_length = int(raw_length)
+            except ValueError as exc:
+                raise RequestValidationError("Content-Length must be an integer") from exc
+            if content_length < 0:
+                raise RequestValidationError("Content-Length must be nonnegative")
+            if content_length > MAX_GEOMETRY_REQUEST_BYTES:
+                # Drain modest over-limit bodies before replying so ordinary
+                # clients do not race the 413 with an in-flight upload. Never
+                # drain an arbitrarily large claimed body.
+                if content_length <= MAX_GEOMETRY_REQUEST_BYTES * 2:
+                    self.rfile.read(content_length)
+                else:
+                    # The unread bytes make HTTP/1.1 reuse unsafe.
+                    self.close_connection = True
+                raise RequestBodyTooLargeError(
+                    f"request body may not exceed {MAX_GEOMETRY_REQUEST_BYTES} bytes"
+                )
+            try:
+                payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RequestValidationError("request body must be valid UTF-8 JSON") from exc
+            if not isinstance(payload, dict):
+                raise RequestValidationError("request body must be a JSON object")
+            return payload
 
         def _query(self, operation: Any) -> Any:
             if not query_slots.acquire(blocking=False):
@@ -1567,6 +2484,8 @@ def make_handler(store: StoryMapStore, settings: Settings) -> type[BaseHTTPReque
                 self.send_header("ETag", etag)
             if use_gzip:
                 self.send_header("Content-Encoding", "gzip")
+            if self.close_connection:
+                self.send_header("Connection", "close")
             for name, value in (extra_headers or {}).items():
                 self.send_header(name, value)
             self.send_header("Content-Length", str(len(body)))
@@ -1677,6 +2596,7 @@ def _first(query: dict[str, list[str]], key: str) -> str | None:
 FILTER_COLUMNS = {
     "story_cluster_id",
     "max_risk_band",
+    "current_risk_band",
     "hazard_signature",
     "response_signature",
     "motif_family",
@@ -1843,6 +2763,17 @@ def _parse_bbox(raw: str | None) -> tuple[float, float, float, float] | None:
     return min_lon, min_lat, max_lon, max_lat
 
 
+@lru_cache(maxsize=8)
+def _geometry_artifact_version(path: str, size: int, mtime_ns: int) -> str:
+    """Hash immutable geometry bytes; stat values only invalidate the local cache."""
+    del size, mtime_ns
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"geom-sha256-{digest.hexdigest()}"
+
+
 @lru_cache(maxsize=4)
 def _bounds_for_geometry(path: str, optimized: bool) -> dict[str, float]:
     if optimized:
@@ -1905,6 +2836,24 @@ def _records(df: Any) -> list[dict[str, Any]]:
         return []
     clean_df = df.where(df.notnull(), None)
     return clean_df.to_dict(orient="records")
+
+
+def _rounded_float(value: Any, digits: int) -> float | None:
+    if value is None:
+        return None
+    normalized = float(value)
+    if not math.isfinite(normalized):
+        return None
+    return round(normalized, digits)
+
+
+def _weekly_buckets_are_consecutive(previous: Any, current: Any, *, fallback: bool) -> bool:
+    try:
+        previous_date = date.fromisoformat(str(previous)[:10])
+        current_date = date.fromisoformat(str(current)[:10])
+    except ValueError:
+        return fallback
+    return (current_date - previous_date).days == 7
 
 
 def _clean(value: Any) -> Any:

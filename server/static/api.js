@@ -23,11 +23,32 @@ export class ApiClient {
       });
       if (!response.ok) {
         const body = await response.text();
-        throw new Error(`${response.status} ${response.statusText}${body ? `: ${body}` : ""}`);
+        throw new HttpError(response.status, response.statusText, body);
       }
       const value = await response.json();
       if (cache) this.remember(url, value);
       return value;
+    } finally {
+      if (this.controllers.get(channel) === controller) this.controllers.delete(channel);
+    }
+  }
+
+  async post(url, body, { channel = url } = {}) {
+    this.abort(channel);
+    const controller = new AbortController();
+    this.controllers.set(channel, controller);
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        signal: controller.signal,
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) {
+        const responseBody = await response.text();
+        throw new HttpError(response.status, response.statusText, responseBody);
+      }
+      return await response.json();
     } finally {
       if (this.controllers.get(channel) === controller) this.controllers.delete(channel);
     }
@@ -44,9 +65,19 @@ export class ApiClient {
     this.controllers.delete(channel);
   }
 
+  abortPrefix(prefix) {
+    for (const channel of [...this.controllers.keys()]) {
+      if (String(channel).startsWith(prefix)) this.abort(channel);
+    }
+  }
+
   abortAll() {
     for (const controller of this.controllers.values()) controller.abort();
     this.controllers.clear();
+  }
+
+  forget(url) {
+    this.cache.delete(url);
   }
 
   remember(url, value) {
@@ -54,6 +85,14 @@ export class ApiClient {
     while (this.cache.size > this.cacheLimit) {
       this.cache.delete(this.cache.keys().next().value);
     }
+  }
+}
+
+export class HttpError extends Error {
+  constructor(status, statusText, body = "") {
+    super(`${status} ${statusText}${body ? `: ${body}` : ""}`);
+    this.name = "HttpError";
+    this.status = Number(status);
   }
 }
 
@@ -70,4 +109,8 @@ export function withQuery(path, values = {}) {
 
 export function isAbortError(error) {
   return error?.name === "AbortError";
+}
+
+export function isUnsupportedError(error) {
+  return [404, 405, 501].includes(Number(error?.status));
 }

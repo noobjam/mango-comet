@@ -15,6 +15,7 @@ import pandas as pd
 
 from story_map_server import (
     BoundedThreadingHTTPServer,
+    MAX_GEOMETRY_REQUEST_BYTES,
     ResponseCache,
     Settings,
     StoryMapStore,
@@ -112,6 +113,44 @@ class StoryMapServerTests(unittest.TestCase):
         pd.DataFrame(
             [{"field_id": "A", "story_cluster_id": "story-A", "event_id": "event-A"}]
         ).to_parquet(run_dir / "story_day_membership.parquet", index=False)
+        pd.DataFrame(
+            [
+                {
+                    "timeline_bucket": "2025-01-01",
+                    "snapshot_as_of_date": "2025-01-05",
+                    "field_id": "A",
+                    "crop_name": "Maize",
+                    "crop_season": "Season A",
+                    "event_id": "event-A",
+                    "event_state": "ACTIVE",
+                    "hazard_signature": "heat",
+                    "max_risk_rank": 3,
+                    "max_risk_band": "MED-HIGH",
+                    "daily_pressure_rank": 3,
+                    "daily_response_class": "no_new_acquisition",
+                    "right_censored": True,
+                    "requires_review": False,
+                    "revision": 1,
+                },
+                {
+                    "timeline_bucket": "2025-01-08",
+                    "snapshot_as_of_date": "2025-01-12",
+                    "field_id": "A",
+                    "crop_name": "Maize",
+                    "crop_season": "Season A",
+                    "event_id": "event-A",
+                    "event_state": "QUIET_PENDING",
+                    "hazard_signature": "heat",
+                    "max_risk_rank": 3,
+                    "max_risk_band": "MED-HIGH",
+                    "daily_pressure_rank": 1,
+                    "daily_response_class": "recovery",
+                    "right_censored": True,
+                    "requires_review": False,
+                    "revision": 1,
+                },
+            ]
+        ).to_parquet(run_dir / "event_state_snapshots.parquet", index=False)
         (run_dir / "manifest.json").write_text(
             json.dumps(
                 {
@@ -171,6 +210,252 @@ class StoryMapServerTests(unittest.TestCase):
         self.assertNotIn("story-E", {item["story_cluster_id"] for item in motifs["exact_stories"]})
         self.assertIn("motif_family", motifs["facets"])
         self.assertEqual(motifs["taxonomy"]["source"], "hazard_signature_fallback")
+
+    def test_frame_state_excludes_geometry_coordinates_and_static_admin(self) -> None:
+        state = self.store.frame_state(
+            timeline_bucket="2025-01-01",
+            bbox=(-1.0, -1.0, 3.0, 3.0),
+            limit=10,
+            filters={"motif_family": "heat"},
+        )
+        self.assertEqual([row["field_id"] for row in state["rows"]], ["A", "B"])
+        self.assertEqual(state["meta"]["source_row_count"], 2)
+        self.assertEqual(state["meta"]["state_count"], 2)
+        self.assertTrue(state["meta"]["bbox_applied"])
+        self.assertNotIn("bbox", state["meta"])
+        forbidden = {
+            "geometry",
+            "geometry_geojson",
+            "geometry_text",
+            "geometry_format",
+            "bbox",
+            "min_lon",
+            "min_lat",
+            "max_lon",
+            "max_lat",
+            "centroid_lon",
+            "centroid_lat",
+            "district",
+            "sector",
+            "cell",
+            "village",
+        }
+        self.assertTrue(all(forbidden.isdisjoint(row) for row in state["rows"]))
+        self.assertTrue(state["geometry_version"].startswith("geom-sha256-"))
+        self.assertEqual(state["geometry_version"], self.store.geometry_version())
+        self.assertEqual(state["geometry_version"], StoryMapStore(self.settings).geometry_version())
+
+        url = (
+            f"http://127.0.0.1:{self.httpd.server_port}"
+            "/api/frame-state/2025-01-01?bbox=-1,-1,3,3&limit=10"
+        )
+        with urlopen(url, timeout=3) as response:
+            http_state = json.loads(response.read())
+        self.assertEqual([row["field_id"] for row in http_state["rows"]], ["A", "B"])
+        self.assertTrue(all(forbidden.isdisjoint(row) for row in http_state["rows"]))
+
+    def test_frame_is_one_field_row_and_prioritizes_live_current_risk(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            for name in (
+                "field_geometry.parquet", "cluster_labels.parquet",
+                "event_windows.parquet", "story_day_membership.parquet", "manifest.json",
+            ):
+                shutil.copy2(self.settings.run_dir / name, run_dir / name)
+            rows = [
+                {
+                    **_frame_row("2025-01-01", "A", "story-A"),
+                    "event_id": "event-old", "event_state": "CLOSED_RECOVERED",
+                    "current_risk_band": "LOW", "current_risk_rank": 1,
+                },
+                {
+                    **_frame_row("2025-01-01", "A", "story-B"),
+                    "event_id": "event-live", "event_state": "SEVERE",
+                    "current_risk_band": "HIGH", "current_risk_rank": 4,
+                },
+                {
+                    **_frame_row("2025-01-01", "B", "story-B"),
+                    "event_id": "event-quiet", "event_state": "QUIET_PENDING",
+                    "current_risk_band": "LOW", "current_risk_rank": 1,
+                },
+            ]
+            pd.DataFrame(rows).to_parquet(run_dir / "frame_fields.parquet", index=False)
+            store = StoryMapStore(Settings(**{**self.settings.__dict__, "run_dir": run_dir}))
+
+            frame = store.frame_state(
+                timeline_bucket="2025-01-01", bbox=None, limit=10, filters={}
+            )
+            high = store.frame_state(
+                timeline_bucket="2025-01-01", bbox=None, limit=10,
+                filters={"current_risk_band": "HIGH"},
+            )
+
+        self.assertEqual(frame["meta"]["source_row_count"], 2)
+        self.assertEqual(len(frame["rows"]), 2)
+        selected_a = next(row for row in frame["rows"] if row["field_id"] == "A")
+        self.assertEqual(selected_a["event_id"], "event-live")
+        self.assertEqual(selected_a["concurrent_event_count"], 2)
+        self.assertEqual([row["field_id"] for row in high["rows"]], ["A"])
+
+    def test_geometry_post_is_versioned_bounded_and_deduplicated(self) -> None:
+        base_url = f"http://127.0.0.1:{self.httpd.server_port}/api/geometry"
+        version = self.store.geometry_version()
+
+        payload = json.dumps(
+            {
+                "geometry_version": version,
+                "field_ids": ["D", "A", "D", "missing"],
+            }
+        ).encode("utf-8")
+        request = Request(
+            base_url,
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(request, timeout=3) as response:
+            geometry = json.loads(response.read())
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(geometry["geometry_version"], version)
+        self.assertEqual(
+            [feature["properties"]["field_id"] for feature in geometry["features"]],
+            ["D", "A"],
+        )
+        self.assertEqual(geometry["meta"]["requested_field_count"], 3)
+        self.assertEqual(geometry["meta"]["feature_count"], 2)
+        self.assertEqual(geometry["meta"]["missing_field_ids"], ["missing"])
+        self.assertEqual(geometry["features"][0]["properties"]["village"], "D")
+        self.assertIn("bbox", geometry["features"][0]["properties"])
+        self.assertEqual(geometry["features"][0]["geometry"]["type"], "Polygon")
+
+        stale_request = Request(
+            base_url,
+            data=json.dumps(
+                {"geometry_version": "geom-sha256-stale", "field_ids": ["A"]}
+            ).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(stale_request, timeout=3)
+        self.assertEqual(raised.exception.code, 409)
+        conflict = json.loads(raised.exception.read())
+        self.assertEqual(conflict["geometry_version"], version)
+
+        excessive_request = Request(
+            base_url,
+            data=json.dumps(
+                {"geometry_version": version, "field_ids": ["A"] * 2001}
+            ).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(excessive_request, timeout=3)
+        self.assertEqual(raised.exception.code, 413)
+
+        oversized_request = Request(
+            base_url,
+            data=b"{" + (b" " * MAX_GEOMETRY_REQUEST_BYTES) + b"}",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(oversized_request, timeout=3)
+        self.assertEqual(raised.exception.code, 413)
+
+    def test_evolution_reports_nonphysical_centers_and_nonzero_overlap(self) -> None:
+        evolution = self.store.evolution({"story_cluster_id": "story-A"})
+        self.assertEqual(evolution["kind"], "aggregate_activity_center")
+        self.assertFalse(evolution["is_physical_movement"])
+        self.assertEqual(evolution["bucket_count"], 3)
+        self.assertNotIn("features", evolution)
+        first, second, third = evolution["points"]
+        self.assertEqual(first["break_reason"], "start")
+        self.assertFalse(first["trail_segment_allowed"])
+        self.assertEqual(first["entering_field_count"], 1)
+        self.assertEqual(first["center_lon"], 0.1)
+        self.assertEqual(first["center_lat"], 0.1)
+        for point in (second, third):
+            self.assertTrue(point["consecutive"])
+            self.assertTrue(point["trail_segment_allowed"])
+            self.assertIsNone(point["break_reason"])
+            self.assertEqual(point["persisting_field_count"], 1)
+            self.assertEqual(point["jaccard_overlap"], 1.0)
+            self.assertEqual(point["p50_dispersion_km"], 0.0)
+            self.assertEqual(point["p90_dispersion_km"], 0.0)
+
+        base_url = f"http://127.0.0.1:{self.httpd.server_port}"
+        with urlopen(f"{base_url}/api/evolution?story_cluster_id=story-A", timeout=3) as response:
+            http_evolution = json.loads(response.read())
+        self.assertEqual(http_evolution["points"], evolution["points"])
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(f"{base_url}/api/evolution", timeout=3)
+        self.assertEqual(raised.exception.code, 400)
+
+    def test_field_trajectory_returns_causal_weekly_prefix_states(self) -> None:
+        trajectory = self.store.field_trajectory("A", 20)
+        self.assertTrue(trajectory["available"])
+        self.assertEqual(trajectory["mode"], "causal_weekly_event_prefix")
+        self.assertEqual(
+            [state["event_state"] for state in trajectory["states"]],
+            ["ACTIVE", "QUIET_PENDING"],
+        )
+        url = (
+            f"http://127.0.0.1:{self.httpd.server_port}"
+            "/api/field/A/trajectory?limit=20"
+        )
+        with urlopen(url, timeout=3) as response:
+            payload = json.loads(response.read())
+        self.assertEqual(payload["states"], trajectory["states"])
+
+    def test_evolution_breaks_zero_overlap_but_allows_later_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            pd.DataFrame(
+                [
+                    _geometry_row("A", 0.0, 0.0),
+                    _geometry_row("B", 1.0, 1.0),
+                ]
+            ).to_parquet(run_dir / "field_geometry.parquet", index=False)
+            pd.DataFrame(
+                [
+                    _frame_row("2025-01-01", "A", "story-A"),
+                    _frame_row("2025-01-08", "B", "story-A"),
+                    _frame_row("2025-01-15", "B", "story-A"),
+                ]
+            ).to_parquet(run_dir / "frame_fields.parquet", index=False)
+            for name in (
+                "cluster_labels.parquet",
+                "event_windows.parquet",
+                "story_day_membership.parquet",
+                "manifest.json",
+            ):
+                shutil.copy2(self.settings.run_dir / name, run_dir / name)
+            store = StoryMapStore(
+                Settings(
+                    **{
+                        **self.settings.__dict__,
+                        "run_dir": run_dir,
+                    }
+                )
+            )
+            evolution = store.evolution({"story_cluster_id": "story-A"})
+
+        first, zero_overlap, overlap = evolution["points"]
+        self.assertEqual(first["break_reason"], "start")
+        self.assertTrue(zero_overlap["consecutive"])
+        self.assertEqual(zero_overlap["persisting_field_count"], 0)
+        self.assertEqual(zero_overlap["entering_field_count"], 1)
+        self.assertEqual(zero_overlap["exiting_field_count"], 1)
+        self.assertEqual(zero_overlap["jaccard_overlap"], 0.0)
+        self.assertFalse(zero_overlap["trail_segment_allowed"])
+        self.assertEqual(zero_overlap["break_reason"], "zero_field_overlap")
+        self.assertTrue(overlap["consecutive"])
+        self.assertEqual(overlap["persisting_field_count"], 1)
+        self.assertEqual(overlap["jaccard_overlap"], 1.0)
+        self.assertTrue(overlap["trail_segment_allowed"])
+        self.assertIsNone(overlap["break_reason"])
 
     def test_activity_contains_no_spatial_movement_coordinates(self) -> None:
         activity = self.store.activity({"story_cluster_id": "story-A"})
@@ -289,9 +574,11 @@ class StoryMapServerTests(unittest.TestCase):
         self.assertTrue(a["persists_to_current"])
         self.assertEqual(trail["meta"]["current_field_count"], 2)
         self.assertEqual(trail["meta"]["prior_field_count"], 2)
+        self.assertEqual(trail["meta"]["previous_field_count"], 1)
         self.assertEqual(trail["meta"]["persisting_field_count"], 1)
-        self.assertEqual(trail["meta"]["departed_field_count"], 1)
+        self.assertEqual(trail["meta"]["departed_field_count"], 0)
         self.assertEqual(trail["meta"]["new_current_field_count"], 1)
+        self.assertEqual(trail["meta"]["transition_scope"], "open_previous_bucket")
 
         bounded = self.store.trail_features(
             timeline_bucket="2025-01-15",
@@ -303,6 +590,44 @@ class StoryMapServerTests(unittest.TestCase):
         self.assertEqual(len(bounded["features"]), 1)
         self.assertEqual(bounded["meta"]["prior_field_count"], 2)
         self.assertTrue(bounded["meta"]["truncated"])
+
+    def test_trail_open_transitions_use_immediately_previous_bucket(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            for name in (
+                "field_geometry.parquet", "cluster_labels.parquet",
+                "event_windows.parquet", "story_day_membership.parquet", "manifest.json",
+            ):
+                shutil.copy2(self.settings.run_dir / name, run_dir / name)
+            rows = []
+            for bucket, event_state, risk, rank in (
+                ("2025-01-01", "ACTIVE", "MED-HIGH", 3),
+                ("2025-01-08", "CLOSED_RECOVERED", "LOW", 1),
+                ("2025-01-15", "ACTIVE", "MED-HIGH", 3),
+            ):
+                rows.append(
+                    {
+                        **_frame_row(bucket, "A", "story-A"),
+                        "event_id": f"event-{bucket}", "event_state": event_state,
+                        "current_risk_band": risk, "current_risk_rank": rank,
+                    }
+                )
+            pd.DataFrame(rows).to_parquet(run_dir / "frame_fields.parquet", index=False)
+            store = StoryMapStore(Settings(**{**self.settings.__dict__, "run_dir": run_dir}))
+            trail = store.trail_features(
+                timeline_bucket="2025-01-15",
+                filters={"story_cluster_id": "story-A"},
+                lookback=2,
+            )
+
+        self.assertEqual(trail["meta"]["previous_field_count"], 0)
+        self.assertEqual(trail["meta"]["persisting_field_count"], 0)
+        self.assertEqual(trail["meta"]["new_current_field_count"], 1)
+        self.assertEqual(len(trail["features"]), 1)
+        prior = trail["features"][0]["properties"]
+        self.assertEqual(prior["timeline_bucket"], "2025-01-01")
+        self.assertEqual(prior["event_state"], "ACTIVE")
+        self.assertEqual(prior["current_risk_band"], "MED-HIGH")
 
     def test_recent_field_events_and_invalid_bbox(self) -> None:
         events = self.store.field_events("A", 2)["events"]

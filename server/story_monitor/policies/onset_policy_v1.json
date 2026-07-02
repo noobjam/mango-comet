@@ -1,0 +1,40 @@
+{
+  "policy_version": "weekly-story-monitor-v1.0.0-uncalibrated",
+  "calibration_status": "STARTER_THRESHOLDS_UNCALIBRATED_REQUIRES_AGRONOMIST_VALIDATION",
+  "description": "Deterministic prefix-safe starter policy. Every numeric threshold is provisional and must not be presented as calibrated agronomic truth.",
+  "crop_instance_gap_days": 60,
+  "spectral_freshness_days": {
+    "fresh": 7,
+    "aging": 14
+  },
+  "reference_window_days": {
+    "minimum": 7,
+    "maximum": 21
+  },
+  "spectral_change_thresholds": {
+    "medium_ndvi_delta": -0.08,
+    "medium_ndmi_delta": -0.06,
+    "medium_psri_delta": 0.05,
+    "severe_ndvi_delta": -0.15,
+    "severe_ndmi_delta": -0.10,
+    "severe_psri_delta": 0.10,
+    "recovery_ndvi_delta": 0.05,
+    "recovery_ndmi_delta": 0.04,
+    "recovery_psri_delta": -0.05
+  },
+  "onset_rules": {
+    "watch": "LOW-MED or higher on 2 of 3 observed days, or one fresh/aging medium response",
+    "active": "MED-HIGH or higher on 2 of 3, or aligned fresh/aging medium response plus same-driver LOW-MED-or-higher pressure",
+    "severe": "one HIGH day or one aligned severe response"
+  },
+  "quiet_observed_days_by_hazard": {
+    "heat": 4,
+    "damaging_wind": 4,
+    "ponding_flooding": 7,
+    "drought": 14,
+    "unattributed_decline": 7,
+    "other": 7
+  },
+  "data_gap_days": 7,
+  "max_recovery_days": 28
+}

@@ -1,4 +1,5 @@
-import { applyVisualProperties, colorFor } from "./palette.js";
+import { alphaForState, applyVisualProperties, colorFor } from "./palette.js";
+import { buildEvolutionModel, evolutionDeckLayers, evolutionGeoJson } from "./map-evolution.js";
 
 const EMPTY = { type: "FeatureCollection", features: [], meta: {} };
 
@@ -16,6 +17,8 @@ export class MapView {
     this.colorMode = "family";
     this.showHistory = true;
     this.selectedFieldId = "";
+    this.evolution = null;
+    this.evolutionBucket = "";
     this.overlay = null;
     this.ready = false;
     this.fallbackEventsBound = false;
@@ -93,9 +96,11 @@ export class MapView {
     this.onReady?.();
   }
 
-  setData(frame, trail) {
+  setData(frame, trail, evolution = this.evolution, evolutionBucket = this.evolutionBucket) {
     this.frame = frame || EMPTY;
     this.trail = trail || EMPTY;
+    this.evolution = evolution || null;
+    this.evolutionBucket = String(evolutionBucket || "");
     this.render();
   }
 
@@ -111,6 +116,12 @@ export class MapView {
 
   setSelectedField(fieldId) {
     this.selectedFieldId = String(fieldId || "");
+    this.render();
+  }
+
+  setEvolution(payload, bucket) {
+    this.evolution = payload || null;
+    this.evolutionBucket = String(bucket || "");
     this.render();
   }
 
@@ -155,13 +166,17 @@ export class MapView {
       filled: true,
       stroked: true,
       lineWidthUnits: "pixels",
-      getFillColor: (feature) => colorFor(feature.properties, this.colorMode, 188),
+      getFillColor: (feature) => colorFor(
+        feature.properties,
+        this.colorMode,
+        alphaForState(feature.properties, 188),
+      ),
       getLineColor: (feature) => String(feature.properties?.field_id) === this.selectedFieldId
         ? [255, 255, 255, 255]
         : [5, 20, 15, 210],
       getLineWidth: (feature) => {
         if (String(feature.properties?.field_id) === this.selectedFieldId) return 3;
-        const risk = String(feature.properties?.max_risk_band || "").toUpperCase();
+        const risk = String(feature.properties?.current_risk_band || feature.properties?.max_risk_band || "").toUpperCase();
         if (this.colorMode === "risk" && ["HIGH", "SEVERE"].includes(risk)) return 1.8;
         return this.colorMode === "risk" && risk === "MEDIUM" ? 1.1 : 0.7;
       },
@@ -174,7 +189,14 @@ export class MapView {
       onHover: (info) => this.onHover?.(info.object?.properties || null, { x: info.x, y: info.y }),
       onClick: (info) => this.onSelect?.(info.object?.properties || null),
     }));
+    layers.push(...this.evolutionLayers());
     return layers;
+  }
+
+  evolutionLayers() {
+    const model = buildEvolutionModel(this.evolution, this.evolutionBucket);
+    const base = colorFor(this.frame.features?.[0]?.properties || {}, this.colorMode, 220);
+    return evolutionDeckLayers(deck, model, base);
   }
 
   priorTrail() {
@@ -194,18 +216,23 @@ export class MapView {
     const history = this.showHistory ? applyVisualProperties(this.priorTrail(), this.colorMode, true) : EMPTY;
     this.setSource("story-history-fallback", history);
     this.setSource("story-current-fallback", current);
+    this.setSource("activity-center-fallback", this.evolutionGeoJson());
     this.ensureFallbackLayers();
     this.map.setLayoutProperty("story-history-fill", "visibility", this.showHistory ? "visible" : "none");
     this.map.setPaintProperty("story-current-line", "line-width", [
       "case",
       ["==", ["get", "field_id"], this.selectedFieldId], 3,
-      ["all", ["==", this.colorMode, "risk"], ["in", ["get", "max_risk_band"], ["literal", ["HIGH", "SEVERE"]]]], 1.8,
-      ["all", ["==", this.colorMode, "risk"], ["==", ["get", "max_risk_band"], "MEDIUM"]], 1.1,
+      ["all", ["==", this.colorMode, "risk"], ["in", ["coalesce", ["get", "current_risk_band"], ["get", "max_risk_band"]], ["literal", ["HIGH"]]]], 1.8,
+      ["all", ["==", this.colorMode, "risk"], ["in", ["coalesce", ["get", "current_risk_band"], ["get", "max_risk_band"]], ["literal", ["LOW-MED", "MED-HIGH"]]]], 1.1,
       0.7,
     ]);
     this.map.setPaintProperty("story-current-line", "line-color", [
       "case", ["==", ["get", "field_id"], this.selectedFieldId], "#ffffff", "#05140f",
     ]);
+  }
+
+  evolutionGeoJson() {
+    return evolutionGeoJson(buildEvolutionModel(this.evolution, this.evolutionBucket));
   }
 
   setSource(id, data) {
@@ -226,6 +253,15 @@ export class MapView {
     if (!this.map.getLayer("story-current-line")) this.map.addLayer({
       id: "story-current-line", type: "line", source: "story-current-fallback",
       paint: { "line-color": ["case", ["==", ["get", "field_id"], this.selectedFieldId], "#ffffff", "#05140f"], "line-opacity": 0.85, "line-width": 0.7 },
+    });
+    if (!this.map.getLayer("activity-center-dots")) this.map.addLayer({
+      id: "activity-center-dots", type: "circle", source: "activity-center-fallback",
+      paint: {
+        "circle-radius": ["match", ["get", "kind"], "current-center", 8, "prior-center", 4, 2],
+        "circle-color": "rgba(0,0,0,0)",
+        "circle-stroke-color": ["match", ["get", "kind"], "current-center", "#ffffff", "#73e2b4"],
+        "circle-stroke-width": ["match", ["get", "kind"], "current-center", 2.5, 1.2],
+      },
     });
     if (this.fallbackEventsBound) return;
     this.fallbackEventsBound = true;

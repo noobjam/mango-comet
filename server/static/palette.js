@@ -10,11 +10,12 @@ const FAMILY_SPECS = {
 };
 
 const RISK_SPECS = {
-  SEVERE: { label: "Severe", color: "#c83e68" },
+  UNKNOWN: { label: "Unknown / data gap", color: "#708078" },
   HIGH: { label: "High", color: "#e76f51" },
-  MEDIUM: { label: "Medium", color: "#f2c14e" },
+  "MED-HIGH": { label: "Medium–high", color: "#ef9b45" },
+  "LOW-MED": { label: "Low–medium", color: "#f2c14e" },
   LOW: { label: "Low", color: "#2a9d8f" },
-  NONE: { label: "Not classified", color: "#8b9d95" },
+  NONE: { label: "None", color: "#8b9d95" },
 };
 
 export function familyKey(properties = {}) {
@@ -33,17 +34,29 @@ export function familyKey(properties = {}) {
 }
 
 export function colorFor(properties, mode = "family", alpha = 210) {
-  const spec = mode === "risk" ? riskSpec(properties.max_risk_band) : FAMILY_SPECS[familyKey(properties)];
+  const spec = mode === "risk" ? riskSpec(properties.current_risk_band || properties.max_risk_band) : FAMILY_SPECS[familyKey(properties)];
   return hexToRgba(spec.color, alpha);
 }
 
+export function alphaForState(properties = {}, openAlpha = 188) {
+  const state = String(properties.event_state || "").toUpperCase();
+  if (state === "DATA_GAP") return Math.min(openAlpha, 96);
+  if (state.startsWith("CLOSED_")) return Math.min(openAlpha, 72);
+  return openAlpha;
+}
+
+export function isOpenStory(properties = {}) {
+  const state = String(properties.event_state || "").toUpperCase();
+  return !state || ["WATCH", "ACTIVE", "SEVERE", "QUIET_PENDING", "RECOVERING", "DATA_GAP"].includes(state);
+}
+
 export function colorHexFor(properties, mode = "family") {
-  return mode === "risk" ? riskSpec(properties.max_risk_band).color : FAMILY_SPECS[familyKey(properties)].color;
+  return mode === "risk" ? riskSpec(properties.current_risk_band || properties.max_risk_band).color : FAMILY_SPECS[familyKey(properties)].color;
 }
 
 export function legendEntries(mode, features = []) {
   if (mode === "risk") {
-    return ["LOW", "MEDIUM", "HIGH", "SEVERE"].map((key) => ({ key, ...RISK_SPECS[key] }));
+    return ["UNKNOWN", "NONE", "LOW", "LOW-MED", "MED-HIGH", "HIGH"].map((key) => ({ key, ...RISK_SPECS[key] }));
   }
   const present = new Set(features.map((feature) => familyKey(feature.properties || {})));
   const keys = Object.keys(FAMILY_SPECS).filter((key) => present.has(key));
@@ -56,7 +69,9 @@ export function applyVisualProperties(collection, mode, history = false) {
     const properties = { ...(feature.properties || {}) };
     const age = Math.max(0, Number(properties.age_index || 0));
     properties.__story_color = colorHexFor(properties, mode);
-    properties.__story_opacity = history ? Math.max(0.06, 0.24 - age * 0.035) : 0.72;
+    properties.__story_opacity = history
+      ? Math.max(0.06, 0.24 - age * 0.035)
+      : alphaForState(properties, 184) / 255;
     return { ...feature, properties };
   });
   return { type: "FeatureCollection", features, meta: collection?.meta || {} };

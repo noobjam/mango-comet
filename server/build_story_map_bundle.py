@@ -106,6 +106,8 @@ GEOMETRY_OUTPUT_COLUMNS = (
 )
 
 OPTIONAL_MOTIF_ARTIFACTS = (
+    "motif_assignments.parquet",
+    "motif_catalog.parquet",
     "event_motif_membership.parquet",
     "field_motif_timeline.parquet",
     "story_motifs.parquet",
@@ -116,12 +118,18 @@ OPTIONAL_MOTIF_ARTIFACTS = (
     "llm_narration_queue.jsonl",
 )
 
+OPTIONAL_MONITORING_ARTIFACTS = (
+    "crop_instances.parquet",
+    "event_state_snapshots.parquet",
+)
+
 OWNED_OUTPUT_NAMES = frozenset(
     {
         "field_geometry.parquet",
         "geometry_profile.json",
         *ARTIFACT_COPIES.values(),
         *OPTIONAL_MOTIF_ARTIFACTS,
+        *OPTIONAL_MONITORING_ARTIFACTS,
     }
 )
 
@@ -196,7 +204,34 @@ def build_bundle(
                 stage_dir,
                 min_frame_geometry_coverage=min_frame_geometry_coverage,
             )
+            mark_bundle_ready(stage_dir)
             install_staged_bundle(stage_dir, out_dir, transaction_dir / "backup")
+
+
+def mark_bundle_ready(stage_dir: Path) -> None:
+    """Mark readiness only after normalized geometry and joins have validated."""
+    path = stage_dir / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    run = manifest.setdefault("run", {})
+    run["viewer_ready"] = True
+    run["viewer_bundle_required"] = False
+    run["geometry_optimized"] = True
+    output_candidates = {
+        "field_geometry": "field_geometry.parquet",
+        "frame_fields": "frame_fields.parquet",
+        "cluster_labels": "cluster_labels.parquet",
+        "event_windows": "event_windows.parquet",
+        "story_day_membership": "story_day_membership.parquet",
+        "geometry_profile": "geometry_profile.json",
+        "crop_instances": "crop_instances.parquet",
+        "event_state_snapshots": "event_state_snapshots.parquet",
+        "motif_assignments": "motif_assignments.parquet",
+        "motif_catalog": "motif_catalog.parquet",
+    }
+    manifest["outputs"] = {
+        key: name for key, name in output_candidates.items() if (stage_dir / name).is_file()
+    }
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def validate_coverage_threshold(name: str, value: float) -> float:
@@ -410,7 +445,8 @@ def build_geometry(
 
 
 def copy_artifacts(run_dir: Path, out_dir: Path) -> None:
-    copies = {**ARTIFACT_COPIES, **{name: name for name in OPTIONAL_MOTIF_ARTIFACTS}}
+    optional = (*OPTIONAL_MOTIF_ARTIFACTS, *OPTIONAL_MONITORING_ARTIFACTS)
+    copies = {**ARTIFACT_COPIES, **{name: name for name in optional}}
     for source_name, target_name in copies.items():
         source = run_dir / source_name
         if source.exists():

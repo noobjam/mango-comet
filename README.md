@@ -1,8 +1,8 @@
 # Mango Comet
 
-Portable viewer for retrospective agronomic story activity. The repository is
-intentionally code-only: field geometry, Parquet runs, manifests, generated
-bundles, and credentials are not published.
+Echo-aware story monitoring, offline motif discovery, and a portable agronomic
+activity viewer. The repository is intentionally code-only: field geometry,
+Parquet runs, manifests, generated bundles, and credentials are not published.
 
 ## VM quick start
 
@@ -66,6 +66,11 @@ STORY_MAP_RUN_DIR=/srv/story-map-data/releases/mango-comet-v1
 The builder validates required schemas, geometry integrity, unique field IDs,
 and geometry coverage before installing a release.
 
+`weekly_story_monitor.py` builds immutable weekly monitoring generations from
+the VM echo-aware parquet. It is currently a scheduled batch-release workflow,
+not a parquet tailer or hot-reloading browser service; the exact VM commands and
+that production boundary are documented in `server/README.md`.
+
 ## Verify on the VM
 
 ```bash
@@ -77,6 +82,10 @@ curl --fail http://127.0.0.1:8877/api/health
 For interpretation, API endpoints, performance controls, optional GPU
 precomputation, and the production vector-tile direction, see
 [`server/README.md`](server/README.md).
+
+For lifecycle semantics, causality rules, trajectory interpretation,
+validation gates, and safe presentation language, read
+[`server/MONITORING_STORIES.md`](server/MONITORING_STORIES.md).
 
 ## Data policy
 
