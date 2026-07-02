@@ -3,11 +3,17 @@
 # version, so prefer the RAPIDS install selector when possible:
 # https://docs.rapids.ai/install/
 #
-# Typical CUDA 12 pip package names are below. Keep this file as a reference,
-# not as a mandatory dependency for the map server.
-cudf-cu12
-cuml-cu12
-cuspatial-cu12
-dask-cudf-cu12
-dask-cuda
-cupy-cuda12x
+# Keep this file as a package-name reference, not as a directly installable
+# requirements file: CUDA 12 and CUDA 13 packages are mutually exclusive.
+# Pin one coherent RAPIDS release in a separate environment.
+#
+# CUDA 12 example:
+#   cuml-cu12==26.6.*
+#   cupy-cuda12x>=13.6,<14
+#
+# CUDA 13 example used by the current H100 VM (CUDA toolkit 13.0):
+#   cuml-cu13==26.6.*
+#   cupy-cuda13x>=13.6,<14
+#
+# Add cudf/dask packages only when a measured workload uses them. The current
+# motif trainer uses single-GPU cuML HDBSCAN and does not require Dask.

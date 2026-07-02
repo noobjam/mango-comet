@@ -50,6 +50,9 @@ The new `weekly_story_monitor.py` path provides those causal prefixes for
 ordinary append-only updates. Its starter thresholds and discovered motifs are
 still uncalibrated and require agronomist/outcome validation. Read
 [`MONITORING_STORIES.md`](MONITORING_STORIES.md) before presenting the method.
+For the exact first full-release sequence, durable `nohup` commands, quality
+gates, current full-scale export blocker, bundle promotion, and map acceptance
+checks, use [`VM_MAP_RELEASE_RUNBOOK.md`](VM_MAP_RELEASE_RUNBOOK.md).
 
 ## Build monitoring data on the VM
 
@@ -57,7 +60,7 @@ Use the echo-aware deliverable and the matching geometry:
 
 ```bash
 DATA=/mnt/KSA-Oasis/fields_health_v2/rwanda_crop_risk_kb/final_field_daily_v4/rwanda_2025_2026_field_daily_risk_DELIVERABLE_WITH_CROP_AND_RISK_DRIVER_v4_WITH_SPECTRAL_ECHO_DAYS.parquet
-GEOM=/mnt/KSA-Oasis/fields_health_v2/spatial/rwanda_2025_v3_deliverable_field_geometries_with_admin_hierarchy.parquet
+GEOM=/mnt/KSA-Oasis/fields_health_v2/clusters/runs/full_event_adaptive_28d/map_field_geometry.parquet
 ROOT=/mnt/KSA-Oasis/fields_health_v2/clusters/runs/weekly_monitor_v1
 AS_OF=2026-05-17
 ```
@@ -135,12 +138,21 @@ borrowing January 2026 evidence. Concurrent hazards use event-specific daily
 pressure/response columns, so one field's heat event cannot inherit its drought
 event's pressure signal.
 
-Use `--engine cpu` when RAPIDS is unavailable or for a canonical
-reproducibility run. In either case, weekly assignment uses the frozen model;
-it does not recluster as new weeks arrive.
+Use `--engine cpu` only for bounded fixtures or a separately measured
+reproducibility run. Do not use `--engine auto` for the 3.1-million-event
+generation: a missing RAPIDS installation could silently select CPU HDBSCAN.
+In either case, weekly assignment uses the frozen model; it does not recluster
+as new weeks arrive.
 
-Export motif assignments and build the geometry-optimized bundle used by the
-app:
+The following export command describes the intended artifact sequence, but it
+is **not currently safe for the first full generation**. The exporter on commit
+`eb6fa0a` materializes all weekly prefixes and performs row-wise pandas
+assignment before copying and rewriting the generation. At 3.1 million events,
+run the scalable-export gate in
+[`VM_MAP_RELEASE_RUNBOOK.md`](VM_MAP_RELEASE_RUNBOOK.md) before using it.
+
+After that gate is implemented and verified, export motif assignments and build
+the geometry-optimized bundle used by the app:
 
 ```bash
 MOTIF_RUN="$ROOT/releases/${AS_OF}_motifs"

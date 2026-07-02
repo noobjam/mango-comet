@@ -69,7 +69,10 @@ and geometry coverage before installing a release.
 `weekly_story_monitor.py` builds immutable weekly monitoring generations from
 the VM echo-aware parquet. It is currently a scheduled batch-release workflow,
 not a parquet tailer or hot-reloading browser service; the exact VM commands and
-that production boundary are documented in `server/README.md`.
+that production boundary are documented in `server/README.md`. The current
+full-generation checkpoint and the gated path from RAPIDS installation through
+learned motifs, bundle promotion, map verification, and latency acceptance are
+in [`server/VM_MAP_RELEASE_RUNBOOK.md`](server/VM_MAP_RELEASE_RUNBOOK.md).
 
 ## Verify on the VM
 
