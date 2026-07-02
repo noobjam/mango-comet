@@ -80,7 +80,10 @@ From the repository root:
 ```bash
 python -m venv .venv-map
 source .venv-map/bin/activate
-pip install -r server/requirements.txt
+PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL= \
+  python -m pip install --no-cache-dir \
+  --index-url https://pypi.org/simple \
+  -r server/requirements.txt
 cp server/env.example server/.env
 python server/story_map_server.py
 ```

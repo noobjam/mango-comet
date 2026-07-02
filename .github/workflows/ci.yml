@@ -27,7 +27,7 @@ jobs:
         with:
           node-version: "22"
       - name: Install Python dependencies
-        run: python -m pip install -r server/requirements.txt
+        run: python -m pip install --index-url https://pypi.org/simple -r server/requirements.txt
       - name: Compile Python
         run: python -m py_compile server/*.py
       - name: Check JavaScript syntax

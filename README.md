@@ -13,10 +13,20 @@ cd mango-comet
 python3 --version  # Python 3.11 or newer
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r server/requirements.txt
+
+# Ignore machine-wide Oracle pip configuration and use only public PyPI.
+PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL= \
+  python -m pip install --no-cache-dir \
+  --index-url https://pypi.org/simple \
+  -r server/requirements.txt
 
 cp server/env.example server/.env
 ```
+
+This command bypasses machine-wide pip configuration and permits only the
+official `https://pypi.org/simple` index. If it still reports a proxy connection
+failure, inspect `env | grep -i proxy`; the VM may also have stale `HTTP_PROXY`,
+`HTTPS_PROXY`, or `ALL_PROXY` variables unrelated to pip's package index.
 
 Edit `server/.env` and point `STORY_MAP_RUN_DIR` at the existing run directory
 on the VM. A raw run works for current-frame exploration; historical footprints
