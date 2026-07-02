@@ -8,7 +8,7 @@ import tempfile
 from threading import Event, Thread
 import time
 import unittest
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 from urllib.error import HTTPError
 
 import pandas as pd
@@ -22,6 +22,12 @@ from story_map_server import (
     make_handler,
 )
 from http.server import ThreadingHTTPServer
+
+
+# These integration tests only call their own loopback HTTP servers. Bypass
+# machine-wide corporate proxy settings so 127.0.0.1 can never be sent to an
+# outbound proxy on developer or VM hosts.
+urlopen = build_opener(ProxyHandler({})).open
 
 
 def _geometry_row(field_id: str, x: float, y: float) -> dict[str, object]:
