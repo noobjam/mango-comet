@@ -6,6 +6,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import date
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import shutil
@@ -154,7 +155,10 @@ def build_partitioned_generation(
             summaries = [_process_partition(job) for job in jobs]
         else:
             try:
-                executor = ProcessPoolExecutor(max_workers=options.workers)
+                executor = ProcessPoolExecutor(
+                    max_workers=options.workers,
+                    mp_context=multiprocessing.get_context("spawn"),
+                )
             except (OSError, PermissionError):
                 # Restricted runtimes may deny POSIX semaphore inspection. The
                 # partition contract remains correct when processed serially.
