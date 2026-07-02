@@ -1,0 +1,13 @@
+# Optional RAPIDS acceleration for the GPU VM.
+# Install only on the H100/CUDA VM. RAPIDS packaging changes by CUDA/Python
+# version, so prefer the RAPIDS install selector when possible:
+# https://docs.rapids.ai/install/
+#
+# Typical CUDA 12 pip package names are below. Keep this file as a reference,
+# not as a mandatory dependency for the map server.
+cudf-cu12
+cuml-cu12
+cuspatial-cu12
+dask-cudf-cu12
+dask-cuda
+cupy-cuda12x

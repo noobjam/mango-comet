@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#09110f" />
+    <title>Agronomic Story Activity</title>
+    <link rel="stylesheet" href="./vendor/maplibre-gl.css" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <div class="eyebrow">Field intelligence</div>
+          <h1>Agronomic story activity</h1>
+          <p id="runSummary">Preparing the story map…</p>
+        </div>
+        <div class="top-actions">
+          <div id="loadingStatus" class="status-pill" role="status" aria-live="polite">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="loadingStatusText">Loading data</span>
+          </div>
+          <label class="compact-control" for="colorMode">
+            <span>Color fields by</span>
+            <select id="colorMode">
+              <option id="familyColorOption" value="family" selected>Situation family</option>
+              <option value="risk">Risk severity</option>
+            </select>
+          </label>
+          <button
+            id="panelToggle"
+            class="panel-toggle"
+            type="button"
+            aria-expanded="false"
+            aria-controls="explorerPanel"
+          >
+            Explore
+          </button>
+        </div>
+      </header>
+
+      <section class="map-workspace" aria-label="Story activity map and controls">
+        <div
+          id="map"
+          role="region"
+          aria-label="Map of fields with active agronomic stories. Use the explorer and timeline for a text-accessible view."
+          tabindex="0"
+        ></div>
+        <p id="mapHelp" class="sr-only">
+          Filled polygons are fields active in the selected week. Faded polygons show recently active fields;
+          they are history, not a movement path.
+        </p>
+
+        <aside id="explorerPanel" class="explorer-panel" aria-label="Story explorer">
+          <div class="panel-heading">
+            <div>
+              <div class="eyebrow">Retrospective explorer</div>
+              <h2>What was happening?</h2>
+            </div>
+            <button id="panelClose" class="icon-button mobile-only" type="button" aria-label="Close explorer">×</button>
+          </div>
+
+          <div class="mode-switch" role="group" aria-label="Exploration mode">
+            <button id="situationMode" class="mode-button is-active" type="button" aria-pressed="true">
+              Similar situations
+            </button>
+            <button id="exactMode" class="mode-button" type="button" aria-pressed="false">
+              Exact story
+            </button>
+          </div>
+
+          <section id="situationFilters" class="filter-section" aria-labelledby="situationFilterTitle">
+            <h3 id="situationFilterTitle">Group fields by shared evidence</h3>
+            <div class="filter-grid">
+              <label>
+                <span id="familyFilterLabel">Situation family</span>
+                <select id="familyFilter"><option value="">All families</option></select>
+              </label>
+              <label>
+                <span>Risk</span>
+                <select id="riskFilter"><option value="">All risks</option></select>
+              </label>
+              <label>
+                <span>Hazard</span>
+                <select id="hazardFilter"><option value="">All hazards</option></select>
+              </label>
+              <label>
+                <span>Response evidence</span>
+                <select id="responseFilter"><option value="">All responses</option></select>
+              </label>
+            </div>
+          </section>
+
+          <section id="exactFilters" class="filter-section" aria-labelledby="exactFilterTitle" hidden>
+            <h3 id="exactFilterTitle">Trace one strict temporal signature</h3>
+            <label class="stacked-control">
+              <span>Find an exact story</span>
+              <input id="storySearch" type="search" autocomplete="off" placeholder="Search hazard, risk, response, or ID" />
+            </label>
+            <label class="stacked-control">
+              <span>Exact story</span>
+              <select id="storySelect"><option value="">Choose a story</option></select>
+            </label>
+          </section>
+
+          <div class="filter-actions">
+            <button id="clearFilters" class="quiet-button" type="button">Clear filters</button>
+            <label class="history-toggle">
+              <input id="showHistory" type="checkbox" checked disabled />
+              <span id="historyLabel">Filter to compare weeks</span>
+            </label>
+          </div>
+
+          <article id="storySummary" class="story-card" aria-live="polite">
+            <div class="story-card-kicker">All situations</div>
+            <h3>Every active story in the selected week</h3>
+            <p>Choose shared evidence or an exact story to narrow the retrospective.</p>
+          </article>
+
+          <section class="activity-section" aria-labelledby="activityTitle">
+            <div class="section-heading-row">
+              <h3 id="activityTitle">Visible field activity</h3>
+              <span id="activityScope">Current viewport</span>
+            </div>
+            <div id="activityStats" class="stat-grid" aria-live="polite">
+              <div><strong id="affectedCount">—</strong><span>active now</span></div>
+              <div><strong id="enteringCount">—</strong><span>entering</span></div>
+              <div><strong id="persistingCount">—</strong><span>persisting</span></div>
+              <div><strong id="inactiveCount">—</strong><span>recently inactive</span></div>
+            </div>
+          </section>
+
+          <section class="legend-section" aria-labelledby="legendTitle">
+            <h3 id="legendTitle">Map key</h3>
+            <div id="legend" class="legend"></div>
+            <p class="legend-note"><span class="history-swatch"></span> Faded fill = prior active bucket</p>
+          </section>
+
+          <section id="selectionPanel" class="selection-panel" aria-labelledby="selectionTitle">
+            <h3 id="selectionTitle">Field evidence</h3>
+            <div id="selectionDetails" class="detail muted">Select a field to inspect its event windows.</div>
+          </section>
+        </aside>
+
+        <div id="hoverTooltip" class="map-tooltip" role="tooltip" hidden></div>
+      </section>
+
+      <section class="timeline-dock" aria-labelledby="timelineTitle">
+        <div class="playback-controls">
+          <button id="previousBucket" class="icon-button" type="button" aria-label="Previous week">‹</button>
+          <button id="playTimeline" class="play-button" type="button" aria-pressed="false">Play</button>
+          <button id="nextBucket" class="icon-button" type="button" aria-label="Next week">›</button>
+        </div>
+        <div class="timeline-main">
+          <div class="timeline-heading">
+            <div>
+              <span id="timelineTitle" class="eyebrow">Selected week</span>
+              <strong id="timelineLabel">Loading timeline…</strong>
+            </div>
+            <span id="frameStats">Waiting for map data</span>
+          </div>
+          <div id="timelineHistogram" class="timeline-histogram" aria-hidden="true"></div>
+          <input
+            id="timelineSlider"
+            type="range"
+            min="0"
+            max="0"
+            value="0"
+            aria-label="Story activity week"
+          />
+          <div class="timeline-extents"><span id="timelineStart">—</span><span id="timelineEnd">—</span></div>
+        </div>
+        <label class="speed-control" for="playbackSpeed">
+          <span>Playback</span>
+          <select id="playbackSpeed">
+            <option value="1600">Slow</option>
+            <option value="1000" selected>Normal</option>
+            <option value="600">Fast</option>
+          </select>
+        </label>
+      </section>
+    </main>
+
+    <script src="./vendor/maplibre-gl.js"></script>
+    <script src="./vendor/deck.gl.js"></script>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

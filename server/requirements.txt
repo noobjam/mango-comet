@@ -1,0 +1,4 @@
+duckdb>=1.2.0
+pandas>=2.2.0
+pyarrow>=18.0.0
+shapely>=2.1.0
