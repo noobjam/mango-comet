@@ -575,9 +575,11 @@ code when either gate group fails. It never publishes anything to the map.
 The runner resolves RAPIDS in this order: explicit `--rapids-python`, an
 exported `RAPIDS_PYTHON`, then `$ROOT/logs/latest_rapids_python.txt`. The
 completed installation pointer is therefore enough when no environment
-override is present. It also refuses a dirty tracked worktree, so commit or
-stash tracked VM edits first. Run the complete sequence in the foreground with
-the known full generation:
+override is present. The virtualenv `bin/python` launcher path is preserved;
+it must not be canonicalized to the base interpreter, which would bypass the
+RAPIDS site-packages. The runner also refuses a dirty tracked worktree, so
+commit or stash tracked VM edits first. Run the complete sequence in the
+foreground with the known full generation:
 
 ```bash
 cd /mnt/KSA-Oasis/El-Mohammed/mango-comet

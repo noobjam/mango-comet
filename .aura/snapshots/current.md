@@ -17,6 +17,8 @@
   heartbeats, orphan-child protection, gate-aware exit codes, and persistent
   launcher logs. No `tqdm` percentage is shown because the stages expose no
   valid work denominator.
-- Current verification: 100 Python tests and 11 browser-logic tests pass;
+- Current verification: 101 Python tests and 11 browser-logic tests pass;
   compilation, diff checks, and documentation Bash syntax pass. Independent
   runner and documentation reviews pass. VM execution remains.
+- VM preflight fix: preserve the RAPIDS virtualenv `bin/python` symlink path;
+  resolving it to the base interpreter bypassed CuPy/cuML site-packages.

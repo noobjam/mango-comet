@@ -12,6 +12,7 @@ from unittest import mock
 
 from story_monitor.archetype_runner_validation import (
     discover_generation,
+    resolve_rapids_python,
     validate_evaluation,
 )
 from story_monitor.runner_process import RunnerError, run_stage
@@ -148,6 +149,22 @@ class _FakeProcess:
 
 
 class ArchetypeV2RunnerTests(unittest.TestCase):
+    def test_rapids_virtualenv_python_symlink_is_not_canonicalized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "base" / "python3.13"
+            target.parent.mkdir()
+            target.write_text("#!/bin/sh\n")
+            target.chmod(0o755)
+            virtualenv_python = root / "venv" / "bin" / "python"
+            virtualenv_python.parent.mkdir(parents=True)
+            virtualenv_python.symlink_to(target)
+
+            selected = resolve_rapids_python(root, virtualenv_python)
+
+            self.assertEqual(selected, virtualenv_python.absolute())
+            self.assertNotEqual(selected, target.resolve())
+
     def test_generation_discovery_is_full_immutable_and_unambiguous(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

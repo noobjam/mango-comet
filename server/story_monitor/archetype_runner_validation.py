@@ -131,7 +131,10 @@ def resolve_rapids_python(root: Path, explicit: Path | None) -> Path:
             candidate = Path(pointer.read_text(encoding="utf-8").strip())
     if candidate is None:
         raise RunnerError("RAPIDS Python is unknown; pass --rapids-python or restore latest_rapids_python.txt")
-    candidate = candidate.expanduser().resolve()
+    # A virtualenv's bin/python is commonly a symlink to the base interpreter.
+    # Keep that launcher path: executing the resolved target bypasses the
+    # virtualenv's site-packages (including CuPy/cuML).
+    candidate = Path(os.path.abspath(candidate.expanduser()))
     if not candidate.is_file() or not os.access(candidate, os.X_OK):
         raise RunnerError(f"RAPIDS Python is not executable: {candidate}")
     return candidate
