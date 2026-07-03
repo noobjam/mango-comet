@@ -4,6 +4,19 @@ Portable, no-Docker server for reviewing precomputed crop-risk stories on a
 map. MapLibre/deck.gl render in the browser; the Python server reads Parquet
 artifacts with DuckDB.
 
+## Archetype V2 Phase A authority
+
+[`ARCHETYPE_V2.md`](ARCHETYPE_V2.md) is the authoritative contract and VM
+runbook for the current learned-archetype work. Phase A builds and evaluates one
+fixed causal anchor per eligible event; it does not publish archetypes to this
+viewer.
+
+The completed V1 experiment's **10,901 HDBSCAN prefix groups are diagnostic and
+not publishable**. They came from multiple age-dependent prefix rows per event,
+remain `discovered_unreviewed`, and must not be described as 10,901 story types
+or exported as the map taxonomy. The V1 commands below remain for provenance
+and bounded compatibility tests, not as the V2 release path.
+
 ## Interpretation
 
 Three related identifiers may be present:
@@ -50,6 +63,9 @@ The new `weekly_story_monitor.py` path provides those causal prefixes for
 ordinary append-only updates. Its starter thresholds and discovered motifs are
 still uncalibrated and require agronomist/outcome validation. Read
 [`MONITORING_STORIES.md`](MONITORING_STORIES.md) before presenting the method.
+For the V2 event anchor, exact eligibility/status contract, immutable assignment,
+gates, Phase A artifacts, and VM commands, read
+[`ARCHETYPE_V2.md`](ARCHETYPE_V2.md).
 For the exact first full-release sequence, durable `nohup` commands, quality
 gates, current full-scale export blocker, bundle promotion, and map acceptance
 checks, use [`VM_MAP_RELEASE_RUNBOOK.md`](VM_MAP_RELEASE_RUNBOOK.md).
@@ -114,8 +130,10 @@ current full update also rescans and repartitions retained history; a persistent
 incremental event registry and automatic late-correction lineage remain future
 production work.
 
-Discover motifs on 2025 prefixes, leaving 2026 available for validation. One
-H100 is enough for the initial hazard-stratified discovery:
+The following command records the historical V1 prefix experiment. It is not
+the Archetype V2 command and must not be used to produce a publishable map.
+V1 used 2025 prefixes, leaving 2026 available for diagnostics. One H100 is
+enough for its hazard-stratified discovery:
 
 ```bash
 MODEL="$ROOT/models/motif_v1_train_2025"

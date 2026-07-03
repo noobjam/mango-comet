@@ -3,6 +3,19 @@
 This document is the scientific and product contract for the live story view.
 It is intentionally stricter than the original retrospective prototype.
 
+> **Archetype V2 status:** [`ARCHETYPE_V2.md`](ARCHETYPE_V2.md) supersedes the
+> V1 prefix-motif method for current learned-archetype discovery and release
+> decisions. Phase A uses one fixed causal event anchor, assigns at most one
+> immutable archetype per event, and ends at an unreviewed diagnostic model. It
+> does not change the V1 event-state semantics documented here and does not
+> authorize a map release.
+
+The completed V1 experiment produced **10,901 HDBSCAN groups from sampled
+weekly event prefixes**. The count is a diagnostic of the V1 representation,
+not a set of validated story types. Those groups remain unreviewed and must not
+be published, used as a flat legend, or presented as agronomically meaningful
+clusters.
+
 ## Verdict on the idea
 
 The core idea is good: monitor a field as an evolving event, then group event
@@ -120,6 +133,12 @@ use current risk.
 Motifs are trained offline from causal prefix snapshots, never from completed
 event summaries projected backward in time.
 
+This section describes V1 behavior for provenance. V2 does not cluster every
+weekly prefix: it anchors each eligible event once at the 21st usable pressure
+observation or an eligible earlier closure. Its exact eligibility, 20-feature
+schema, four-way anchor-status ledger, temporal holdout, and gates are defined only in
+[`ARCHETYPE_V2.md`](ARCHETYPE_V2.md).
+
 Training cutoffs apply before prefix windows are built, and partial boundary
 weeks are excluded. Daily pressure and response are event-specific; concurrent
 hazards may share field-level weather/acquisition context but never each other's
@@ -208,15 +227,17 @@ measure:
 - median event intersection-over-union;
 - same-motif “same narration” agreement and false-merge rate;
 - inter-rater agreement;
-- bootstrap cluster stability and frozen-assignment stability;
+- deterministic hazard-stratified subsample-refit stability, with the
+  hazard-local scaler refitted inside each subsample, plus frozen-assignment
+  stability;
 - novelty rate, tiny-cluster rate, and motif drift by season;
 - cross-crop support reported by crop and season, not only pooled counts;
 - usefulness for scouting prioritization or an independently measured outcome.
 
 Suggested gates for a pilot are boundary F1 at least 0.80 within two days,
 median event IoU at least 0.70, agronomist same-narration agreement at least
-80%, false merges at most 10%, and bootstrap matched-motif Jaccard at least
-0.70. These are proposed acceptance gates, not achieved results.
+80%, false merges at most 10%, and subsample-refit matched-archetype Jaccard at
+least 0.70. These are proposed acceptance gates, not achieved results.
 
 ## Safe presentation language
 
@@ -237,3 +258,9 @@ Do not say:
 Until expert/outcome validation is complete, call V1 a
 **causal monitoring and motif-discovery framework with uncalibrated starter
 thresholds**.
+
+For Archetype V2 Phase A, use the narrower language in
+[`ARCHETYPE_V2.md`](ARCHETYPE_V2.md): it evaluates the stability and separation
+of causal event-anchor archetypes on a temporal holdout; the outputs remain
+unreviewed and unpublished. Passing those statistical gates does not establish
+that the archetypes are semantically or narratively distinct.

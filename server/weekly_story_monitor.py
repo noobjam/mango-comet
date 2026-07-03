@@ -122,6 +122,32 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--generation-dir", type=Path, required=True)
     export.add_argument("--model-dir", type=Path, required=True)
     export.add_argument("--output-dir", type=Path, required=True)
+
+    build_v2 = subparsers.add_parser(
+        "build-archetypes-v2",
+        help="Build one-anchor-per-event V2 diagnostic archetypes; does not publish to the map.",
+    )
+    build_v2.add_argument("--generation-dir", type=Path, required=True)
+    build_v2.add_argument("--training-through", type=_date, required=True)
+    build_v2.add_argument("--output-dir", type=Path, required=True)
+    build_v2.add_argument("--engine", choices=("cpu", "gpu", "auto"), default="cpu")
+    build_v2.add_argument("--radius-quantile", type=float, default=0.95)
+    build_v2.add_argument("--assignment-margin", type=float, default=0.05)
+    build_v2.add_argument("--threads", type=_positive_int, default=16)
+    build_v2.add_argument("--memory-limit")
+    build_v2.add_argument("--temp-dir", type=Path)
+
+    evaluate_v2 = subparsers.add_parser(
+        "evaluate-archetypes-v2",
+        help="Run temporal-holdout and two-run stability gates for a frozen V2 model.",
+    )
+    evaluate_v2.add_argument("--model-dir", type=Path, required=True)
+    evaluate_v2.add_argument("--output-dir", type=Path, required=True)
+    evaluate_v2.add_argument(
+        "--stability-runs", dest="stability_runs",
+        type=_positive_int, default=2,
+        help="Exactly two deterministic 80%% hazard-stratified subsample refits.",
+    )
     return parser
 
 
@@ -226,13 +252,38 @@ def main() -> None:
             "training_prefix_count": len(prefixes),
             "model": manifest,
         }
-    else:
+    elif args.command == "export-motifs":
         output = export_motif_generation(args.generation_dir, args.model_dir, args.output_dir)
         payload = {
             "status": "written",
             "output_dir": str(output),
             "warning": "Motif labels remain discovered_unreviewed until expert validation.",
         }
+    elif args.command == "build-archetypes-v2":
+        from story_monitor.archetype_workflow_v2 import build_archetype_model
+        from story_monitor.archetypes_v2 import ArchetypeConfig
+
+        payload = build_archetype_model(
+            args.generation_dir,
+            args.output_dir,
+            training_cutoff=args.training_through.isoformat(),
+            config=ArchetypeConfig(
+                engine=args.engine,
+                radius_quantile=args.radius_quantile,
+                assignment_margin=args.assignment_margin,
+            ),
+            threads=args.threads,
+            memory_limit=args.memory_limit,
+            temp_dir=args.temp_dir,
+        )
+    else:
+        from story_monitor.archetype_workflow_v2 import evaluate_archetype_release
+
+        payload = evaluate_archetype_release(
+            args.model_dir,
+            args.output_dir,
+            stability_runs=args.stability_runs,
+        )
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 

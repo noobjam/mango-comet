@@ -4,6 +4,14 @@ This is the operational sequence for turning the first full causal monitoring
 generation into the data shown by the map. It is deliberately stricter than a
 list of commands: every stage has an artifact, a gate, and a failure rule.
 
+> **Current authority and stop point:** use
+> [`ARCHETYPE_V2.md`](ARCHETYPE_V2.md) for the active Phase A workflow. Phase A
+> discovers the latest completed generation, builds one fixed causal anchor per
+> eligible event, evaluates a frozen unreviewed V2 model, and then stops. It does
+> **not** export to the map, build a bundle, change `.env`, or restart the
+> viewer. The V1 commands retained below are a provenance record and bounded
+> compatibility reference.
+
 ## Current checkpoint
 
 The first full generation completed successfully on 2026-07-02:
@@ -20,20 +28,29 @@ generation_dir:
 This proves that the causal state-machine generation finished. It does **not**
 yet prove that the event thresholds or learned motifs are agronomically valid.
 
-The remaining sequence is:
+The completed V1 prefix experiment subsequently produced **10,901 HDBSCAN
+groups**. Because V1 sampled multiple age-dependent prefixes per event, that
+result is a fragmentation/scale diagnostic, not 10,901 publishable stories.
+The catalog is `discovered_unreviewed`; do not run it through the release path
+or show the count as the map taxonomy.
+
+The currently authorized sequence is:
 
 ```text
-RAPIDS ready
-  -> train frozen motifs on 2025 prefixes
-  -> inspect motif/noise diagnostics
-  -> pass the scalable-export code gate
-  -> assign the frozen model to all weekly prefixes
-  -> build the optimized map bundle
-  -> launch and benchmark the VM server
-  -> inspect the map and field trajectories
+discover latest complete 2026-05-17 generation from its manifest
+  -> build V2 one-anchor-per-event diagnostic model
+  -> evaluate temporal holdout, deterministic 80% subsample-refit stability,
+     and all-pairs prototype separation
+  -> require every hard and quality gate
+  -> retain unreviewed artifacts
+  -> STOP at the Phase A / Phase B boundary
 ```
 
-## Definition of done for the map
+Copy-paste generation/model discovery,
+`build-archetypes-v2` / `evaluate-archetypes-v2` launch wrappers, status files,
+and expected JSON checks are in [`ARCHETYPE_V2.md`](ARCHETYPE_V2.md).
+
+## Future Phase B definition of done for the map
 
 The desired map release must provide all of the following:
 
@@ -119,7 +136,7 @@ CUDA_VISIBLE_DEVICES=0 "$RAPIDS_PYTHON" -c 'import cupy as cp, cuml; from cuml.c
 Stop here if either command fails. Do not use `--engine auto`: on this dataset
 it could silently choose CPU HDBSCAN.
 
-## 3. Train the frozen motif model
+## 3. Historical V1: train the frozen prefix-motif model
 
 Training uses causal 2025 event prefixes and an explicit GPU backend. The
 current implementation uses one H100; the other seven GPUs do not reduce this
@@ -200,7 +217,7 @@ fi
 On failure, use a fresh `TRAIN_TAG` and model directory. Never reuse a partial
 model directory.
 
-## 4. Apply the model-quality gate
+## 4. Historical V1: inspect diagnostic model quality
 
 Restore the successful model path:
 
@@ -311,7 +328,7 @@ with duckdb.connect(":memory:") as con:
         ORDER BY prefix_count DESC
     """, [assignments]).fetchdf().to_string(index=False))
 
-    print("\nPUBLISHED MOTIF SIZE SUMMARY")
+    print("\nDISCOVERED V1 GROUP SIZE SUMMARY")
     print(con.execute("""
         SELECT
           hazard_family,
@@ -335,7 +352,7 @@ These summaries are diagnostics, not agronomic validation. Before publication:
 - keep catalog status `discovered_unreviewed` until that review exists;
 - do not tune thresholds solely to make the map look visually balanced.
 
-## 5. Full-scale export is a mandatory code gate
+## 5. Historical V1 full-scale exporter blocker
 
 **Do not run full `export-motifs` on commit `eb6fa0a`.** The current exporter:
 
@@ -363,10 +380,16 @@ The export gate is open only after the repository provides and tests:
 Until this gate is implemented, the technically correct next action is to
 inspect the trained model, not to attempt a full release export.
 
-## 6. Export and bundle after the scalable-export gate opens
+## 6. Historical release path — prohibited during Phase A
 
-This section is conditional. Run it only after pulling a reviewed commit that
-implements the gate above and after its full tests pass:
+Do not execute this section for the 10,901-group V1 result and do not execute it
+during V2 Phase A. It is retained to document the later operational shape. A
+future Phase B decision requires the V2 gates and expert review in
+[`ARCHETYPE_V2.md`](ARCHETYPE_V2.md), plus a reviewed scalable-export
+implementation. Passing only the old exporter code gate is insufficient.
+
+After that future Phase B decision, pull the reviewed commit and require its
+full tests:
 
 ```bash
 cd "$REPO"
@@ -637,4 +660,6 @@ Do not overwrite the bundle read by a live process. Promote a new immutable
 bundle directory only after every gate above passes.
 
 For the scientific contract and safe presentation language, read
-[`MONITORING_STORIES.md`](MONITORING_STORIES.md).
+[`MONITORING_STORIES.md`](MONITORING_STORIES.md). For the active V2 Phase A
+anchor, features, status ledger, artifacts, gates, and VM commands, read
+[`ARCHETYPE_V2.md`](ARCHETYPE_V2.md).
