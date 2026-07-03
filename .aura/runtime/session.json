@@ -1,8 +1,8 @@
 {
   "started_at": "2026-07-03T09:02:17Z",
   "mode": "orchestrate",
-  "objective": "Implement and document Phase A of stable causal event-archetype discovery while preserving V1",
+  "objective": "Provide one durable VM command for the complete Archetype V2 Phase A sequence",
   "config_hash": "6829e8fe3df3db561237234733b68dc9b8ce7c37",
   "phase": "A-model-validation",
-  "status": "locally_verified_vm_validation_required"
+  "status": "runner_locally_verified_ready_for_vm_execution"
 }

@@ -38,3 +38,17 @@ with noise and on mutually assigned non-noise events, matched-archetype
 Jaccard, and two-run support. Prototype separation examines every unordered
 same-hazard pair rather than only nearest centers. These are engineering and
 statistical gates, not agronomic validation.
+
+## ADR-005: Phase A runs through one fail-closed orchestrator
+
+Status: accepted, 2026-07-03.
+
+The preferred VM interface is `server/run_archetype_v2.py`. It performs
+focused tests, RAPIDS/GPU preflight, immutable build, evaluation, artifact and
+lineage verification, and gate-aware exit handling in one job. State and
+heartbeats are atomic; subprocesses are shell-free and isolated in a process
+group; resume refuses partial, mismatched, or still-running work.
+
+Progress is stage-, time-, PID-, and RSS-based. A percentage bar is rejected
+until the build/evaluation internals expose a real work denominator. Phase A
+success remains diagnostic and does not create a map publication pointer.

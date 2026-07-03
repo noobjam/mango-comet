@@ -73,6 +73,10 @@ that production boundary are documented in `server/README.md`. The current
 full-generation checkpoint and the gated path from RAPIDS installation through
 learned motifs, bundle promotion, map verification, and latency acceptance are
 in [`server/VM_MAP_RELEASE_RUNBOOK.md`](server/VM_MAP_RELEASE_RUNBOOK.md).
+The current Phase A archetype experiment should be launched with the durable
+`server/run_archetype_v2.py` runner documented in
+[`server/ARCHETYPE_V2.md`](server/ARCHETYPE_V2.md); it provides one command for
+preflight, GPU build, evaluation, status, resume, and truthful heartbeats.
 
 ## Verify on the VM
 

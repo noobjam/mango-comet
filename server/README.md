@@ -7,9 +7,10 @@ artifacts with DuckDB.
 ## Archetype V2 Phase A authority
 
 [`ARCHETYPE_V2.md`](ARCHETYPE_V2.md) is the authoritative contract and VM
-runbook for the current learned-archetype work. Phase A builds and evaluates one
-fixed causal anchor per eligible event; it does not publish archetypes to this
-viewer.
+runbook for the current learned-archetype work. Its preferred
+`run_archetype_v2.py` command safely runs tests, GPU build, evaluation, logging,
+status, and resume. Phase A builds and evaluates one fixed causal anchor per
+eligible event; it does not publish archetypes to this viewer.
 
 The completed V1 experiment's **10,901 HDBSCAN prefix groups are diagnostic and
 not publishable**. They came from multiple age-dependent prefix rows per event,

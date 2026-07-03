@@ -565,7 +565,128 @@ if [ -s "$ROOT/logs/latest_motif_model_path.txt" ]; then
 fi
 ```
 
-## 12. Phase A build command
+## 12. Preferred one-command Phase A runner
+
+`run_archetype_v2.py` is the preferred VM interface. It runs the focused V2
+tests, verifies the RAPIDS/GPU environment, builds the immutable model, runs
+the two-refit evaluation, verifies artifact hashes, and returns a nonzero exit
+code when either gate group fails. It never publishes anything to the map.
+
+The runner resolves RAPIDS in this order: explicit `--rapids-python`, an
+exported `RAPIDS_PYTHON`, then `$ROOT/logs/latest_rapids_python.txt`. The
+completed installation pointer is therefore enough when no environment
+override is present. It also refuses a dirty tracked worktree, so commit or
+stash tracked VM edits first. Run the complete sequence in the foreground with
+the known full generation:
+
+```bash
+cd /mnt/KSA-Oasis/El-Mohammed/mango-comet
+git pull --ff-only origin main
+
+export PYTHON=/mnt/KSA-Oasis/El-Mohammed/mango-comet/.venv/bin/python
+export ROOT=/mnt/KSA-Oasis/fields_health_v2/clusters/runs/weekly_monitor_v1
+export GEN=/mnt/KSA-Oasis/fields_health_v2/clusters/runs/weekly_monitor_v1/generations/2026-05-17_generation_7a715df05da10c3b3300
+
+"$PYTHON" server/run_archetype_v2.py run \
+  --root "$ROOT" \
+  --generation-dir "$GEN" \
+  --training-through 2025-12-31 \
+  --gpu 0 \
+  --threads 32 \
+  --memory-limit 96GB \
+  --heartbeat-seconds 30
+```
+
+For a durable background launch, give the job an explicit tag and retain a
+launcher log. This captures even a failure that occurs before the job directory
+can be created. The spacing in `2>&1` remains significant; `/dev/null2` is not
+valid.
+
+```bash
+cd /mnt/KSA-Oasis/El-Mohammed/mango-comet
+export PYTHON=/mnt/KSA-Oasis/El-Mohammed/mango-comet/.venv/bin/python
+export ROOT=/mnt/KSA-Oasis/fields_health_v2/clusters/runs/weekly_monitor_v1
+export GEN=/mnt/KSA-Oasis/fields_health_v2/clusters/runs/weekly_monitor_v1/generations/2026-05-17_generation_7a715df05da10c3b3300
+export JOB_TAG=$(date -u +%Y%m%dT%H%M%SZ)
+export JOB_DIR="$ROOT/jobs/archetype_v2_$JOB_TAG"
+export LAUNCH_LOG="$ROOT/logs/archetype_v2_launcher_$JOB_TAG.log"
+
+nohup "$PYTHON" server/run_archetype_v2.py run \
+  --root "$ROOT" \
+  --generation-dir "$GEN" \
+  --training-through 2025-12-31 \
+  --gpu 0 \
+  --threads 32 \
+  --memory-limit 96GB \
+  --heartbeat-seconds 30 \
+  --job-tag "$JOB_TAG" \
+  </dev/null >"$LAUNCH_LOG" 2>&1 &
+
+echo "LAUNCHER_PID=$!"
+echo "JOB_DIR=$JOB_DIR"
+echo "LAUNCH_LOG=$LAUNCH_LOG"
+```
+
+The runner writes one self-contained job directory under `$ROOT/jobs`. It
+contains `state.json`, `runner.log`, the runner PID and terminal status, plus
+separate command JSON and stderr logs for build and evaluation. Follow the
+job. In the launch shell, inspect the exact job rather than a potentially older
+latest pointer:
+
+```bash
+export PYTHON=/mnt/KSA-Oasis/El-Mohammed/mango-comet/.venv/bin/python
+export ROOT=/mnt/KSA-Oasis/fields_health_v2/clusters/runs/weekly_monitor_v1
+
+tail -n 100 "$LAUNCH_LOG"
+"$PYTHON" server/run_archetype_v2.py status --job-dir "$JOB_DIR"
+tail -f "$JOB_DIR/runner.log"
+```
+
+After `state.json` exists, a new shell may recover the latest created job with
+`JOB_DIR=$(tr -d '\r\n' < "$ROOT/logs/latest_archetype_v2_job.txt")`. The
+status JSON includes `liveness`, the current stage, child PID, last heartbeat,
+elapsed time, and RSS while work is active.
+
+Progress is intentionally stage-based rather than a `tqdm` percentage. The
+current build and evaluation APIs do not expose a valid work denominator, so
+the runner logs truthful heartbeats such as elapsed time, PID, and RSS:
+
+```text
+[1/2 BUILD] running — elapsed 00:18:30 — pid 1234 — RSS 24.8 GiB
+[2/2 EVALUATE] running — elapsed 00:41:00 — pid 5678 — RSS 31.2 GiB
+```
+
+Resume an interrupted job using the same immutable output paths:
+
+```bash
+cd /mnt/KSA-Oasis/El-Mohammed/mango-comet
+export PYTHON=/mnt/KSA-Oasis/El-Mohammed/mango-comet/.venv/bin/python
+export ROOT=/mnt/KSA-Oasis/fields_health_v2/clusters/runs/weekly_monitor_v1
+export JOB_DIR=$(tr -d '\r\n' < "$ROOT/logs/latest_archetype_v2_job.txt")
+export RESUME_LOG="$JOB_DIR/resume_launcher_$(date -u +%Y%m%dT%H%M%SZ).log"
+nohup "$PYTHON" server/run_archetype_v2.py resume \
+  --job-dir "$JOB_DIR" \
+  </dev/null >"$RESUME_LOG" 2>&1 &
+echo "RESUME_PID=$!"
+echo "RESUME_LOG=$RESUME_LOG"
+```
+
+A valid completed stage is verified and skipped. A partial or hash-invalid
+existing output is never deleted or overwritten. Terminal exit codes are `0`
+for both gate groups passing, `20` for hard-gate failure, `21` for
+quality-gate failure, and `22` when both fail. Codes `10`-`13` identify build,
+evaluation, or artifact failures; `2` means argument, preflight, or internal
+failure; `75` means another runner holds the lock or a recorded child is still
+alive; and `130`/`143` indicate interruption by `SIGINT`/`SIGTERM`.
+
+Safe automatic generation discovery is also available with `--as-of
+2026-05-17` in place of `--generation-dir "$GEN"`. It accepts only a full,
+complete, immutable generation and refuses to guess if more than one matches.
+
+## 13. Manual Phase A build command
+
+The commands below are retained as a manual debugging fallback. Prefer the
+runner above for normal execution.
 
 Use this durable-launch pattern:
 
@@ -684,7 +805,7 @@ printf '%s\n' "$ARCH_MODEL" > "$ROOT/logs/latest_archetype_v2_path.txt"
 Never write the latest-model pointer before the build status and JSON checks
 pass.
 
-## 13. Phase A evaluation command
+## 14. Manual Phase A evaluation command
 
 Discover the latest valid V2 model from its manifest, using the pointer only as
 a fast path:
