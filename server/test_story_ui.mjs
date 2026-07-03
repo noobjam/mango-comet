@@ -7,6 +7,7 @@ import { EvolutionController } from "./static/evolution-controller.js";
 import { shouldLoadHistory } from "./static/history.js";
 import { lifecycleModel, prefixTrajectoryModel } from "./static/inspector.js";
 import { buildEvolutionModel } from "./static/map-evolution.js";
+import { alphaForState, lineColorFor } from "./static/palette.js";
 
 test("compact state merges cached static geometry with dynamic properties", () => {
   const geometry = new Map([["A", {
@@ -151,6 +152,15 @@ test("closed field states are not counted as open now", () => {
     meta: { timeline_bucket: "2025-01-08" },
   }, { features: [], meta: {} });
   assert.equal(stats.affected, 1);
+});
+
+test("diagnostic archetype states are visibly distinct", () => {
+  assert.ok(alphaForState({ archetype_display_state: "pending_anchor" }, 188) < 100);
+  assert.deepEqual(lineColorFor({ archetype_display_state: "novel_unassigned" }), [251, 146, 60, 245]);
+  assert.notDeepEqual(
+    lineColorFor({ archetype_display_state: "accepted" }),
+    lineColorFor({ archetype_display_state: "pending_anchor" }),
+  );
 });
 
 test("evolution requests are coalesced while a filter query is in flight", async () => {

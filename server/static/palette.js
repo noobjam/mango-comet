@@ -39,10 +39,23 @@ export function colorFor(properties, mode = "family", alpha = 210) {
 }
 
 export function alphaForState(properties = {}, openAlpha = 188) {
+  let alpha = openAlpha;
   const state = String(properties.event_state || "").toUpperCase();
-  if (state === "DATA_GAP") return Math.min(openAlpha, 96);
-  if (state.startsWith("CLOSED_")) return Math.min(openAlpha, 72);
-  return openAlpha;
+  if (state === "DATA_GAP") alpha = Math.min(alpha, 96);
+  if (state.startsWith("CLOSED_")) alpha = Math.min(alpha, 72);
+  const archetypeState = String(properties.archetype_display_state || "").toLowerCase();
+  if (archetypeState === "pending_anchor") return Math.min(alpha, 82);
+  if (archetypeState === "novel_unassigned") return Math.min(alpha, 132);
+  if (archetypeState && archetypeState !== "accepted") return Math.min(alpha, 104);
+  return alpha;
+}
+
+export function lineColorFor(properties = {}) {
+  const state = String(properties.archetype_display_state || "").toLowerCase();
+  if (state === "pending_anchor") return [148, 163, 184, 220];
+  if (state === "novel_unassigned") return [251, 146, 60, 245];
+  if (state && state !== "accepted") return [203, 213, 225, 235];
+  return [5, 20, 15, 210];
 }
 
 export function isOpenStory(properties = {}) {
@@ -69,12 +82,17 @@ export function applyVisualProperties(collection, mode, history = false) {
     const properties = { ...(feature.properties || {}) };
     const age = Math.max(0, Number(properties.age_index || 0));
     properties.__story_color = colorHexFor(properties, mode);
+    properties.__story_line_color = rgbaToHex(lineColorFor(properties));
     properties.__story_opacity = history
       ? Math.max(0.06, 0.24 - age * 0.035)
       : alphaForState(properties, 184) / 255;
     return { ...feature, properties };
   });
   return { type: "FeatureCollection", features, meta: collection?.meta || {} };
+}
+
+function rgbaToHex(values) {
+  return `#${values.slice(0, 3).map((value) => Number(value).toString(16).padStart(2, "0")).join("")}`;
 }
 
 function riskSpec(value) {

@@ -10,7 +10,9 @@ artifacts with DuckDB.
 runbook for the current learned-archetype work. Its preferred
 `run_archetype_v2.py` command safely runs tests, GPU build, evaluation, logging,
 status, and resume. Phase A builds and evaluates one fixed causal anchor per
-eligible event; it does not publish archetypes to this viewer.
+eligible event; it does not publish archetypes to this viewer. When all hard
+gates pass but quality gates fail, the V2 runbook documents a separate,
+unpublishable diagnostic preview for inspecting the result on port 8878.
 
 The completed V1 experiment's **10,901 HDBSCAN prefix groups are diagnostic and
 not publishable**. They came from multiple age-dependent prefix rows per event,

@@ -60,7 +60,7 @@ export class FilterController {
       const id = String(story.story_cluster_id || "");
       if (!id) continue;
       const shortId = id.split(":").at(-1).slice(0, 7);
-      const label = `${readableStory(story) || story.short_label || "Exact story"} · ${shortId}`;
+      const label = `${story.short_label || readableStory(story) || "Exact story"} · ${shortId}`;
       const count = Number(story.event_count || 0);
       select.appendChild(new Option(count ? `${label} · ${count.toLocaleString()} events` : label, id));
     }
@@ -143,7 +143,7 @@ export class FilterController {
       title = "Choose one strict temporal signature";
       text = "Exact-story mode preserves sequence identity instead of broadening it to similar evidence.";
     } else if (story) {
-      title = readableStory(story) || story.short_label || story.story_cluster_id;
+      title = story.short_label || readableStory(story) || story.story_cluster_id;
       text = `${Number(story.event_count || 0).toLocaleString()} events · ${Number(story.field_count || 0).toLocaleString()} fields. Exact identity is preserved.`;
       chips.push(story.stage_signature, story.response_signature);
     } else if (Object.keys(filters).length) {

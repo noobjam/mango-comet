@@ -154,12 +154,19 @@ function prefixTrajectoryRibbon(states, selectedBucket) {
       }
       const item = document.createElement("span");
       const lifecycle = String(state.event_state || "unknown").toLowerCase().replace(/[^a-z]+/g, "-");
-      item.className = `prefix-state state-${lifecycle}${state.selected ? " is-selected" : ""}${state.right_censored ? " is-open" : ""}`;
+      const archetype = String(state.archetype_display_state || "").toLowerCase();
+      const archetypeClass = archetype === "pending_anchor" ? "pending"
+        : archetype === "accepted" ? "accepted"
+        : archetype === "novel_unassigned" ? "novel"
+        : archetype === "calibration_training" ? "calibration"
+        : archetype ? "ineligible" : "";
+      item.className = `prefix-state state-${lifecycle}${archetypeClass ? ` archetype-${archetypeClass}` : ""}${state.selected ? " is-selected" : ""}${state.right_censored ? " is-open" : ""}`;
       item.setAttribute("role", "listitem");
       item.tabIndex = 0;
       const label = [
         state.bucket, state.event_state, state.current_risk_band || state.max_risk_band,
-        state.hazard_signature, state.daily_response_class,
+        state.hazard_signature, state.daily_response_class, state.archetype_display_state,
+        state.anchor_status, state.assignment_reason,
         state.right_censored ? "open at this cutoff" : "closed",
       ].filter(Boolean).join(", ");
       item.setAttribute("aria-label", label);
@@ -243,6 +250,7 @@ function fieldHeader(properties = {}) {
 function readableStory(properties = {}) {
   return [
     properties.motif_family,
+    properties.archetype_display_state,
     properties.current_risk_band || properties.max_risk_band,
     properties.hazard_signature,
     properties.response_signature,

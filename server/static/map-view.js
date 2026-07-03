@@ -1,4 +1,4 @@
-import { alphaForState, applyVisualProperties, colorFor } from "./palette.js";
+import { alphaForState, applyVisualProperties, colorFor, lineColorFor } from "./palette.js";
 import { buildEvolutionModel, evolutionDeckLayers, evolutionGeoJson } from "./map-evolution.js";
 
 const EMPTY = { type: "FeatureCollection", features: [], meta: {} };
@@ -173,7 +173,7 @@ export class MapView {
       ),
       getLineColor: (feature) => String(feature.properties?.field_id) === this.selectedFieldId
         ? [255, 255, 255, 255]
-        : [5, 20, 15, 210],
+        : lineColorFor(feature.properties),
       getLineWidth: (feature) => {
         if (String(feature.properties?.field_id) === this.selectedFieldId) return 3;
         const risk = String(feature.properties?.current_risk_band || feature.properties?.max_risk_band || "").toUpperCase();
@@ -227,7 +227,7 @@ export class MapView {
       0.7,
     ]);
     this.map.setPaintProperty("story-current-line", "line-color", [
-      "case", ["==", ["get", "field_id"], this.selectedFieldId], "#ffffff", "#05140f",
+      "case", ["==", ["get", "field_id"], this.selectedFieldId], "#ffffff", ["get", "__story_line_color"],
     ]);
   }
 
@@ -252,7 +252,7 @@ export class MapView {
     });
     if (!this.map.getLayer("story-current-line")) this.map.addLayer({
       id: "story-current-line", type: "line", source: "story-current-fallback",
-      paint: { "line-color": ["case", ["==", ["get", "field_id"], this.selectedFieldId], "#ffffff", "#05140f"], "line-opacity": 0.85, "line-width": 0.7 },
+      paint: { "line-color": ["case", ["==", ["get", "field_id"], this.selectedFieldId], "#ffffff", ["get", "__story_line_color"]], "line-opacity": 0.85, "line-width": 0.7 },
     });
     if (!this.map.getLayer("activity-center-dots")) this.map.addLayer({
       id: "activity-center-dots", type: "circle", source: "activity-center-fallback",

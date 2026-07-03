@@ -184,7 +184,7 @@ async function loadFrame({ force = false } = {}) {
     const capNote = capNotes.length ? ` · ${capNotes.join(" + ")} to protect rendering` : "";
     state.timeline.commit(
       requestedIndex,
-      `${count.toLocaleString()} visible fields · ${stories.toLocaleString()} ${state.manifest.run?.motif_count ? "motifs" : "exact signatures"}${capNote}`
+      `${count.toLocaleString()} visible fields · ${stories.toLocaleString()} ${state.manifest.run?.diagnostic_preview ? "diagnostic archetype states" : state.manifest.run?.motif_count ? "motifs" : "exact signatures"}${capNote}`
     );
     if (state.selectionBucket && state.selectionBucket !== bucket.timeline_bucket) {
       state.selectionGeneration += 1;
@@ -287,8 +287,12 @@ function renderLegend() {
 function renderSummary() {
   const run = state.manifest.run || {};
   const geometry = state.manifest.map_geometry || {};
+  const diagnosticPreview = run.diagnostic_preview === true;
   const motifCount = Number(run.motif_count || 0);
-  const taxonomySummary = motifCount
+  const archetypeCount = Number(run.archetype_count || motifCount);
+  const taxonomySummary = diagnosticPreview
+    ? `${archetypeCount.toLocaleString()} event archetypes (diagnostic)`
+    : motifCount
     ? `${motifCount.toLocaleString()} discovered motifs (unreviewed)`
     : `${Number(run.story_cluster_count || 0).toLocaleString()} exact signatures`;
   ui.runSummary.textContent = [
@@ -297,9 +301,10 @@ function renderSummary() {
     `${Number(geometry.mappable_event_field_count || geometry.mappable_selected_field_count || 0).toLocaleString()} mapped fields`,
   ].join(" · ");
   const causalSnapshot = Boolean(run.generation_id);
-  ui.runMode.textContent = causalSnapshot ? "Causal snapshot" : "Retrospective";
+  ui.runMode.textContent = diagnosticPreview ? "Diagnostic preview · not approved" : causalSnapshot ? "Causal snapshot" : "Retrospective";
   ui.runMode.classList.toggle("is-causal", causalSnapshot);
-  ui.explorerMode.textContent = causalSnapshot ? "As-of story snapshot" : "Retrospective explorer";
+  ui.runMode.classList.toggle("is-diagnostic", diagnosticPreview);
+  ui.explorerMode.textContent = diagnosticPreview ? "Unreviewed archetype preview" : causalSnapshot ? "As-of story snapshot" : "Retrospective explorer";
 }
 
 function prefetchAdjacent(filters, bbox) {

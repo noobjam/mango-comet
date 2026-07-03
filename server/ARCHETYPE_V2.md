@@ -1026,3 +1026,59 @@ If this check fails, retain the output, diagnose the failed metric, and create a
 new versioned experiment. Do not tune until the map looks attractive, overwrite
 the failed model, export assignments to the viewer, or weaken a gate without a
 recorded methodology decision.
+
+## Diagnostic map preview after a quality-gate failure
+
+A model that passed every hard gate but failed one or more quality gates may be
+viewed only through the separate causal diagnostic exporter. This is useful for
+examining failure modes before the next experiment; it is not Phase B approval.
+The exporter never changes a release pointer, `.env`, source generation, model,
+or evaluation. It masks the final assignment until the event's causal anchor
+(or generation cutoff for an unresolved event), scopes pending/novel identities
+by hazard, and visibly labels the viewer as `Diagnostic preview · not approved`.
+Training-cohort identities remain masked as `calibration_training`; only
+holdout assignments can transition to accepted or novel at their anchor.
+
+```bash
+export MODEL_DIR="$ROOT/models/archetype_v2_anchor21_train_${TRAINING_CUTOFF%%-*}_$JOB_TAG"
+export EVAL_DIR="$ROOT/evaluations/archetype_v2_$JOB_TAG"
+export PREVIEW_ROOT="$ROOT/previews/archetype_v2_$JOB_TAG"
+export PREVIEW_RUN="$PREVIEW_ROOT/raw"
+export PREVIEW_BUNDLE="$PREVIEW_ROOT/bundle"
+
+test -s "$MODEL_DIR/archetype_manifest.json"
+test -s "$EVAL_DIR/evaluation.json"
+
+"$PYTHON" server/export_archetype_preview_v2.py \
+  --generation-dir "$GEN" \
+  --model-dir "$MODEL_DIR" \
+  --evaluation-dir "$EVAL_DIR" \
+  --output-dir "$PREVIEW_RUN" \
+  --allow-failed-quality-gates \
+  --threads 32 \
+  --memory-limit 96GB \
+  --temp-dir "$ROOT/duckdb_tmp"
+
+"$PYTHON" server/build_story_map_bundle.py \
+  --run-dir "$PREVIEW_RUN" \
+  --out-dir "$PREVIEW_BUNDLE"
+```
+
+Run the preview on a different port from any existing viewer:
+
+```bash
+cd "$REPO/server"
+STORY_MAP_RUN_DIR="$PREVIEW_BUNDLE" \
+STORY_MAP_STATIC_DIR=./static \
+STORY_MAP_HOST=127.0.0.1 \
+STORY_MAP_PORT=8878 \
+"$PYTHON" story_map_server.py
+```
+
+Exact-archetype history begins at the anchor by design. Hazard-filtered history
+can include the earlier hazard-scoped `pending_anchor` footprint. The faded map
+trail and aggregate activity center describe changing field footprints, not
+physical movement or propagation. Do not copy this preview bundle into
+`releases`, point production `.env` at it, or present its labels as validated.
+Static diagnostic labels intentionally leave complete-event duration unknown
+rather than backfilling future duration into an earlier map week.

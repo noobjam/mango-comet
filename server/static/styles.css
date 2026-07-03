@@ -111,6 +111,11 @@ button:disabled { cursor: wait; opacity: 0.58; }
   text-transform: uppercase;
 }
 .run-mode.is-causal { border-color: rgba(115, 226, 180, 0.42); color: var(--accent); }
+.run-mode.is-diagnostic {
+  border-color: rgba(251, 146, 60, 0.58);
+  color: #fdba74;
+  background: rgba(124, 45, 18, 0.24);
+}
 
 .brand-block h1 {
   margin: 2px 0 0;
@@ -285,6 +290,11 @@ button:disabled { cursor: wait; opacity: 0.58; }
 .prefix-state.state-recovering { background: #2a9d8f; }
 .prefix-state[class*="state-closed-recovered"] { background: #287f68; }
 .prefix-state[class*="state-closed-"] { opacity: 0.62; }
+.prefix-state.archetype-pending { opacity: 0.48; border-color: #94a3b8; }
+.prefix-state.archetype-accepted { box-shadow: inset 0 -4px #73e2b4; }
+.prefix-state.archetype-novel { border: 2px solid #fb923c; box-shadow: inset 0 -2px rgba(251, 146, 60, 0.6); }
+.prefix-state.archetype-calibration { filter: grayscale(0.55); border: 2px dotted #cbd5e1; }
+.prefix-state.archetype-ineligible { filter: grayscale(0.8); border-style: dashed; }
 .prefix-state.is-open:last-of-type { border-right: 2px dashed #fff; }
 .prefix-state.is-selected { outline: 2px solid #fff; outline-offset: 1px; }
 .prefix-state:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
