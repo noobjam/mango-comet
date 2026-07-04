@@ -3,6 +3,7 @@ export class ApiClient {
     this.cacheLimit = cacheLimit;
     this.cache = new Map();
     this.controllers = new Map();
+    this.inflight = new Map();
   }
 
   async get(url, { channel = url, cache = false } = {}) {
@@ -14,9 +15,22 @@ export class ApiClient {
       return value;
     }
 
+    const existing = this.inflight.get(url);
+    if (existing && !existing.controller.signal.aborted) {
+      this.controllers.set(channel, existing.controller);
+      try {
+        const value = await existing.promise;
+        if (cache) this.remember(url, value);
+        return value;
+      } finally {
+        if (this.controllers.get(channel) === existing.controller) this.controllers.delete(channel);
+      }
+    }
+    if (existing) this.inflight.delete(url);
+
     const controller = new AbortController();
     this.controllers.set(channel, controller);
-    try {
+    const request = (async () => {
       const response = await fetch(url, {
         signal: controller.signal,
         headers: { Accept: "application/json" },
@@ -25,10 +39,16 @@ export class ApiClient {
         const body = await response.text();
         throw new HttpError(response.status, response.statusText, body);
       }
-      const value = await response.json();
+      return response.json();
+    })();
+    const entry = { promise: request, controller };
+    this.inflight.set(url, entry);
+    try {
+      const value = await request;
       if (cache) this.remember(url, value);
       return value;
     } finally {
+      if (this.inflight.get(url) === entry) this.inflight.delete(url);
       if (this.controllers.get(channel) === controller) this.controllers.delete(channel);
     }
   }
@@ -61,7 +81,12 @@ export class ApiClient {
 
   abort(channel) {
     const controller = this.controllers.get(channel);
-    if (controller) controller.abort();
+    if (controller) {
+      controller.abort();
+      for (const [url, entry] of this.inflight) {
+        if (entry.controller === controller) this.inflight.delete(url);
+      }
+    }
     this.controllers.delete(channel);
   }
 
@@ -74,6 +99,7 @@ export class ApiClient {
   abortAll() {
     for (const controller of this.controllers.values()) controller.abort();
     this.controllers.clear();
+    this.inflight.clear();
   }
 
   forget(url) {

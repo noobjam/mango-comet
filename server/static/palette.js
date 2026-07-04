@@ -20,7 +20,7 @@ const RISK_SPECS = {
 
 export function familyKey(properties = {}) {
   const explicit = String(properties.motif_family || "").toLowerCase();
-  const text = `${explicit} ${properties.hazard_signature || ""} ${properties.response_signature || ""}`.toLowerCase();
+  const text = `${explicit} ${properties.hazard_family || ""} ${properties.hazard_signature || ""} ${properties.response_signature || ""}`.toLowerCase();
   const matches = new Set();
   if (has(text, ["heat", "hot", "temperature"])) matches.add("heat");
   if (has(text, ["wind", "storm"])) matches.add("wind");

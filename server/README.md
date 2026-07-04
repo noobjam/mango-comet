@@ -4,14 +4,30 @@ Portable, no-Docker server for reviewing precomputed crop-risk stories on a
 map. MapLibre/deck.gl render in the browser; the Python server reads Parquet
 artifacts with DuckDB.
 
-## Archetype V2 Phase A authority
+## Crop-impact Incident V3 authority
 
-[`ARCHETYPE_V2.md`](ARCHETYPE_V2.md) is the authoritative contract and VM
-runbook for the current learned-archetype work. Its preferred
+[`CROP_INCIDENT_STORIES_V3.md`](CROP_INCIDENT_STORIES_V3.md) is the current
+definition of a product **story**. A weekly local component receives a
+`component_id`; components linked through time retain a crop-independent
+`exposure_id`; each crop affected by that exposure receives a stable
+`incident_id`. Crop stage changes do not rewrite identity. Learned archetypes
+are optional tags trained only on completed crop-impact stories.
+
+Use [`INCIDENT_V3_VM_RUNBOOK.md`](INCIDENT_V3_VM_RUNBOOK.md) for the exact
+tested/nohup build sequence. `run_incident_v3.py` produces both an immutable
+`incidents_v3_*` analytics release and a verified `incident_viewer_v3_*`
+bundle. Point `STORY_MAP_RUN_DIR` only at the latter. The UI renders complete
+weekly incident footprints, crop/stage lifecycle arcs, and selected-only exact
+footprint history without centroid trajectories.
+
+## Archetype V2 Phase A provenance
+
+[`ARCHETYPE_V2.md`](ARCHETYPE_V2.md) records the failed diagnostic predecessor
+and its VM workflow. Its preferred
 `run_archetype_v2.py` command safely runs tests, GPU build, evaluation, logging,
 status, and resume. Phase A builds and evaluates one fixed causal anchor per
 eligible event; it does not publish archetypes to this viewer. When all hard
-gates pass but quality gates fail, the V2 runbook documents a separate,
+gates pass but quality gates fail—as the real VM run did—the V2 runbook documents a separate,
 unpublishable diagnostic preview for inspecting the result on port 8878.
 
 The completed V1 experiment's **10,901 HDBSCAN prefix groups are diagnostic and
@@ -20,7 +36,11 @@ remain `discovered_unreviewed`, and must not be described as 10,901 story types
 or exported as the map taxonomy. The V1 commands below remain for provenance
 and bounded compatibility tests, not as the V2 release path.
 
-## Interpretation
+## Legacy V1/V2 interpretation
+
+This section describes compatibility artifacts from the older event/fingerprint
+and motif paths. It does not override Incident V3: V3 uses stable
+`exposure_id × crop` story identity and keeps crop stage as changing context.
 
 Three related identifiers may be present:
 
@@ -69,6 +89,9 @@ still uncalibrated and require agronomist/outcome validation. Read
 For the V2 event anchor, exact eligibility/status contract, immutable assignment,
 gates, Phase A artifacts, and VM commands, read
 [`ARCHETYPE_V2.md`](ARCHETYPE_V2.md).
+For the current V3 crop-impact story contract and full VM build, read
+[`CROP_INCIDENT_STORIES_V3.md`](CROP_INCIDENT_STORIES_V3.md) and
+[`INCIDENT_V3_VM_RUNBOOK.md`](INCIDENT_V3_VM_RUNBOOK.md).
 For the exact first full-release sequence, durable `nohup` commands, quality
 gates, current full-scale export blocker, bundle promotion, and map acceptance
 checks, use [`VM_MAP_RELEASE_RUNBOOK.md`](VM_MAP_RELEASE_RUNBOOK.md).
@@ -203,6 +226,7 @@ STORY_MAP_DEFAULT_FEATURE_LIMIT=5000
 STORY_MAP_MAX_FEATURE_LIMIT=20000
 STORY_MAP_CACHE_SECONDS=300
 STORY_MAP_CACHE_ENTRIES=256
+STORY_MAP_CACHE_MAX_BYTES=536870912
 STORY_MAP_QUERY_CONCURRENCY=8
 STORY_MAP_GZIP_MIN_BYTES=1024
 ```
@@ -223,6 +247,26 @@ The development fixture measured 76% fewer compressed timeline bytes after
 splitting static geometry from dynamic state. That is evidence for the transport
 design, not a VM acceptance result; record the VM benchmark before presenting a
 latency number.
+
+For the crop-incident V3 app, use the footprint-specific benchmark instead:
+
+```bash
+export NO_PROXY=127.0.0.1,localhost
+export no_proxy="$NO_PROXY"
+python server/benchmark_incident_v3.py \
+  --base-url http://127.0.0.1:8877 \
+  --weeks 20 \
+  --random-requests 60 \
+  --concurrency 8 \
+  --output "$ROOT/incident_v3_benchmark.json"
+```
+
+It records sequential cold, concurrent cold-adjacent, warm, random-scrub, and
+prewarmed concurrent-adjacent p50/p95; HTTP/503 counts; wire and decoded JSON
+bytes; and, when passed the optional numeric `--server-pid`, server RSS. The
+authoritative V3 runbook captures that PID during launch. Browser
+parse/render/heap acceptance remains a required Performance trace because H100s
+cannot accelerate the browser.
 
 ## Artifacts
 
@@ -320,6 +364,12 @@ errors, but a generation-directory switch is the safe deployment boundary.
 Useful endpoints include:
 
 - `GET /api/timeline` for available reporting buckets.
+- `GET /api/incident-footprints/<bucket>?crop_name=...&hazard_family=...` for
+  every complete exact Incident V3 footprint in a week. This country-overview
+  endpoint is never subject to the field feature cap.
+- `GET /api/incident/<incident_id>` for one complete crop story: causal weekly
+  lifecycle, crop-stage denominators, lineage, and exact main/role footprint
+  geometry through time.
 - `GET /api/motifs` for mappable exact-story labels and situation facets,
   including the live `current_risk_band` facet (peak risk remains audit context).
 - `GET /api/frame/<bucket>?bbox=minLon,minLat,maxLon,maxLat&limit=N` for field
@@ -366,14 +416,22 @@ proxy. Health and browser manifest responses omit host filesystem paths, and
 API responses are marked `private` to prevent storage by shared proxy caches.
 
 The example uses a 5,000-feature default, a 20,000-feature hard cap, a
-five-minute/256-entry in-process cache, and gzip for responses of at least 1 KiB.
+five-minute/256-entry in-process cache, a 512 MiB combined raw+gzip process
+cache byte budget, and gzip for responses of at least 1 KiB. The process splits
+that byte budget 15/16 to API responses and 1/16 to static assets, so the two
+caches cannot each consume the full configured amount.
 Tune `STORY_MAP_DEFAULT_FEATURE_LIMIT`, `STORY_MAP_MAX_FEATURE_LIMIT`,
 `STORY_MAP_CACHE_SECONDS`, `STORY_MAP_CACHE_ENTRIES`, and
-`STORY_MAP_GZIP_MIN_BYTES` from measured payloads and memory use. The portable
-server also caps simultaneous query work with `STORY_MAP_QUERY_CONCURRENCY` so
-rapid timeline scrubbing cannot create unbounded DuckDB/GeoJSON work. Excess
-uncached work fails fast with HTTP 503 and `Retry-After: 1` instead of joining a
-stale request queue; tune the cap against CPU cores and measured p95 latency.
+`STORY_MAP_CACHE_MAX_BYTES`, and `STORY_MAP_GZIP_MIN_BYTES` from measured
+payloads and memory use. Oversized responses bypass the process cache. The
+portable server uses `STORY_MAP_QUERY_CONCURRENCY` as the independent cap for
+both simultaneous DuckDB/GeoJSON queries and simultaneous JSON cleaning,
+encoding, and gzip work, so a rapid scrub burst cannot merely move an unbounded
+queue from querying into response construction. Cache hits and `/api/health`
+bypass those work gates. Excess uncached work fails fast with HTTP 503 and
+`Retry-After: 1` instead of joining a stale request queue; tune the cap against
+CPU cores, RSS, 503 counts, and measured sequential and concurrent-cold p95
+latency.
 
 Put a front proxy such as Nginx or Caddy in front of the Python process to add
 TLS, gzip or Brotli compression, and access logs. Cache static vendor assets for

@@ -28,9 +28,11 @@ official `https://pypi.org/simple` index. If it still reports a proxy connection
 failure, inspect `env | grep -i proxy`; the VM may also have stale `HTTP_PROXY`,
 `HTTPS_PROXY`, or `ALL_PROXY` variables unrelated to pip's package index.
 
-Edit `server/.env` and point `STORY_MAP_RUN_DIR` at the existing run directory
-on the VM. A raw run works for current-frame exploration; historical footprints
-require an optimized bundle.
+Edit `server/.env` and point `STORY_MAP_RUN_DIR` at the directory you intend to
+serve. For Incident V3 this must be the completed `incident_viewer_v3_*`
+directory emitted by the durable runner; the intermediate `incidents_v3_*`
+analytics release is not a viewer bundle. Legacy raw runs remain supported for
+bounded current-frame exploration.
 
 ```bash
 python server/story_map_server.py
@@ -78,6 +80,15 @@ The current Phase A archetype experiment should be launched with the durable
 [`server/ARCHETYPE_V2.md`](server/ARCHETYPE_V2.md); it provides one command for
 preflight, GPU build, evaluation, status, resume, and truthful heartbeats.
 
+The product-level successor is the deterministic crop-impact incident V3
+pipeline. Its story identity is local exposure × crop, with crop stage retained
+as changing weekly context. Build and inspect it with
+[`server/INCIDENT_V3_VM_RUNBOOK.md`](server/INCIDENT_V3_VM_RUNBOOK.md). The V3
+pipeline emits a dedicated `incident_viewer_v3_*` directory that is the
+map-ready `STORY_MAP_RUN_DIR`. Use the durable runner and promotion/latency
+gates in the runbook; the intermediate `incidents_v3_*` analytics directory is
+not a drop-in viewer bundle.
+
 ## Verify on the VM
 
 ```bash
@@ -90,9 +101,11 @@ For interpretation, API endpoints, performance controls, optional GPU
 precomputation, and the production vector-tile direction, see
 [`server/README.md`](server/README.md).
 
-For lifecycle semantics, causality rules, trajectory interpretation,
-validation gates, and safe presentation language, read
-[`server/MONITORING_STORIES.md`](server/MONITORING_STORIES.md).
+For the current lifecycle semantics, as-of causality rule, exact-footprint
+trajectory contract, validation gates, and safe presentation language, read
+[`server/CROP_INCIDENT_STORIES_V3.md`](server/CROP_INCIDENT_STORIES_V3.md).
+[`server/MONITORING_STORIES.md`](server/MONITORING_STORIES.md) remains the V1
+field-episode provenance contract.
 
 ## Data policy
 

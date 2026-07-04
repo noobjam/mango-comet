@@ -102,13 +102,15 @@ export class TimelineController {
     const maximum = Math.max(1, ...counts);
     const fragment = document.createDocumentFragment();
     counts.forEach((count, index) => {
+      const activityRow = this.activity.get(this.buckets[index].timeline_bucket) || {};
       const bar = document.createElement("span");
       bar.className = "timeline-bar";
       if (!count) bar.classList.add("is-gap");
       if (index === this.pendingIndex) bar.classList.add("is-current");
       bar.dataset.index = String(index);
       bar.style.setProperty("--bar-height", count ? `${Math.max(4, Math.round((count / maximum) * 25))}px` : "2px");
-      bar.title = `${formatLong(this.buckets[index].timeline_bucket)} · ${count.toLocaleString()} affected fields`;
+      const unit = isIncidentActivity(activityRow) ? "incident stories" : "affected fields";
+      bar.title = `${formatLong(this.buckets[index].timeline_bucket)} · ${count.toLocaleString()} ${unit}`;
       fragment.appendChild(bar);
     });
     histogram.replaceChildren(fragment);
@@ -156,7 +158,22 @@ export class TimelineController {
 }
 
 export function activityCount(row = {}) {
-  return Number(row?.field_count ?? row?.affected_field_count ?? row?.feature_count ?? row?.event_count ?? 0);
+  if (isIncidentActivity(row)) {
+    return Number(row?.activity_count ?? row?.incident_count ?? row?.story_cluster_count ?? 0);
+  }
+  return Number(
+    row?.field_count
+      ?? row?.affected_field_count
+      ?? row?.feature_count
+      ?? row?.event_count
+      ?? row?.incident_count
+      ?? row?.story_cluster_count
+      ?? 0,
+  );
+}
+
+function isIncidentActivity(row = {}) {
+  return row?.activity_unit === "incident_stories" || row?.activity_count !== undefined;
 }
 
 function clamp(value, minimum, maximum) {

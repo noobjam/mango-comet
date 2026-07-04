@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 from datetime import date, timedelta
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from story_monitor.contracts import load_policy
 from story_monitor.motif_export import export_motif_generation
 from story_monitor.motifs import DiscoveryConfig, discover_motifs
+from story_monitor.incident_policy_v3 import DEFAULT_INCIDENT_POLICY_V3_PATH
 from story_monitor.partitioned_pipeline import PartitionOptions, build_partitioned_generation
 from story_monitor.pipeline import BOUNDED_V1_MAX_FIELDS, DEFAULT_POLICY_PATH, build_generation
 from story_monitor.prefix_features import load_training_prefixes
@@ -148,6 +150,59 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int, default=2,
         help="Exactly two deterministic 80%% hazard-stratified subsample refits.",
     )
+    incidents_v3 = subparsers.add_parser(
+        "build-incidents-v3",
+        help=(
+            "Build immutable local crop-impact incident tracks and completed-story "
+            "features; starter thresholds remain uncalibrated."
+        ),
+    )
+    incidents_v3.add_argument("--generation-dir", type=Path, required=True)
+    incidents_v3.add_argument("--output-dir", type=Path, required=True)
+    incidents_v3.add_argument("--baseline-through", type=_date, required=True)
+    incidents_v3.add_argument("--policy", type=Path, default=DEFAULT_INCIDENT_POLICY_V3_PATH)
+    incidents_v3.add_argument("--threads", type=_positive_int, default=16)
+    incidents_v3.add_argument("--memory-limit")
+    incidents_v3.add_argument("--temp-dir", type=Path)
+    release_mode = incidents_v3.add_mutually_exclusive_group(required=True)
+    release_mode.add_argument(
+        "--previous-incident-dir",
+        type=Path,
+        help=(
+            "Prior immutable Incident V3 release. Historical component, "
+            "exposure, incident, and causal weekly content must remain stable."
+        ),
+    )
+    release_mode.add_argument(
+        "--first-release",
+        action="store_true",
+        help="Explicitly declare that no prior Incident V3 release exists.",
+    )
+
+    train_incident_archetypes_v3 = subparsers.add_parser(
+        "train-incident-archetypes-v3",
+        help=(
+            "Discover immutable diagnostic archetype tags from completed Incident V3 "
+            "stories; incident identity is never changed."
+        ),
+    )
+    train_incident_archetypes_v3.add_argument("--incident-dir", type=Path, required=True)
+    train_incident_archetypes_v3.add_argument("--model-dir", type=Path, required=True)
+    train_incident_archetypes_v3.add_argument(
+        "--training-through", type=_date, required=True
+    )
+    train_incident_archetypes_v3.add_argument(
+        "--engine", choices=("cpu", "gpu"), default="cpu"
+    )
+    train_incident_archetypes_v3.add_argument(
+        "--min-cluster-size", type=_positive_int, default=100
+    )
+    train_incident_archetypes_v3.add_argument(
+        "--min-samples", type=_positive_int, default=20
+    )
+    train_incident_archetypes_v3.add_argument(
+        "--radius-quantile", type=float, default=0.95
+    )
     return parser
 
 
@@ -276,13 +331,59 @@ def main() -> None:
             memory_limit=args.memory_limit,
             temp_dir=args.temp_dir,
         )
-    else:
+    elif args.command == "evaluate-archetypes-v2":
         from story_monitor.archetype_workflow_v2 import evaluate_archetype_release
 
         payload = evaluate_archetype_release(
             args.model_dir,
             args.output_dir,
             stability_runs=args.stability_runs,
+        )
+    elif args.command == "train-incident-archetypes-v3":
+        from story_monitor.incident_archetype_discovery_v3 import (
+            IncidentArchetypeDiscoveryConfig,
+            train_incident_archetypes_v3,
+        )
+
+        model = train_incident_archetypes_v3(
+            args.incident_dir,
+            args.model_dir,
+            training_through=args.training_through.isoformat(),
+            config=IncidentArchetypeDiscoveryConfig(
+                min_cluster_size=args.min_cluster_size,
+                min_samples=args.min_samples,
+                radius_quantile=args.radius_quantile,
+                engine=args.engine,
+            ),
+        )
+        payload = {
+            "status": "written",
+            "model_dir": str(args.model_dir.expanduser().resolve()),
+            "model": model,
+            "warning": (
+                "Incident archetypes are diagnostic_unreviewed tags and never replace "
+                "incident_id."
+            ),
+        }
+    else:
+        from story_monitor.incident_policy_v3 import load_incident_policy_v3
+        from story_monitor.incident_workflow_v3 import build_incident_generation_v3
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)sZ %(levelname)s %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
+        payload = build_incident_generation_v3(
+            args.generation_dir,
+            args.output_dir,
+            baseline_through=args.baseline_through.isoformat(),
+            policy=load_incident_policy_v3(args.policy),
+            threads=args.threads,
+            memory_limit=args.memory_limit,
+            temp_dir=args.temp_dir,
+            previous_incident_dir=args.previous_incident_dir,
+            first_release=args.first_release,
         )
     print(json.dumps(payload, indent=2, sort_keys=True))
 

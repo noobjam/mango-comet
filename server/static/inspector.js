@@ -1,3 +1,5 @@
+import { INCIDENT_TRUTH_LABEL, incidentDetailModel } from "./incident-v3.js";
+
 export class Inspector {
   constructor() {
     this.tooltip = document.getElementById("hoverTooltip");
@@ -11,11 +13,16 @@ export class Inspector {
       this.tooltip.hidden = true;
       return;
     }
-    this.tooltip.replaceChildren(
+    const incident = properties.incident_id && !properties.field_id;
+    this.tooltip.replaceChildren(...(incident ? [
+      node("strong", properties.crop_name || properties.crop_name_normalized || "Crop incident"),
+      node("div", [properties.incident_state, properties.hazard_family].filter(Boolean).join(" · ")),
+      node("div", "Exact monitored footprint", "muted"),
+    ] : [
       node("strong", properties.field_id || "Field"),
       node("div", readableStory(properties)),
-      node("div", locationText(properties), "muted")
-    );
+      node("div", locationText(properties), "muted"),
+    ]));
     this.tooltip.hidden = false;
     const width = this.tooltip.offsetWidth || 240;
     const height = this.tooltip.offsetHeight || 70;
@@ -29,6 +36,51 @@ export class Inspector {
   loading(properties) {
     this.selection.className = "detail";
     this.selection.replaceChildren(...fieldHeader(properties), node("span", "Loading event windows…", "muted"));
+  }
+
+  loadingIncident(properties) {
+    this.selection.className = "detail";
+    this.selection.replaceChildren(
+      ...incidentHeader(properties),
+      node("span", "Loading crop-incident evidence…", "muted"),
+    );
+  }
+
+  showIncident(properties, payload = {}) {
+    const model = incidentDetailModel(payload, properties);
+    const children = incidentHeader({ ...properties, incident_id: model.incidentId });
+    children.push(
+      detailPair("Crop", pretty(model.crop)),
+      ...(model.coincident.count > 1 ? [
+        detailPair(
+          "Co-located crop stories",
+          `${count(model.coincident.count)} · ${model.coincident.crops.map(pretty).join(", ")} · click again to cycle`,
+        ),
+      ] : []),
+      detailPair("Lifecycle", pretty(model.lifecycle)),
+      selectedWeekEvidenceView(model),
+      lifecycleDatesView(model.lifecycleDates),
+      storyArcView(model.storyArc),
+      footprintContextView(model),
+      detailPair("Dominant dynamic stage", pretty(model.dominantStage)),
+      stageDistributionView(model.stageDistribution),
+      incidentMetrics(model.counts),
+      detailPair("Fresh evidence", `${count(model.counts.freshDecline)} decline · ${count(model.counts.freshRecovery)} recovery`),
+      detailPair("Carry / recovery", `${count(model.counts.unresolved)} unresolved carried · ${count(model.counts.recovered)} recovered`),
+      detailPair("Lineage / recurrence", `${count(model.counts.split)} split · ${count(model.counts.merge)} merge · ${count(model.counts.relapse)} relapse`),
+      evidenceView(model.evidence),
+      node("p", INCIDENT_TRUTH_LABEL, "truth-note incident-truth"),
+    );
+    this.selection.replaceChildren(...children);
+  }
+
+  showIncidentError(properties, error) {
+    this.selection.className = "detail";
+    this.selection.replaceChildren(
+      ...incidentHeader(properties),
+      node("span", `Could not load incident evidence: ${error.message}`, "muted"),
+      node("p", INCIDENT_TRUTH_LABEL, "truth-note incident-truth"),
+    );
   }
 
   showSelection(properties, events = [], trajectory = [], errors = {}) {
@@ -73,6 +125,181 @@ export class Inspector {
     this.selection.className = "detail muted";
     this.selection.textContent = message;
   }
+}
+
+function incidentHeader(properties = {}) {
+  const title = node(
+    "strong",
+    properties.crop_name || properties.crop_name_normalized || "Selected crop incident",
+  );
+  const context = node(
+    "div",
+    [properties.incident_state, properties.hazard_family].filter(Boolean).map(pretty).join(" · "),
+  );
+  const id = document.createElement("code");
+  id.textContent = properties.incident_id || properties.story_cluster_id || "No incident ID";
+  return [title, context, id];
+}
+
+function stageDistributionView(distribution = []) {
+  const wrapper = document.createElement("section");
+  wrapper.className = "stage-distribution";
+  wrapper.setAttribute("aria-label", "Dynamic crop-stage distribution");
+  wrapper.appendChild(node("strong", "Dynamic stage distribution"));
+  if (!distribution.length) {
+    wrapper.appendChild(node("span", "Stage evidence unavailable", "muted"));
+    return wrapper;
+  }
+  for (const item of distribution) {
+    const row = document.createElement("div");
+    row.className = "stage-row";
+    const label = node("span", pretty(item.stage));
+    const meter = document.createElement("span");
+    meter.className = "stage-meter";
+    meter.style.setProperty("--stage-share", `${Math.min(100, item.share * 100)}%`);
+    meter.setAttribute("aria-label", `${pretty(item.stage)} ${Math.round(item.share * 100)} percent`);
+    row.append(label, meter, node("span", `${Math.round(item.share * 100)}%`, "stage-share"));
+    wrapper.appendChild(row);
+  }
+  return wrapper;
+}
+
+function incidentMetrics(counts = {}) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "incident-metrics";
+  for (const [label, value] of [
+    ["Monitored", counts.monitored],
+    ["Evaluable", counts.evaluable],
+    ["Affected", counts.affected],
+    ["Severe", counts.severe],
+  ]) {
+    const item = document.createElement("div");
+    item.append(node("strong", count(value)), node("span", label));
+    wrapper.appendChild(item);
+  }
+  return wrapper;
+}
+
+function evidenceView(evidence = {}) {
+  const gaps = [];
+  if (!evidence.coverageAdequate) gaps.push("coverage not adequate this week");
+  if (evidence.dataGapCount) gaps.push(`${count(evidence.dataGapCount)} lifecycle data gaps`);
+  if (evidence.coverageMissingCellCount) {
+    gaps.push(`${count(evidence.coverageMissingCellCount)} coverage cells missing`);
+  }
+  if (evidence.globalCropWeekUnmappableInstanceCount) {
+    gaps.push(
+      `${count(evidence.globalCropWeekUnmappableInstanceCount)} national crop-week rows without map geometry`,
+    );
+  }
+  if (evidence.carriedForward) gaps.push("footprint carried forward; no fresh extent inferred");
+  if (evidence.rightCensored) gaps.push("still open at the observation cutoff");
+  return detailPair("Evidence gaps", gaps.length ? gaps.join(" · ") : "No flagged gap in the selected evidence summary");
+}
+
+function lifecycleDatesView(dates = {}) {
+  const values = [
+    ["first evidence", dates.firstEvidence],
+    ["confirmed", dates.confirmed],
+    ["pressure off", dates.pressureOff],
+    ["recovered", dates.recovered],
+    ["closed", dates.closed],
+  ].filter(([, value]) => value);
+  return detailPair(
+    "Lifecycle dates",
+    values.length
+      ? values.map(([label, value]) => `${label}: ${String(value).slice(0, 10)}`).join(" · ")
+      : "No dated transition reported",
+  );
+}
+
+function selectedWeekEvidenceView(model = {}) {
+  if (model.observedThisWeek) {
+    return detailPair("Selected week evidence", "Incident row observed");
+  }
+  const prior = model.lastObservedBucket
+    ? ` · showing last observed ${String(model.lastObservedBucket).slice(0, 10)}`
+    : "";
+  return detailPair("Selected week evidence", `No incident row this week${prior}`);
+}
+
+function storyArcView(weeks = []) {
+  const wrapper = document.createElement("section");
+  wrapper.className = "incident-story-arc";
+  wrapper.setAttribute("aria-label", "Week-by-week crop incident story");
+  const heading = document.createElement("div");
+  heading.className = "story-arc-heading";
+  heading.append(
+    node("strong", "Week-by-week crop story"),
+    node("span", `${weeks.length.toLocaleString()} observed weeks`, "muted"),
+  );
+  wrapper.appendChild(heading);
+  if (!weeks.length) {
+    wrapper.appendChild(node("span", "No incident evidence at or before this week.", "muted"));
+    return wrapper;
+  }
+  const list = document.createElement("div");
+  list.className = "story-arc-weeks";
+  for (const week of weeks) {
+    const row = document.createElement("div");
+    row.className = [
+      "story-arc-week",
+      week.selected ? "is-selected" : "",
+      week.carriedForward ? "is-carried" : "",
+    ].filter(Boolean).join(" ");
+    row.setAttribute(
+      "aria-label",
+      `${week.bucket}, ${pretty(week.lifecycle)}, ${pretty(week.stage)}, `
+        + `${count(week.pressure)} pressure, ${count(week.impact)} impact, `
+        + `${count(week.unresolved)} unresolved, ${areaLabel(week.areaKm2)}`,
+    );
+    row.append(
+      node("time", week.bucket.slice(5), "story-arc-date"),
+      node("span", pretty(week.lifecycle), "story-arc-state"),
+      node("span", pretty(week.stage), "story-arc-stage"),
+      node(
+        "span",
+        `P ${count(week.pressure)} · I ${count(week.impact)} · U ${count(week.unresolved)}`,
+        "story-arc-counts",
+      ),
+      node("span", areaLabel(week.areaKm2), "story-arc-area"),
+    );
+    list.appendChild(row);
+  }
+  wrapper.appendChild(list);
+  return wrapper;
+}
+
+function footprintContextView(model = {}) {
+  const current = model.currentFootprint?.properties?.timeline_bucket;
+  const prior = model.priorFootprint?.properties?.timeline_bucket;
+  const values = [];
+  if (current) values.push(`current ${String(current).slice(0, 10)}`);
+  if (prior) values.push(`prior ${String(prior).slice(0, 10)}`);
+  return detailPair(
+    "Exact footprint outlines",
+    values.length ? values.join(" · ") : "No exact outline at or before this week",
+  );
+}
+
+function areaLabel(value) {
+  const area = Number(value);
+  return Number.isFinite(area) ? `${area.toLocaleString(undefined, { maximumFractionDigits: 2 })} km²` : "area —";
+}
+
+function detailPair(label, value) {
+  const row = document.createElement("div");
+  row.className = "detail-row incident-detail-row";
+  row.append(node("span", label), node("strong", value));
+  return row;
+}
+
+function count(value) {
+  return value === null || value === undefined ? "—" : Number(value).toLocaleString();
+}
+
+function pretty(value) {
+  return String(value || "Unknown").replaceAll("_", " ").replace(/^./, (letter) => letter.toUpperCase());
 }
 
 export function lifecycleModel(events = [], selectedBucket = "") {

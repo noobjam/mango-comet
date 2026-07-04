@@ -22,10 +22,10 @@
             <span id="loadingStatusText">Loading data</span>
           </div>
           <label class="compact-control" for="colorMode">
-            <span>Color fields by</span>
+            <span id="colorModeLabel">Color fields by</span>
             <select id="colorMode">
               <option id="familyColorOption" value="family" selected>Situation family</option>
-              <option value="risk">Risk severity</option>
+              <option id="riskColorOption" value="risk">Risk severity</option>
             </select>
           </label>
           <button
@@ -49,9 +49,9 @@
           tabindex="0"
         ></div>
         <p id="mapHelp" class="sr-only">
-          Filled polygons are fields with a story state in the selected week. Subdued polygons are closed or data-gap states. Faded polygons show prior weeks;
-          they are history, not a movement path. When available, hollow points show an aggregate activity center,
-          not a moving field or inferred propagation.
+          In crop-incident mode, complete exact monitored footprints are the primary overview and fields appear only when zoomed in.
+          Footprint evolution is not physical movement. In legacy mode, filled polygons are fields with a story state; prior weeks and
+          aggregate activity centers are contextual summaries, not inferred propagation.
         </p>
 
         <aside id="explorerPanel" class="explorer-panel" aria-label="Story explorer">
@@ -63,7 +63,7 @@
             <button id="panelClose" class="icon-button mobile-only" type="button" aria-label="Close explorer">×</button>
           </div>
 
-          <div class="mode-switch" role="group" aria-label="Exploration mode">
+          <div id="modeSwitch" class="mode-switch" role="group" aria-label="Exploration mode">
             <button id="situationMode" class="mode-button is-active" type="button" aria-pressed="true">
               Similar situations
             </button>
@@ -71,6 +71,24 @@
               Motif / signature
             </button>
           </div>
+
+          <section id="incidentFilters" class="filter-section" aria-labelledby="incidentFilterTitle" hidden>
+            <h3 id="incidentFilterTitle">Filter crop-impact incidents</h3>
+            <div class="filter-grid incident-filter-grid">
+              <label>
+                <span>Crop</span>
+                <select id="cropFilter"><option value="">All crops</option></select>
+              </label>
+              <label>
+                <span>Dynamic crop stage</span>
+                <select id="stageFilter"><option value="">All crop stages</option></select>
+              </label>
+              <label>
+                <span>Lifecycle</span>
+                <select id="lifecycleFilter"><option value="">All lifecycle states</option></select>
+              </label>
+            </div>
+          </section>
 
           <section id="situationFilters" class="filter-section" aria-labelledby="situationFilterTitle">
             <h3 id="situationFilterTitle">Group fields by shared evidence</h3>
@@ -108,7 +126,7 @@
 
           <div class="filter-actions">
             <button id="clearFilters" class="quiet-button" type="button">Clear filters</button>
-            <label class="history-toggle">
+            <label id="historyControl" class="history-toggle">
               <input id="showHistory" type="checkbox" disabled />
               <span id="historyLabel">Filter to compare weeks</span>
             </label>
@@ -145,8 +163,9 @@
           <section class="legend-section" aria-labelledby="legendTitle">
             <h3 id="legendTitle">Map key</h3>
             <div id="legend" class="legend"></div>
-            <p class="legend-note"><span class="history-swatch"></span> Faded fill = prior story-state bucket</p>
-            <p class="legend-note">Subdued current fill = closed or data-gap state</p>
+            <p id="historyLegendNote" class="legend-note"><span class="history-swatch"></span> Faded fill = prior story-state bucket</p>
+            <p id="stateLegendNote" class="legend-note">Subdued current fill = closed or data-gap state</p>
+            <p id="incidentLegendNote" class="legend-note" hidden>Coral, magenta, and amber overlays mark exact pressure, impact-lag, and watch cells when available. Selecting one incident adds its exact prior weekly outlines; thinner, fainter dashes mean older weeks and never imply movement. The complete footprint remains the overview base; fields appear after zooming in.</p>
           </section>
 
           <section id="selectionPanel" class="selection-panel" aria-labelledby="selectionTitle">

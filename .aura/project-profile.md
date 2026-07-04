@@ -10,11 +10,19 @@
 - Tests: Python `unittest`, Node `node:test`, Python compile checks
 - Runtime data: generated on the GPU VM; source Parquet and generated artifacts are not committed
 
-## Change strategy
+## Current product strategy
 
-The V2 archetype work is deliberately split into two gates:
+Incident V3 supersedes learned archetypes as map story identity:
 
-1. Build and validate a causal one-anchor-per-event archetype model without changing the V1 pipeline or map contract.
-2. Only after the VM evaluation gates pass, export the reviewed hierarchy and precomputed summaries used by the map.
+1. Build causal/as-of weekly components from exact significant cells and crop
+   denominators.
+2. Link them into crop-independent exposures and stable crop-specific
+   incidents, with stage retained only as changing context.
+3. Export a precomputed `incident_viewer_v3_*` bundle and serve exact weekly
+   footprints; no clustering runs in the request path.
+4. Gate every append against the prior immutable analytics release, then gate
+   publication on latency, visual truthfulness, and data-quality checks.
 
-No new runtime dependency is required for Phase A. GPU discovery continues to use the optional RAPIDS environment.
+DuckDB performs the production build. RAPIDS remains optional for offline
+completed-story archetype experiments and does not improve HTTP or browser
+rendering latency.

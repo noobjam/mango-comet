@@ -1,0 +1,173 @@
+{
+  "policy_schema_version": "incident-context-policy-v3/2",
+  "policy_version": "crop-impact-incident-context-v3.1.0-uncalibrated",
+  "calibration_status": "STARTER_CONTEXT_MAPPING_UNCALIBRATED_REQUIRES_AGRONOMIST_VALIDATION",
+  "warning": "UNCALIBRATED monitoring context policy. Stage aliases and lane priorities are provisional display semantics, not agronomic truth, crop-loss estimates, diagnoses, or causal claims.",
+  "week_start": "monday",
+  "monitored_rule": "at_least_one_canonical_source_row_in_crop_instance_week",
+  "evaluable_rule": "at_least_one_pressure_observed_or_new_response_evidence_row_in_crop_instance_week",
+  "tracker_starter_parameters": {
+    "identity_namespace": "crop-impact-incident-v3",
+    "grid_cell_size_km": 5.0,
+    "grid_origin_lon": 30.0,
+    "grid_origin_lat": -2.0,
+    "reference_latitude_strategy": "fixed_origin",
+    "baseline_prior_strength": 20.0,
+    "minimum_source_field_centroid_coverage": 0.95,
+    "minimum_source_crop_instance_week_centroid_coverage": 0.95,
+    "minimum_known_stage_coverage": 0.8,
+    "minimum_known_stage_coverage_per_supported_crop": 0.7,
+    "minimum_stage_coverage_crop_instance_weeks": 100,
+    "minimum_evaluable_fields": 20,
+    "minimum_coverage_ratio": 0.0,
+    "minimum_active_fields": 3,
+    "severe_override_min_fields": 2,
+    "severe_override_min_fresh_response_fields": 1,
+    "allow_severe_override": true,
+    "frontier_distance_cells": 1,
+    "fdr_alpha": 0.1,
+    "minimum_link_score": 0.35,
+    "lineage_threshold": 0.3,
+    "minimum_lineage_jaccard": 0.2,
+    "same_hazard_link_required": true,
+    "max_link_gap_weeks": 2,
+    "spatial_scale_km": 15.0,
+    "gap_penalty": 0.1,
+    "confirmation_weeks": 2,
+    "candidate_expiry_observed_weeks": 2,
+    "quiet_close_weeks": 2,
+    "recovery_observed_weeks": 1,
+    "recovery_grace_weeks": 2,
+    "severe_confirmation_min_fields": 2,
+    "severe_confirmation_min_fresh_response_fields": 1,
+    "minimum_crop_monitored_instances": 1,
+    "minimum_crop_evaluable_instances": 1,
+    "maximum_data_gap_weeks": 4,
+    "link_weights": {
+      "active_episode_overlap": 0.35,
+      "cell_or_footprint_overlap": 0.25,
+      "recent_member_overlap": 0.25,
+      "centroid_proximity": 0.15,
+      "stage_distribution_similarity": 0.0
+    }
+  },
+  "stage_buckets": [
+    "emergence",
+    "vegetative",
+    "flowering",
+    "fruiting_or_grain_fill",
+    "maturity_or_harvest",
+    "off_season",
+    "unknown"
+  ],
+  "stage_aliases": {
+    "off_season": [
+      "off_season",
+      "fallow"
+    ],
+    "emergence": [
+      "planting",
+      "sowing",
+      "germination",
+      "emergence",
+      "seedling",
+      "nursery",
+      "transplanting"
+    ],
+    "vegetative": [
+      "vegetative",
+      "leaf_development",
+      "tillering",
+      "rosette",
+      "stem_elongation"
+    ],
+    "flowering": [
+      "booting",
+      "heading",
+      "anthesis",
+      "flowering"
+    ],
+    "fruiting_or_grain_fill": [
+      "yield_formation",
+      "grain_fill",
+      "grain_filling",
+      "fruit_development",
+      "fruiting",
+      "fruit_set",
+      "pod_set",
+      "pod_fill",
+      "pod_filling",
+      "bulking",
+      "tuber_bulking"
+    ],
+    "maturity_or_harvest": [
+      "maturation",
+      "maturity",
+      "ripening",
+      "senescence",
+      "harvest_ready",
+      "harvest"
+    ],
+    "unknown": [
+      "unknown",
+      "unknown_stage"
+    ]
+  },
+  "lane_state_priority": [
+    {
+      "event_state": "SEVERE",
+      "priority": 900,
+      "is_open": true
+    },
+    {
+      "event_state": "ACTIVE",
+      "priority": 800,
+      "is_open": true
+    },
+    {
+      "event_state": "QUIET_PENDING",
+      "priority": 700,
+      "is_open": true
+    },
+    {
+      "event_state": "WATCH",
+      "priority": 600,
+      "is_open": true
+    },
+    {
+      "event_state": "RECOVERING",
+      "priority": 500,
+      "is_open": true
+    },
+    {
+      "event_state": "DATA_GAP",
+      "priority": 400,
+      "is_open": true
+    },
+    {
+      "event_state": "CLOSED_RESPONSE_UNRESOLVED",
+      "priority": 300,
+      "is_open": false
+    },
+    {
+      "event_state": "CLOSED_PRESSURE_QUIET_UNCONFIRMED",
+      "priority": 250,
+      "is_open": false
+    },
+    {
+      "event_state": "CLOSED_RECOVERED",
+      "priority": 200,
+      "is_open": false
+    },
+    {
+      "event_state": "CLOSED_WATCH_QUIET",
+      "priority": 150,
+      "is_open": false
+    },
+    {
+      "event_state": "CLOSED_SEASON_BOUNDARY",
+      "priority": 100,
+      "is_open": false
+    }
+  ]
+}

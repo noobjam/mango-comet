@@ -1,8 +1,8 @@
 {
-  "started_at": "2026-07-03T09:02:17Z",
+  "started_at": "2026-07-04T17:30:45Z",
   "mode": "orchestrate",
-  "objective": "Provide one durable VM command for the complete Archetype V2 Phase A sequence",
+  "objective": "Build and verify Incident V3 crop-impact stories and map viewer",
   "config_hash": "6829e8fe3df3db561237234733b68dc9b8ce7c37",
-  "phase": "A-model-validation",
-  "status": "runner_locally_verified_ready_for_vm_execution"
+  "phase": "v3-release-verification",
+  "status": "locally_verified_ready_for_commit_and_vm_execution"
 }

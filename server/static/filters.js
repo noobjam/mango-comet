@@ -4,18 +4,26 @@ const FACETS = [
   ["hazardFilter", "hazard_signature", "All hazards"],
   ["responseFilter", "response_signature", "All responses"],
 ];
+const INCIDENT_FACETS = [
+  ["cropFilter", "crop_name", "All crops"],
+  ["stageFilter", "stage_bucket", "All crop stages"],
+  ["lifecycleFilter", "incident_state", "All lifecycle states"],
+];
 
 export class FilterController {
-  constructor({ onChange, onSearch }) {
+  constructor({ onChange, onSearch, incidentMode = false }) {
     this.onChange = onChange;
     this.onSearch = onSearch;
-    this.mode = "situation";
+    this.incidentMode = Boolean(incidentMode);
+    this.mode = this.incidentMode ? "incident" : "situation";
     this.exactStories = [];
+    this.incidentFacetValues = new Map(INCIDENT_FACETS.map(([, key]) => [key, new Set()]));
     this.searchTimer = null;
     this.elements = Object.fromEntries([
       "situationMode", "exactMode", "situationFilters", "exactFilters", "storySearch",
       "storySelect", "familyFilter", "riskFilter", "hazardFilter", "responseFilter",
-      "clearFilters", "storySummary", "familyFilterLabel",
+      "clearFilters", "storySummary", "familyFilterLabel", "modeSwitch",
+      "incidentFilters", "cropFilter", "stageFilter", "lifecycleFilter",
     ].map((id) => [id, document.getElementById(id)]));
     this.bind();
   }
@@ -26,11 +34,22 @@ export class FilterController {
     e.exactMode.addEventListener("click", () => this.setMode("exact"));
     e.storySelect.addEventListener("change", () => this.changed());
     for (const [id] of FACETS) e[id].addEventListener("change", () => this.changed());
+    for (const [id] of INCIDENT_FACETS) e[id].addEventListener("change", () => this.changed());
     e.storySearch.addEventListener("input", () => {
       window.clearTimeout(this.searchTimer);
       this.searchTimer = window.setTimeout(() => this.onSearch?.(e.storySearch.value.trim()), 260);
     });
     e.clearFilters.addEventListener("click", () => this.clear());
+    this.setIncidentMode(this.incidentMode);
+  }
+
+  setIncidentMode(enabled) {
+    this.incidentMode = Boolean(enabled);
+    if (this.incidentMode) this.mode = "incident";
+    this.elements.modeSwitch.hidden = this.incidentMode;
+    this.elements.incidentFilters.hidden = !this.incidentMode;
+    this.elements.situationFilters.hidden = this.incidentMode || this.mode === "exact";
+    this.elements.exactFilters.hidden = this.incidentMode || this.mode !== "exact";
   }
 
   setData(payload = {}) {
@@ -50,7 +69,41 @@ export class FilterController {
     for (const [id, key, emptyLabel] of FACETS) {
       this.fillFacet(this.elements[id], payload.facets?.[key] || [], key, emptyLabel);
     }
+    const rows = payload.incidents || payload.exact_stories || payload.motifs || [];
+    for (const [id, key, emptyLabel] of INCIDENT_FACETS) {
+      const values = payload.facets?.[key] || derivedFacet(rows, key);
+      this.rememberIncidentFacet(key, values);
+      this.fillFacet(
+        this.elements[id],
+        [...this.incidentFacetValues.get(key)].sort(),
+        key,
+        emptyLabel,
+      );
+    }
     this.renderSummary();
+  }
+
+  setIncidentFeatures(features = []) {
+    if (!this.incidentMode) return;
+    const rows = features.map((feature) => feature?.properties || {});
+    for (const [id, key, emptyLabel] of INCIDENT_FACETS) {
+      this.rememberIncidentFacet(key, derivedFacet(rows, key));
+      this.fillFacet(
+        this.elements[id],
+        [...this.incidentFacetValues.get(key)].sort(),
+        key,
+        emptyLabel,
+      );
+    }
+    this.renderSummary();
+  }
+
+  rememberIncidentFacet(key, values) {
+    const target = this.incidentFacetValues.get(key);
+    for (const row of values || []) {
+      const value = typeof row === "string" ? row : row?.[key] ?? row?.value;
+      if (value) target.add(String(value));
+    }
   }
 
   fillStories(selected) {
@@ -77,10 +130,14 @@ export class FilterController {
       const label = prettyValue(value);
       select.appendChild(new Option(count ? `${label} · ${count.toLocaleString()}` : label, String(value)));
     }
+    if (selected && !Array.from(select.options).some((option) => option.value === selected)) {
+      select.appendChild(new Option(prettyValue(selected), selected));
+    }
     select.value = Array.from(select.options).some((option) => option.value === selected) ? selected : "";
   }
 
   setMode(mode, { notify = true } = {}) {
+    if (this.incidentMode) return;
     this.mode = mode === "exact" ? "exact" : "situation";
     const exact = this.mode === "exact";
     if (exact) this.clearFacets();
@@ -100,12 +157,13 @@ export class FilterController {
     this.elements.storySelect.value = "";
     this.clearFacets();
     this.renderSummary();
-    this.onSearch?.("");
+    if (!this.incidentMode) this.onSearch?.("");
     this.onChange?.(this.filters());
   }
 
   clearFacets() {
     for (const [id] of FACETS) this.elements[id].value = "";
+    for (const [id] of INCIDENT_FACETS) this.elements[id].value = "";
   }
 
   changed() {
@@ -114,6 +172,13 @@ export class FilterController {
   }
 
   filters() {
+    if (this.incidentMode) {
+      const result = {};
+      for (const [id, key] of INCIDENT_FACETS) {
+        if (this.elements[id].value) result[key] = this.elements[id].value;
+      }
+      return result;
+    }
     if (this.mode === "exact") {
       const storyId = this.elements.storySelect.value;
       return storyId ? { story_cluster_id: storyId } : {};
@@ -135,11 +200,20 @@ export class FilterController {
     const story = this.mode === "exact" ? this.selectedStory() : null;
     const filters = this.filters();
     card.replaceChildren();
-    const kicker = element("div", "story-card-kicker", this.mode === "exact" ? "Exact story" : "Similar situations");
+    const kicker = element(
+      "div",
+      "story-card-kicker",
+      this.incidentMode ? "Crop-impact incidents" : this.mode === "exact" ? "Exact story" : "Similar situations",
+    );
     let title = "Every story state in the selected week";
     let text = "Choose shared evidence or an exact story to narrow the retrospective.";
     const chips = [];
-    if (this.mode === "exact" && !story) {
+    if (this.incidentMode) {
+      title = Object.keys(filters).length
+        ? Object.values(filters).map(prettyValue).join(" · ")
+        : "All crop incidents in the selected week";
+      text = "Exact monitored footprints are primary; zoom in for contributing field evidence.";
+    } else if (this.mode === "exact" && !story) {
       title = "Choose one strict temporal signature";
       text = "Exact-story mode preserves sequence identity instead of broadening it to similar evidence.";
     } else if (story) {
@@ -158,6 +232,13 @@ export class FilterController {
       card.appendChild(row);
     }
   }
+}
+
+function derivedFacet(rows, key) {
+  return [...new Set(rows.map((row) => (
+    key === "incident_state" ? row?.incident_state || row?.terminal_state : row?.[key]
+  )).filter(Boolean))]
+    .sort((left, right) => String(left).localeCompare(String(right)));
 }
 
 function readableStory(story) {

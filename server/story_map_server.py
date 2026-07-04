@@ -31,6 +31,10 @@ FRAME_STATE_FIELDS = (
     "timeline_bucket",
     "field_id",
     "story_cluster_id",
+    "incident_id",
+    "crop_name",
+    "stage_bucket",
+    "incident_state",
     "event_id",
     "event_state",
     "motif_id",
@@ -53,6 +57,99 @@ FRAME_STATE_FIELDS = (
     "assignment_reason",
     "motif_model_version",
     "concurrent_event_count",
+)
+
+INCIDENT_V3_ARTIFACT_NAMES = {
+    "footprints": "incident_footprints.parquet",
+    "weekly_state": "incident_weekly_state.parquet",
+    "stage_summary": "incident_stage_summary.parquet",
+    "windows": "incident_windows.parquet",
+    "lineage": "incident_lineage.parquet",
+}
+
+INCIDENT_FOOTPRINT_FILTER_COLUMNS = frozenset(
+    {
+        "incident_id",
+        "crop_name",
+        "hazard_family",
+        "incident_state",
+        "stage_bucket",
+    }
+)
+
+INCIDENT_FOOTPRINT_REQUIRED_COLUMNS = frozenset(
+    {
+        "timeline_bucket",
+        "incident_id",
+        "crop_name",
+        "hazard_family",
+        "incident_state",
+        "stage_bucket",
+        "geometry_geojson",
+        "geometry_type",
+        "min_lon",
+        "min_lat",
+        "max_lon",
+        "max_lat",
+        "footprint_geometry_method",
+        "low_zoom_omitted",
+        "monitored_count",
+        "evaluable_count",
+        "affected_count",
+        "severe_count",
+        "footprint_carried_forward",
+        "is_physical_movement",
+    }
+)
+
+INCIDENT_FOOTPRINT_PROPERTY_FIELDS = (
+    "timeline_bucket",
+    "incident_id",
+    "story_cluster_id",
+    "exposure_id",
+    "crop_name",
+    "hazard_family",
+    "incident_state",
+    "current_state",
+    "stage_bucket",
+    "stage_distribution",
+    "component_id",
+    "monitored_count",
+    "evaluable_count",
+    "affected_count",
+    "active_count",
+    "severe_count",
+    "pressure_core_count",
+    "impact_lag_count",
+    "global_crop_week_unmappable_instance_count",
+    "pressure_core_field_count",
+    "severe_field_count",
+    "watch_frontier_field_count",
+    "impact_lag_field_count",
+    "coverage_adequate",
+    "coverage_missing_cell_count",
+    "unresolved_carried_field_count",
+    "recovered_field_count",
+    "fresh_decline_field_count",
+    "fresh_recovery_field_count",
+    "footprint_carried_forward",
+    "footprint_cell_count",
+    "pressure_cell_count",
+    "impact_cell_count",
+    "watch_cell_count",
+    "relapse_count",
+    "data_gap_count",
+    "right_censored",
+    "fresh_decline_evidence",
+    "fresh_recovery_evidence",
+    "pressure_core_evidence",
+    "footprint_geometry_method",
+    "footprint_area_km2",
+    "coincident_group_id",
+    "coincident_incident_count",
+    "coincident_incident_index",
+    "coincident_crop_names_json",
+    "is_physical_movement",
 )
 
 FRAME_STATE_META_FIELDS = (
@@ -136,6 +233,10 @@ class RequestValidationError(ValueError):
     """A malformed public request that is safe to report as HTTP 400."""
 
 
+class ResourceNotFoundError(LookupError):
+    """A missing optional public resource that is safe to report as HTTP 404."""
+
+
 class ServerBusyError(RuntimeError):
     """The bounded query executor has no immediately available capacity."""
 
@@ -161,6 +262,7 @@ class Settings:
     log_level: str
     cache_seconds: float = 300.0
     cache_entries: int = 256
+    cache_max_bytes: int = 536_870_912
     gzip_min_bytes: int = 1024
     query_concurrency: int = 8
 
@@ -191,6 +293,9 @@ class Settings:
             log_level=os.getenv("STORY_MAP_LOG_LEVEL", "INFO"),
             cache_seconds=float(os.getenv("STORY_MAP_CACHE_SECONDS", "300")),
             cache_entries=int(os.getenv("STORY_MAP_CACHE_ENTRIES", "256")),
+            cache_max_bytes=int(
+                os.getenv("STORY_MAP_CACHE_MAX_BYTES", "536870912")
+            ),
             gzip_min_bytes=int(os.getenv("STORY_MAP_GZIP_MIN_BYTES", "1024")),
             query_concurrency=int(os.getenv("STORY_MAP_QUERY_CONCURRENCY", "8")),
         )
@@ -205,15 +310,29 @@ class CachedBody:
 class ResponseCache:
     """Small process-local TTL/LRU cache for immutable run artifacts."""
 
-    def __init__(self, *, ttl_seconds: float, capacity: int, gzip_min_bytes: int) -> None:
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float,
+        capacity: int,
+        gzip_min_bytes: int,
+        max_bytes: int = 536_870_912,
+    ) -> None:
         self.ttl_seconds = max(0.0, float(ttl_seconds))
         self.capacity = max(0, int(capacity))
         self.gzip_min_bytes = max(0, int(gzip_min_bytes))
+        self.max_bytes = max(0, int(max_bytes))
         self._items: OrderedDict[str, tuple[float, CachedBody]] = OrderedDict()
+        self._size_bytes = 0
         self._lock = RLock()
 
     def get(self, key: str) -> CachedBody | None:
-        if not key or self.capacity == 0 or self.ttl_seconds == 0:
+        if (
+            not key
+            or self.capacity == 0
+            or self.ttl_seconds == 0
+            or self.max_bytes == 0
+        ):
             return None
         now = time.monotonic()
         with self._lock:
@@ -223,6 +342,7 @@ class ResponseCache:
             expires_at, cached = item
             if expires_at <= now:
                 self._items.pop(key, None)
+                self._size_bytes -= _cached_body_size(cached)
                 return None
             self._items.move_to_end(key)
             return cached
@@ -234,15 +354,58 @@ class ResponseCache:
             else None
         )
         cached = CachedBody(body=body, gzip_body=gzip_body)
-        if not key or self.capacity == 0 or self.ttl_seconds == 0:
+        if (
+            not key
+            or self.capacity == 0
+            or self.ttl_seconds == 0
+            or self.max_bytes == 0
+        ):
+            return cached
+        cached_size = _cached_body_size(cached)
+        if cached_size > self.max_bytes:
             return cached
         expires_at = time.monotonic() + self.ttl_seconds
         with self._lock:
+            previous = self._items.pop(key, None)
+            if previous is not None:
+                self._size_bytes -= _cached_body_size(previous[1])
             self._items[key] = (expires_at, cached)
+            self._size_bytes += cached_size
             self._items.move_to_end(key)
-            while len(self._items) > self.capacity:
-                self._items.popitem(last=False)
+            while (
+                len(self._items) > self.capacity
+                or self._size_bytes > self.max_bytes
+            ):
+                _, (_, evicted) = self._items.popitem(last=False)
+                self._size_bytes -= _cached_body_size(evicted)
         return cached
+
+    @property
+    def size_bytes(self) -> int:
+        with self._lock:
+            return self._size_bytes
+
+
+def _cached_body_size(value: CachedBody) -> int:
+    return len(value.body) + (len(value.gzip_body) if value.gzip_body else 0)
+
+
+def _cache_byte_budgets(total_bytes: int) -> tuple[int, int]:
+    """Split one process cache budget between API payloads and static assets."""
+
+    total = max(0, int(total_bytes))
+    static = total // 16
+    return total - static, static
+
+
+def _encode_json_body(payload: object) -> bytes:
+    """Clean and encode one JSON response before optional cache compression."""
+
+    return json.dumps(
+        _clean(payload),
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
@@ -267,8 +430,18 @@ class StoryMapStore:
         self.state_snapshots_path = self.run_dir / "event_state_snapshots.parquet"
         self.manifest_path = self._pick("manifest.json")
         self.timeline_summary_path = self.run_dir / "gpu_summaries" / "timeline_summary.parquet"
+        self.incident_footprints_path = self.run_dir / INCIDENT_V3_ARTIFACT_NAMES["footprints"]
+        self.incident_weekly_state_path = self.run_dir / INCIDENT_V3_ARTIFACT_NAMES["weekly_state"]
+        self.incident_stage_summary_path = self.run_dir / INCIDENT_V3_ARTIFACT_NAMES["stage_summary"]
+        self.incident_windows_path = self.run_dir / INCIDENT_V3_ARTIFACT_NAMES["windows"]
+        self.incident_lineage_path = self.run_dir / INCIDENT_V3_ARTIFACT_NAMES["lineage"]
         self.frame_columns = self._parquet_columns(self.frame_path)
         self.timeline_summary_columns = self._parquet_columns(self.timeline_summary_path)
+        self.incident_footprint_columns = self._parquet_columns(self.incident_footprints_path)
+        self.incident_weekly_state_columns = self._parquet_columns(self.incident_weekly_state_path)
+        self.incident_stage_summary_columns = self._parquet_columns(self.incident_stage_summary_path)
+        self.incident_window_columns = self._parquet_columns(self.incident_windows_path)
+        self.incident_lineage_columns = self._parquet_columns(self.incident_lineage_path)
         self.timeline_summary_mapping = self._timeline_summary_mapping()
         LOGGER.info(
             "story_map_store run_dir=%s optimized_geometry=%s frame_columns=%s timeline_summary=%s",
@@ -303,6 +476,25 @@ class StoryMapStore:
             "story_days": self.story_days_path,
             "manifest": self.manifest_path,
         }
+
+    def _incident_v3_paths(self) -> dict[str, Path]:
+        return {
+            "footprints": self.incident_footprints_path,
+            "weekly_state": self.incident_weekly_state_path,
+            "stage_summary": self.incident_stage_summary_path,
+            "windows": self.incident_windows_path,
+            "lineage": self.incident_lineage_path,
+        }
+
+    def has_incident_v3(self) -> bool:
+        """Return whether the complete optional Incident V3 API bundle is present."""
+        return all(path.is_file() for path in self._incident_v3_paths().values())
+
+    def require_incident_v3(self) -> None:
+        if not self.has_incident_v3():
+            raise ResourceNotFoundError(
+                "Incident V3 data is not available for this viewer bundle."
+            )
 
     def _parquet_columns(self, path: Path) -> frozenset[str]:
         if not path.exists():
@@ -344,6 +536,17 @@ class StoryMapStore:
     def _effective_frame_filters(self, filters: dict[str, str] | None) -> dict[str, str]:
         """Map the live-risk filter to old bundles without changing new semantics."""
         clean = _clean_filters(filters)
+        incident_id = clean.pop("incident_id", None)
+        if incident_id is not None:
+            story_cluster_id = clean.get("story_cluster_id")
+            if story_cluster_id is not None and story_cluster_id != incident_id:
+                raise RequestValidationError(
+                    "incident_id and story_cluster_id must match when both are provided"
+                )
+            clean["story_cluster_id"] = incident_id
+        for optional_name in ("crop_name", "stage_bucket", "incident_state"):
+            if optional_name not in self.frame_columns:
+                clean.pop(optional_name, None)
         if "current_risk_band" in clean and "current_risk_band" not in self.frame_columns:
             clean["max_risk_band"] = clean.pop("current_risk_band")
         return clean
@@ -362,6 +565,7 @@ class StoryMapStore:
         return {
             "ok": all(checks.values()),
             "checks": checks,
+            "capabilities": {"incident_v3": self.has_incident_v3()},
         }
 
     def require_ready(self) -> None:
@@ -391,6 +595,7 @@ class StoryMapStore:
                 "defaultFeatureLimit": self.settings.default_feature_limit,
                 "maxFeatureLimit": self.settings.max_feature_limit,
             },
+            "capabilities": {"incident_v3": self.has_incident_v3()},
         }
 
     def manifest(self) -> dict[str, Any]:
@@ -403,6 +608,7 @@ class StoryMapStore:
             "bounds": bounds,
             "optimized_geometry": self._has_optimized_geometry(),
             "story_palette": self.story_palette(manifest),
+            "incident_v3_available": self.has_incident_v3(),
         }
         LOGGER.info(
             "manifest_loaded run_dir=%s optimized_geometry=%s bounds=%s",
@@ -411,6 +617,336 @@ class StoryMapStore:
             _json_for_log(bounds),
         )
         return manifest
+
+    @staticmethod
+    def _require_incident_columns(
+        artifact_name: str,
+        columns: frozenset[str],
+        required: set[str] | frozenset[str],
+    ) -> None:
+        missing = sorted(set(required) - set(columns))
+        if missing:
+            raise RuntimeError(
+                f"Incident V3 {artifact_name} schema is missing required columns: "
+                + ", ".join(missing)
+            )
+
+    def incident_footprints(
+        self,
+        *,
+        timeline_bucket: str,
+        filters: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Return every exact incident footprint for one week, without a field cap."""
+        self.require_incident_v3()
+        self._require_incident_columns(
+            "footprints",
+            self.incident_footprint_columns,
+            INCIDENT_FOOTPRINT_REQUIRED_COLUMNS,
+        )
+        clean_filters = _clean_incident_filters(filters)
+        public_filters = dict(clean_filters)
+        stage_bucket = clean_filters.pop("stage_bucket", None)
+        filter_clause, filter_params = _incident_filter_sql(clean_filters, "f")
+        if stage_bucket is not None:
+            self._require_incident_columns(
+                "stage summary",
+                self.incident_stage_summary_columns,
+                {
+                    "incident_id", "timeline_bucket", "stage_bucket",
+                    "affected_crop_instance_count",
+                },
+            )
+            filter_clause += """
+                AND EXISTS (
+                    SELECT 1
+                    FROM read_parquet(?) AS stage
+                    WHERE CAST(stage.timeline_bucket AS DATE)
+                            = CAST(f.timeline_bucket AS DATE)
+                      AND CAST(stage.incident_id AS VARCHAR)
+                            = CAST(f.incident_id AS VARCHAR)
+                      AND CAST(stage.stage_bucket AS VARCHAR) = ?
+                      AND COALESCE(
+                            TRY_CAST(stage.affected_crop_instance_count AS BIGINT), 0
+                          ) > 0
+                )
+            """
+            filter_params.extend(
+                [str(self.incident_stage_summary_path), stage_bucket]
+            )
+        geometry_fields = (
+            "geometry_geojson", "geometry_type",
+            "min_lon", "min_lat", "max_lon", "max_lat",
+        )
+        projection = ",\n                    ".join(
+            (
+                f'f."{column}"'
+                if column in self.incident_footprint_columns
+                else f'NULL AS "{column}"'
+            )
+            for column in dict.fromkeys(
+                (*geometry_fields, *INCIDENT_FOOTPRINT_PROPERTY_FIELDS)
+            )
+        )
+        with duckdb.connect(":memory:") as con:
+            summary = con.execute(
+                """
+                SELECT
+                    COUNT(*) AS source_count,
+                    COUNT(DISTINCT CAST(incident_id AS VARCHAR)) AS distinct_incident_count,
+                    SUM(CASE WHEN COALESCE(TRY_CAST(low_zoom_omitted AS BOOLEAN), TRUE)
+                        THEN 1 ELSE 0 END) AS omitted_count,
+                    SUM(CASE WHEN COALESCE(CAST(footprint_geometry_method AS VARCHAR), '')
+                        <> 'exact_union_of_grid_rectangles' THEN 1 ELSE 0 END) AS inexact_count,
+                    SUM(CASE WHEN COALESCE(TRY_CAST(is_physical_movement AS BOOLEAN), TRUE)
+                        THEN 1 ELSE 0 END) AS physical_movement_count
+                FROM read_parquet(?)
+                WHERE CAST(timeline_bucket AS DATE) = CAST(? AS DATE)
+                """,
+                [str(self.incident_footprints_path), timeline_bucket],
+            ).fetchone()
+            rows = con.execute(
+                f"""
+                SELECT {projection}
+                FROM read_parquet(?) AS f
+                WHERE CAST(f.timeline_bucket AS DATE) = CAST(? AS DATE)
+                {filter_clause}
+                ORDER BY CAST(f.incident_id AS VARCHAR)
+                """,
+                [str(self.incident_footprints_path), timeline_bucket, *filter_params],
+            ).fetchdf()
+
+        source_count = int(summary[0] or 0)
+        if source_count != int(summary[1] or 0):
+            raise RuntimeError("Incident V3 footprints are not unique by incident and week")
+        if any(int(value or 0) for value in summary[2:]):
+            raise RuntimeError(
+                "Incident V3 footprint completeness contract was violated"
+            )
+
+        features: list[dict[str, Any]] = []
+        for row in _records(rows):
+            geometry, geom_bbox = _precomputed_geojson_and_bbox(
+                row.get("geometry_geojson"),
+                row.get("geometry_type"),
+                (
+                    row.get("min_lon"), row.get("min_lat"),
+                    row.get("max_lon"), row.get("max_lat"),
+                ),
+            )
+            if geometry.get("type") not in {"Polygon", "MultiPolygon"}:
+                raise RuntimeError("Incident V3 footprint geometry must be Polygon or MultiPolygon")
+            properties = {
+                key: row.get(key)
+                for key in INCIDENT_FOOTPRINT_PROPERTY_FIELDS
+            }
+            incident_id = row.get("incident_id")
+            properties["incident_id"] = incident_id
+            properties["story_cluster_id"] = row.get("story_cluster_id") or incident_id
+            properties["footprint_geometry_method"] = "exact_union_of_grid_rectangles"
+            properties["is_physical_movement"] = False
+            properties["bbox"] = geom_bbox
+            features.append(
+                {"type": "Feature", "geometry": geometry, "properties": properties}
+            )
+
+        LOGGER.info(
+            "incident_footprints bucket=%s filters=%s source=%s matching=%s",
+            timeline_bucket,
+            _json_for_log(public_filters),
+            source_count,
+            len(features),
+        )
+        return {
+            "type": "FeatureCollection",
+            "features": features,
+            "meta": {
+                "timeline_bucket": timeline_bucket,
+                "source_footprint_count": source_count,
+                "matching_footprint_count": len(features),
+                "feature_count": len(features),
+                "complete": True,
+                "truncated": False,
+                "feature_cap_applied": False,
+                "low_zoom_footprints_dropped": False,
+                "footprint_geometry_method": "exact_union_of_grid_rectangles",
+                "is_physical_movement": False,
+                "filters": public_filters,
+            },
+        }
+
+    def incident_detail(self, incident_id: str) -> dict[str, Any]:
+        """Return a complete V3 incident lifecycle, stage, and lineage drill-down."""
+        self.require_incident_v3()
+        self._require_incident_columns(
+            "windows", self.incident_window_columns, {"incident_id"}
+        )
+        self._require_incident_columns(
+            "weekly state",
+            self.incident_weekly_state_columns,
+            {"incident_id", "timeline_bucket"},
+        )
+        self._require_incident_columns(
+            "stage summary",
+            self.incident_stage_summary_columns,
+            {"incident_id", "timeline_bucket"},
+        )
+        self._require_incident_columns(
+            "footprints",
+            self.incident_footprint_columns,
+            {
+                "incident_id", "timeline_bucket",
+                "geometry_geojson", "footprint_geometry_method",
+                "low_zoom_omitted", "is_physical_movement",
+            },
+        )
+
+        detail_footprint_fields = (
+            "timeline_bucket", "incident_id", "geometry_geojson",
+            "footprint_geometry_method", "low_zoom_omitted",
+            "is_physical_movement", "footprint_area_km2",
+            "footprint_carried_forward", "incident_state", "stage_bucket",
+            "crop_name", "hazard_family",
+            "pressure_geometry_geojson", "impact_geometry_geojson",
+            "watch_geometry_geojson", "pressure_cell_count",
+            "impact_cell_count", "watch_cell_count",
+        )
+        detail_footprint_projection = ",\n                        ".join(
+            (
+                f'f."{column}"'
+                if column in self.incident_footprint_columns
+                else f'NULL AS "{column}"'
+            )
+            for column in detail_footprint_fields
+        )
+
+        window_order = _optional_order_by(
+            self.incident_window_columns, ("first_evidence_week", "incident_id")
+        )
+        with duckdb.connect(":memory:") as con:
+            window_rows = _records(
+                con.execute(
+                    f"""
+                    SELECT * FROM read_parquet(?)
+                    WHERE CAST(incident_id AS VARCHAR) = ?
+                    {window_order}
+                    """,
+                    [str(self.incident_windows_path), incident_id],
+                ).fetchdf()
+            )
+            if not window_rows:
+                raise ResourceNotFoundError("Incident was not found.")
+            if len(window_rows) != 1:
+                raise RuntimeError("Incident V3 windows are not unique by incident_id")
+
+            weekly_state = _records(
+                con.execute(
+                    """
+                    SELECT * FROM read_parquet(?)
+                    WHERE CAST(incident_id AS VARCHAR) = ?
+                    ORDER BY timeline_bucket
+                    """,
+                    [str(self.incident_weekly_state_path), incident_id],
+                ).fetchdf()
+            )
+            stage_rows = _records(
+                con.execute(
+                    """
+                    SELECT * FROM read_parquet(?)
+                    WHERE CAST(incident_id AS VARCHAR) = ?
+                    ORDER BY timeline_bucket, stage_bucket
+                    """,
+                    [str(self.incident_stage_summary_path), incident_id],
+                ).fetchdf()
+            )
+            footprint_rows = _records(
+                con.execute(
+                    f"""
+                    SELECT {detail_footprint_projection}
+                    FROM read_parquet(?) AS f
+                    WHERE CAST(f.incident_id AS VARCHAR) = ?
+                    ORDER BY timeline_bucket
+                    """,
+                    [str(self.incident_footprints_path), incident_id],
+                ).fetchdf()
+            )
+            for footprint in footprint_rows:
+                if (
+                    str(footprint.get("footprint_geometry_method") or "")
+                    != "exact_union_of_grid_rectangles"
+                    or bool(footprint.get("low_zoom_omitted"))
+                    or bool(footprint.get("is_physical_movement"))
+                ):
+                    raise RuntimeError(
+                        "Incident V3 detail requires exact non-movement footprints"
+                    )
+                main_geometry, _ = _geometry_to_geojson_and_bbox(
+                    footprint.pop("geometry_geojson", None), "geojson"
+                )
+                if main_geometry.get("type") not in {"Polygon", "MultiPolygon"}:
+                    raise RuntimeError(
+                        "Incident V3 detail footprint geometry must be Polygon or MultiPolygon"
+                    )
+                footprint["geometry"] = main_geometry
+                footprint["is_physical_movement"] = False
+                for role in ("pressure", "impact", "watch"):
+                    raw_geometry = footprint.pop(
+                        f"{role}_geometry_geojson", None
+                    )
+                    if raw_geometry:
+                        geometry, _ = _geometry_to_geojson_and_bbox(
+                            raw_geometry, "geojson"
+                        )
+                        footprint[f"{role}_geometry"] = geometry
+                    else:
+                        footprint[f"{role}_geometry"] = None
+
+            lineage_required = {"parent_incident_id", "child_incident_id"}
+            if lineage_required.issubset(self.incident_lineage_columns):
+                lineage_order = _optional_order_by(
+                    self.incident_lineage_columns, ("timeline_bucket", "lineage_id")
+                )
+                incoming = _records(
+                    con.execute(
+                        f"""
+                        SELECT * FROM read_parquet(?)
+                        WHERE CAST(child_incident_id AS VARCHAR) = ?
+                        {lineage_order}
+                        """,
+                        [str(self.incident_lineage_path), incident_id],
+                    ).fetchdf()
+                )
+                outgoing = _records(
+                    con.execute(
+                        f"""
+                        SELECT * FROM read_parquet(?)
+                        WHERE CAST(parent_incident_id AS VARCHAR) = ?
+                        {lineage_order}
+                        """,
+                        [str(self.incident_lineage_path), incident_id],
+                    ).fetchdf()
+                )
+            else:
+                incoming = []
+                outgoing = []
+
+        LOGGER.info(
+            "incident_detail incident_id=%s weekly=%s stages=%s incoming=%s outgoing=%s",
+            incident_id,
+            len(weekly_state),
+            len(stage_rows),
+            len(incoming),
+            len(outgoing),
+        )
+        return {
+            "incident_id": incident_id,
+            "window": window_rows[0],
+            "weekly_state": weekly_state,
+            "stage_summary": stage_rows,
+            "stage_rows": stage_rows,
+            "footprints": footprint_rows,
+            "lineage": {"incoming": incoming, "outgoing": outgoing},
+        }
 
     def story_palette(self, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
         self.require_ready()
@@ -480,6 +1016,22 @@ class StoryMapStore:
     def timeline(self) -> dict[str, Any]:
         self.require_ready()
         started = time.perf_counter()
+        if self.has_incident_v3() and not self.timeline_summary_mapping:
+            activity = self.activity({})
+            buckets = activity["buckets"]
+            LOGGER.info(
+                "timeline_loaded source=incident_artifacts buckets=%s "
+                "first_bucket=%s last_bucket=%s elapsed_ms=%.1f",
+                len(buckets),
+                buckets[0]["timeline_bucket"] if buckets else None,
+                buckets[-1]["timeline_bucket"] if buckets else None,
+                (time.perf_counter() - started) * 1000,
+            )
+            return {
+                "buckets": buckets,
+                "source": "incident_artifacts",
+                "activity_unit": "incident_stories",
+            }
         source = "frame_fields"
         with duckdb.connect(":memory:") as con:
             if self.timeline_summary_mapping:
@@ -517,6 +1069,12 @@ class StoryMapStore:
                     [str(self.frame_path)],
                 ).fetchdf()
         buckets = _records(rows)
+        if self.has_incident_v3():
+            for bucket in buckets:
+                incident_count = int(bucket.get("story_cluster_count") or 0)
+                bucket["incident_count"] = incident_count
+                bucket["activity_count"] = incident_count
+                bucket["activity_unit"] = "incident_stories"
         LOGGER.info(
             "timeline_loaded source=%s buckets=%s first_bucket=%s last_bucket=%s elapsed_ms=%.1f",
             source,
@@ -569,6 +1127,10 @@ class StoryMapStore:
         optional_frame_select = ",\n                ".join(
             self._optional_frame_sql("f", name, fallback)
             for name, fallback in (
+                ("incident_id", "f.story_cluster_id"),
+                ("crop_name", "NULL"),
+                ("stage_bucket", "NULL"),
+                ("incident_state", "NULL"),
                 ("event_id", "NULL"),
                 ("event_state", "NULL"),
                 ("motif_id", "NULL"),
@@ -710,6 +1272,10 @@ class StoryMapStore:
                     "timeline_bucket",
                     "field_id",
                     "story_cluster_id",
+                    "incident_id",
+                    "crop_name",
+                    "stage_bucket",
+                    "incident_state",
                     "event_id",
                     "event_state",
                     "motif_id",
@@ -879,6 +1445,10 @@ class StoryMapStore:
         optional_frame_select = ",\n                ".join(
             self._optional_frame_sql("f", name, fallback)
             for name, fallback in (
+                ("incident_id", "f.story_cluster_id"),
+                ("crop_name", "NULL"),
+                ("stage_bucket", "NULL"),
+                ("incident_state", "NULL"),
                 ("event_id", "NULL"),
                 ("event_state", "NULL"),
                 ("motif_id", "NULL"),
@@ -1258,6 +1828,49 @@ class StoryMapStore:
                 """,
                 [str(self.frame_path), str(self.labels_path)],
             ).fetchdf()
+            incident_facets: dict[str, list[dict[str, Any]]] = {}
+            if self.has_incident_v3():
+                facet_sources = {
+                    "crop_name": (
+                        self.incident_weekly_state_path,
+                        self.incident_weekly_state_columns,
+                    ),
+                    "stage_bucket": (
+                        self.incident_stage_summary_path,
+                        self.incident_stage_summary_columns,
+                    ),
+                    "incident_state": (
+                        self.incident_weekly_state_path,
+                        self.incident_weekly_state_columns,
+                    ),
+                }
+                for column, (source_path, source_columns) in facet_sources.items():
+                    if column not in source_columns or "incident_id" not in source_columns:
+                        continue
+                    if (
+                        column == "stage_bucket"
+                        and "affected_crop_instance_count" not in source_columns
+                    ):
+                        continue
+                    affected_stage_clause = (
+                        "AND COALESCE(TRY_CAST(s.affected_crop_instance_count AS BIGINT), 0) > 0"
+                        if column == "stage_bucket"
+                        else ""
+                    )
+                    rows = con.execute(
+                        f"""
+                        SELECT CAST(s.{column} AS VARCHAR) AS {column},
+                               COUNT(DISTINCT s.incident_id) AS count
+                        FROM read_parquet(?) AS s
+                        WHERE s.{column} IS NOT NULL
+                          AND TRIM(CAST(s.{column} AS VARCHAR)) <> ''
+                          {affected_stage_clause}
+                        GROUP BY s.{column}
+                        ORDER BY count DESC, {column}
+                        """,
+                        [str(source_path)],
+                    ).fetchdf()
+                    incident_facets[column] = _records(rows)
         motif_records = _records(motifs)
         LOGGER.info("motifs_loaded query=%s limit=%s motifs=%s", q, limit, len(motif_records))
         return {
@@ -1268,12 +1881,15 @@ class StoryMapStore:
                 "hazard_signature": _records(hazards),
                 "response_signature": _records(responses),
                 "motif_family": _records(motif_families),
+                **incident_facets,
             },
             "taxonomy": self.motif_taxonomy(),
         }
 
     def activity(self, filters: dict[str, str] | None) -> dict[str, Any]:
         self.require_ready()
+        if self.has_incident_v3():
+            return self._incident_activity(filters)
         filters = self._effective_frame_filters(filters)
         motif_family_sql = self._motif_family_sql("f")
         current_rank_sql = (
@@ -1313,6 +1929,259 @@ class StoryMapStore:
         )
         return {
             "filters": filters,
+            "bucket_count": len(buckets),
+            "buckets": buckets,
+        }
+
+    def _incident_activity(
+        self, filters: dict[str, str] | None
+    ) -> dict[str, Any]:
+        """Aggregate V3 activity from authoritative incident/week artifacts."""
+        self._require_incident_columns(
+            "footprints",
+            self.incident_footprint_columns,
+            {
+                "timeline_bucket", "incident_id", "crop_name",
+                "hazard_family", "incident_state", "monitored_count",
+                "affected_count", "severe_count",
+            },
+        )
+        self._require_incident_columns(
+            "weekly state",
+            self.incident_weekly_state_columns,
+            {
+                "timeline_bucket", "incident_id", "crop_name",
+                "hazard_family", "incident_state", "monitored_count",
+                "affected_count", "severe_count",
+            },
+        )
+        clean = _clean_filters(filters)
+        incident_id = clean.pop("incident_id", None)
+        story_cluster_id = clean.pop("story_cluster_id", None)
+        if (
+            incident_id is not None
+            and story_cluster_id is not None
+            and incident_id != story_cluster_id
+        ):
+            raise RequestValidationError(
+                "incident_id and story_cluster_id must match when both are provided"
+            )
+        if incident_id is not None:
+            clean["story_cluster_id"] = incident_id
+        elif story_cluster_id is not None:
+            clean["story_cluster_id"] = story_cluster_id
+
+        frame_filter_keys = {
+            "max_risk_band", "current_risk_band", "response_signature"
+        }
+        frame_filters = {
+            key: value for key, value in clean.items() if key in frame_filter_keys
+        }
+        if (
+            "current_risk_band" in frame_filters
+            and "current_risk_band" not in self.frame_columns
+        ):
+            frame_filters["max_risk_band"] = frame_filters.pop(
+                "current_risk_band"
+            )
+        incident_filters = {
+            key: value for key, value in clean.items() if key not in frame_filter_keys
+        }
+        frame_clause, frame_params = _filter_sql(frame_filters, "fr")
+
+        incident_clauses: list[str] = []
+        incident_params: list[Any] = []
+        incident_columns = {
+            "story_cluster_id": "incident_id",
+            "crop_name": "crop_name",
+            "incident_state": "incident_state",
+            "hazard_signature": "hazard_family",
+            "motif_family": "hazard_family",
+        }
+        stage_bucket = incident_filters.pop("stage_bucket", None)
+        for key in sorted(incident_filters):
+            column = incident_columns.get(key)
+            if column is None:
+                continue
+            incident_clauses.append(
+                f"AND CAST(i.{column} AS VARCHAR) = ?"
+            )
+            incident_params.append(incident_filters[key])
+        if stage_bucket is not None:
+            self._require_incident_columns(
+                "stage summary",
+                self.incident_stage_summary_columns,
+                {
+                    "incident_id", "timeline_bucket", "stage_bucket",
+                    "affected_crop_instance_count",
+                },
+            )
+            incident_clauses.append(
+                """
+                AND EXISTS (
+                    SELECT 1
+                    FROM read_parquet(?) AS stage
+                    WHERE CAST(stage.timeline_bucket AS DATE)
+                            = CAST(i.timeline_bucket AS DATE)
+                      AND CAST(stage.incident_id AS VARCHAR)
+                            = CAST(i.incident_id AS VARCHAR)
+                      AND CAST(stage.stage_bucket AS VARCHAR) = ?
+                      AND COALESCE(
+                            TRY_CAST(stage.affected_crop_instance_count AS BIGINT), 0
+                          ) > 0
+                )
+                """
+            )
+            incident_params.extend(
+                [str(self.incident_stage_summary_path), stage_bucket]
+            )
+        if frame_filters:
+            incident_clauses.append(
+                """
+                AND EXISTS (
+                    SELECT 1 FROM filtered_frames AS matched_frame
+                    WHERE CAST(matched_frame.timeline_bucket AS DATE)
+                            = CAST(i.timeline_bucket AS DATE)
+                      AND CAST(matched_frame.story_cluster_id AS VARCHAR)
+                            = CAST(i.incident_id AS VARCHAR)
+                )
+                """
+            )
+        incident_clause = "\n".join(incident_clauses)
+        started = time.perf_counter()
+        incident_weeks_sql = """
+            incident_weeks AS (
+                SELECT
+                    CAST(timeline_bucket AS DATE) AS timeline_bucket,
+                    CAST(incident_id AS VARCHAR) AS incident_id,
+                    CAST(crop_name AS VARCHAR) AS crop_name,
+                    CAST(hazard_family AS VARCHAR) AS hazard_family,
+                    CAST(incident_state AS VARCHAR) AS incident_state,
+                    COALESCE(TRY_CAST(monitored_count AS BIGINT), 0) AS monitored_count,
+                    COALESCE(TRY_CAST(affected_count AS BIGINT), 0) AS affected_count,
+                    COALESCE(TRY_CAST(severe_count AS BIGINT), 0) AS severe_count
+                FROM read_parquet(?)
+                UNION ALL
+                SELECT
+                    CAST(f.timeline_bucket AS DATE) AS timeline_bucket,
+                    CAST(f.incident_id AS VARCHAR) AS incident_id,
+                    CAST(f.crop_name AS VARCHAR) AS crop_name,
+                    CAST(f.hazard_family AS VARCHAR) AS hazard_family,
+                    CAST(f.incident_state AS VARCHAR) AS incident_state,
+                    COALESCE(TRY_CAST(f.monitored_count AS BIGINT), 0)
+                        AS monitored_count,
+                    COALESCE(TRY_CAST(f.affected_count AS BIGINT), 0)
+                        AS affected_count,
+                    COALESCE(TRY_CAST(f.severe_count AS BIGINT), 0) AS severe_count
+                FROM read_parquet(?) AS f
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM read_parquet(?) AS state
+                    WHERE CAST(state.timeline_bucket AS DATE)
+                            = CAST(f.timeline_bucket AS DATE)
+                      AND CAST(state.incident_id AS VARCHAR)
+                            = CAST(f.incident_id AS VARCHAR)
+                )
+            )
+        """
+        incident_paths = [
+            str(self.incident_weekly_state_path),
+            str(self.incident_footprints_path),
+            str(self.incident_weekly_state_path),
+        ]
+        with duckdb.connect(":memory:") as con:
+            if frame_filters:
+                current_rank_sql = (
+                    "COALESCE(fr.current_risk_rank, fr.max_risk_rank)"
+                    if "current_risk_rank" in self.frame_columns
+                    else "fr.max_risk_rank"
+                )
+                rows = con.execute(
+                    f"""
+                    WITH filtered_frames AS (
+                        SELECT fr.* FROM read_parquet(?) AS fr
+                        WHERE 1 = 1 {frame_clause}
+                    ), {incident_weeks_sql}, matching_incidents AS (
+                        SELECT DISTINCT i.* FROM incident_weeks AS i
+                        WHERE 1 = 1 {incident_clause}
+                    ), incident_stats AS (
+                        SELECT timeline_bucket,
+                            COUNT(DISTINCT incident_id) AS story_cluster_count,
+                            COUNT(DISTINCT hazard_family) AS motif_family_count
+                        FROM matching_incidents GROUP BY timeline_bucket
+                    ), frame_stats AS (
+                        SELECT m.timeline_bucket,
+                            COUNT(DISTINCT fr.field_id) AS field_count,
+                            SUM(fr.reportable_day_count) AS reportable_day_count,
+                            SUM(fr.event_count) AS event_count,
+                            MAX({current_rank_sql}) AS max_risk_rank
+                        FROM matching_incidents AS m
+                        LEFT JOIN filtered_frames AS fr
+                          ON CAST(fr.timeline_bucket AS DATE) = m.timeline_bucket
+                         AND CAST(fr.story_cluster_id AS VARCHAR) = m.incident_id
+                        GROUP BY m.timeline_bucket
+                    )
+                    SELECT CAST(i.timeline_bucket AS VARCHAR) AS timeline_bucket,
+                        COALESCE(f.field_count, 0) AS field_count,
+                        i.story_cluster_count,
+                        i.story_cluster_count AS incident_count,
+                        i.story_cluster_count AS activity_count,
+                        CAST('incident_stories' AS VARCHAR) AS activity_unit,
+                        i.motif_family_count,
+                        COALESCE(f.reportable_day_count, 0) AS reportable_day_count,
+                        COALESCE(f.event_count, 0) AS event_count,
+                        COALESCE(f.max_risk_rank, 0) AS max_risk_rank
+                    FROM incident_stats AS i
+                    LEFT JOIN frame_stats AS f USING (timeline_bucket)
+                    ORDER BY i.timeline_bucket
+                    """,
+                    [
+                        str(self.frame_path), *frame_params, *incident_paths,
+                        *incident_params,
+                    ],
+                ).fetchdf()
+            else:
+                rows = con.execute(
+                    f"""
+                    WITH {incident_weeks_sql}, matching_incidents AS (
+                        SELECT DISTINCT i.* FROM incident_weeks AS i
+                        WHERE 1 = 1 {incident_clause}
+                    )
+                    SELECT CAST(timeline_bucket AS VARCHAR) AS timeline_bucket,
+                        SUM(monitored_count)::BIGINT AS field_count,
+                        COUNT(DISTINCT incident_id) AS story_cluster_count,
+                        COUNT(DISTINCT incident_id) AS incident_count,
+                        COUNT(DISTINCT incident_id) AS activity_count,
+                        CAST('incident_stories' AS VARCHAR) AS activity_unit,
+                        COUNT(DISTINCT hazard_family) AS motif_family_count,
+                        CAST(0 AS BIGINT) AS reportable_day_count,
+                        SUM(affected_count)::BIGINT AS event_count,
+                        MAX(CASE
+                            WHEN severe_count > 0 OR UPPER(incident_state) = 'SEVERE'
+                                THEN 4
+                            WHEN UPPER(incident_state) IN ('ACTIVE', 'CONFIRMED') THEN 3
+                            WHEN UPPER(incident_state) IN
+                                ('CANDIDATE', 'WATCH', 'PRESSURE_QUIET') THEN 2
+                            ELSE 1 END) AS max_risk_rank
+                    FROM matching_incidents
+                    GROUP BY timeline_bucket
+                    ORDER BY timeline_bucket
+                    """,
+                    [*incident_paths, *incident_params],
+                ).fetchdf()
+        buckets = _records(rows)
+        public_filters = dict(clean)
+        LOGGER.info(
+            "activity_loaded source=incident_artifacts filters=%s buckets=%s "
+            "elapsed_ms=%.1f",
+            _json_for_log(public_filters),
+            len(buckets),
+            (time.perf_counter() - started) * 1000,
+        )
+        return {
+            "filters": public_filters,
+            "source": "incident_artifacts",
+            "activity_unit": "incident_stories",
+            "uses_frame_fields": bool(frame_filters),
             "bucket_count": len(buckets),
             "buckets": buckets,
         }
@@ -2128,23 +2997,40 @@ class StoryMapStore:
                 diagnostics["requested_bbox"] = list(bbox)
                 diagnostics["geometry_bounds"] = self.bounds()
             diagnostics["filters"] = filters
-        except Exception as exc:
-            diagnostics["diagnostic_error"] = str(exc)
+        except Exception:
+            LOGGER.exception(
+                "empty_frame_diagnostic_failed bucket=%s filters=%s bbox=%s "
+                "optimized_geometry=%s",
+                timeline_bucket,
+                _json_for_log(filters),
+                _json_for_log(bbox),
+                optimized,
+            )
+            diagnostics["diagnostic_error"] = "diagnostic_query_failed"
         return diagnostics
 
 
 def make_handler(store: StoryMapStore, settings: Settings) -> type[BaseHTTPRequestHandler]:
+    api_cache_bytes, static_cache_bytes = _cache_byte_budgets(
+        settings.cache_max_bytes
+    )
     api_cache = ResponseCache(
         ttl_seconds=settings.cache_seconds,
         capacity=settings.cache_entries,
         gzip_min_bytes=settings.gzip_min_bytes,
+        max_bytes=api_cache_bytes,
     )
     static_cache = ResponseCache(
         ttl_seconds=settings.cache_seconds,
         capacity=settings.cache_entries,
         gzip_min_bytes=settings.gzip_min_bytes,
+        max_bytes=static_cache_bytes,
     )
     query_slots = BoundedSemaphore(max(1, int(settings.query_concurrency)))
+    # DuckDB/GeoJSON work and JSON cleaning/encoding/gzip are separate CPU and
+    # memory-heavy stages. Bound both stages independently so a burst cannot
+    # move an unbounded number of completed queries into response construction.
+    response_slots = BoundedSemaphore(max(1, int(settings.query_concurrency)))
     static_root = settings.static_dir.resolve()
 
     class Handler(BaseHTTPRequestHandler):
@@ -2222,6 +3108,33 @@ def make_handler(store: StoryMapStore, settings: Settings) -> type[BaseHTTPReque
                         )
                     )
                     return
+                if path.startswith("/api/incident-footprints/"):
+                    bucket = _parse_iso_date_segment(
+                        unquote(path.removeprefix("/api/incident-footprints/"))
+                    )
+                    self._json(
+                        self._query(
+                            lambda: store.incident_footprints(
+                                timeline_bucket=bucket,
+                                filters=_incident_filters_from_query(query),
+                            )
+                        )
+                    )
+                    return
+                if path == "/api/incident-footprints":
+                    raise RequestValidationError(
+                        "date path parameter is required in YYYY-MM-DD format"
+                    )
+                if path.startswith("/api/incident/"):
+                    incident_id = _validate_incident_id(
+                        unquote(path.removeprefix("/api/incident/"))
+                    )
+                    self._json(
+                        self._query(lambda: store.incident_detail(incident_id))
+                    )
+                    return
+                if path == "/api/incident":
+                    raise RequestValidationError("incident_id path parameter is required")
                 if path.startswith("/api/frame-state/"):
                     bucket = unquote(path.removeprefix("/api/frame-state/"))
                     self._json(
@@ -2305,12 +3218,23 @@ def make_handler(store: StoryMapStore, settings: Settings) -> type[BaseHTTPReque
                     (time.perf_counter() - self._request_started) * 1000,
                 )
                 self._json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            except ServerBusyError:
+            except ResourceNotFoundError as exc:
+                LOGGER.info(
+                    "http_not_found method=GET path=%s remote=%s error=%s elapsed_ms=%.1f",
+                    path,
+                    self.client_address[0] if self.client_address else None,
+                    str(exc),
+                    (time.perf_counter() - self._request_started) * 1000,
+                )
+                self._json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+            except ServerBusyError as exc:
                 LOGGER.warning(
-                    "http_server_busy method=GET path=%s query=%s remote=%s elapsed_ms=%.1f",
+                    "http_server_busy method=GET path=%s query=%s remote=%s "
+                    "reason=%s elapsed_ms=%.1f",
                     path,
                     parsed.query,
                     self.client_address[0] if self.client_address else None,
+                    str(exc),
                     (time.perf_counter() - self._request_started) * 1000,
                 )
                 self._json(
@@ -2391,8 +3315,12 @@ def make_handler(store: StoryMapStore, settings: Settings) -> type[BaseHTTPReque
             except RequestValidationError as exc:
                 LOGGER.warning("http_bad_request method=POST path=%s error=%s", path, str(exc))
                 self._json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            except ServerBusyError:
-                LOGGER.warning("http_server_busy method=POST path=%s", path)
+            except ServerBusyError as exc:
+                LOGGER.warning(
+                    "http_server_busy method=POST path=%s reason=%s",
+                    path,
+                    str(exc),
+                )
                 self._json(
                     {"error": "The server is busy. Retry this request shortly."},
                     status=HTTPStatus.SERVICE_UNAVAILABLE,
@@ -2453,16 +3381,35 @@ def make_handler(store: StoryMapStore, settings: Settings) -> type[BaseHTTPReque
             *,
             extra_headers: dict[str, str] | None = None,
         ) -> None:
-            body = json.dumps(_clean(payload), separators=(",", ":"), ensure_ascii=True).encode("utf-8")
-            cache_key = getattr(self, "_api_cache_key", None)
-            if status == HTTPStatus.OK and cache_key:
-                cached = api_cache.put(cache_key, body)
-                cache_status = "MISS" if api_cache.capacity and api_cache.ttl_seconds else "BYPASS"
-                cache_control = f"private, max-age={max(0, int(settings.cache_seconds))}"
-            else:
-                cached = api_cache.put("", body)
-                cache_status = "BYPASS"
-                cache_control = "no-store"
+            path = urlparse(self.path).path
+            gate_response_work = (
+                status == HTTPStatus.OK
+                and path.startswith("/api/")
+                and path != "/api/health"
+            )
+            if gate_response_work and not response_slots.acquire(blocking=False):
+                raise ServerBusyError("response capacity exhausted")
+            try:
+                body = _encode_json_body(payload)
+                cache_key = getattr(self, "_api_cache_key", None)
+                if status == HTTPStatus.OK and cache_key:
+                    cached = api_cache.put(cache_key, body)
+                    cache_status = (
+                        "MISS"
+                        if api_cache.capacity
+                        and api_cache.ttl_seconds
+                        and api_cache.max_bytes
+                        and _cached_body_size(cached) <= api_cache.max_bytes
+                        else "BYPASS"
+                    )
+                    cache_control = f"private, max-age={max(0, int(settings.cache_seconds))}"
+                else:
+                    cached = api_cache.put("", body)
+                    cache_status = "BYPASS"
+                    cache_control = "no-store"
+            finally:
+                if gate_response_work:
+                    response_slots.release()
             self._send_body(
                 cached,
                 status=status,
@@ -2558,7 +3505,14 @@ def make_handler(store: StoryMapStore, settings: Settings) -> type[BaseHTTPReque
             cached = static_cache.get(cache_key)
             if cached is None:
                 cached = static_cache.put(cache_key, path.read_bytes())
-                cache_status = "MISS" if static_cache.capacity and static_cache.ttl_seconds else "BYPASS"
+                cache_status = (
+                    "MISS"
+                    if static_cache.capacity
+                    and static_cache.ttl_seconds
+                    and static_cache.max_bytes
+                    and _cached_body_size(cached) <= static_cache.max_bytes
+                    else "BYPASS"
+                )
             else:
                 cache_status = "HIT"
             self._send_body(
@@ -2620,12 +3574,73 @@ def _first(query: dict[str, list[str]], key: str) -> str | None:
 
 FILTER_COLUMNS = {
     "story_cluster_id",
+    "incident_id",
+    "crop_name",
+    "stage_bucket",
+    "incident_state",
     "max_risk_band",
     "current_risk_band",
     "hazard_signature",
     "response_signature",
     "motif_family",
 }
+
+
+def _incident_filters_from_query(query: dict[str, list[str]]) -> dict[str, str]:
+    filters: dict[str, str] = {}
+    for key in INCIDENT_FOOTPRINT_FILTER_COLUMNS:
+        value = _first(query, key)
+        if value:
+            filters[key] = value
+    return filters
+
+
+def _clean_incident_filters(filters: dict[str, str] | None) -> dict[str, str]:
+    return {
+        key: str(value)
+        for key, value in (filters or {}).items()
+        if key in INCIDENT_FOOTPRINT_FILTER_COLUMNS
+        and value is not None
+        and str(value) != ""
+    }
+
+
+def _incident_filter_sql(
+    filters: dict[str, str] | None,
+    alias: str,
+) -> tuple[str, list[Any]]:
+    clean = _clean_incident_filters(filters)
+    clauses: list[str] = []
+    params: list[Any] = []
+    for key in sorted(clean):
+        clauses.append(f"AND {alias}.{key} = ?")
+        params.append(clean[key])
+    return ("\n".join(clauses), params)
+
+
+def _parse_iso_date_segment(raw: str) -> str:
+    if len(raw) != 10:
+        raise RequestValidationError("date must use YYYY-MM-DD format")
+    try:
+        parsed = date.fromisoformat(raw)
+    except ValueError as exc:
+        raise RequestValidationError("date must use YYYY-MM-DD format") from exc
+    if parsed.isoformat() != raw:
+        raise RequestValidationError("date must use YYYY-MM-DD format")
+    return raw
+
+
+def _validate_incident_id(raw: str) -> str:
+    if not raw or raw != raw.strip():
+        raise RequestValidationError("incident_id must be a nonempty string")
+    if len(raw) > 512:
+        raise RequestValidationError("incident_id may not exceed 512 characters")
+    return raw
+
+
+def _optional_order_by(columns: frozenset[str], candidates: tuple[str, ...]) -> str:
+    selected = [name for name in candidates if name in columns]
+    return "ORDER BY " + ", ".join(selected) if selected else ""
 
 
 def _filters_from_query(query: dict[str, list[str]]) -> dict[str, str]:
@@ -2850,6 +3865,41 @@ def _geometry_to_geojson_and_bbox(text: Any, fmt: str) -> tuple[dict[str, Any], 
         geometry = mapping(geom)
     min_lon, min_lat, max_lon, max_lat = geom.bounds
     return dict(geometry), [float(min_lon), float(min_lat), float(max_lon), float(max_lat)]
+
+
+def _precomputed_geojson_and_bbox(
+    raw_geometry: Any,
+    geometry_type: Any,
+    raw_bbox: tuple[Any, Any, Any, Any],
+) -> tuple[dict[str, Any], list[float]]:
+    """Decode exporter-validated geometry without per-request Shapely work."""
+    if not raw_geometry:
+        raise ValueError("empty geometry")
+    try:
+        geometry = (
+            json.loads(raw_geometry)
+            if isinstance(raw_geometry, str)
+            else dict(raw_geometry)
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid precomputed GeoJSON geometry") from exc
+    declared = str(geometry_type or geometry.get("type") or "")
+    if declared not in {"Polygon", "MultiPolygon"}:
+        raise ValueError("unsupported precomputed footprint geometry type")
+    if str(geometry.get("type") or "") != declared:
+        raise ValueError("precomputed footprint geometry type does not reconcile")
+    try:
+        bbox = [float(value) for value in raw_bbox]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid precomputed footprint bounds") from exc
+    if (
+        not all(math.isfinite(value) for value in bbox)
+        or bbox[0] >= bbox[2]
+        or bbox[1] >= bbox[3]
+        or not isinstance(geometry.get("coordinates"), list)
+    ):
+        raise ValueError("invalid precomputed footprint geometry metadata")
+    return geometry, bbox
 
 
 def _intersects(a: list[float], b: tuple[float, float, float, float]) -> bool:
