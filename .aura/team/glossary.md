@@ -33,3 +33,17 @@
 - **Pending**: an event that has not accumulated enough causal evidence for assignment.
 - **Novel unassigned**: an eligible event outside the model's acceptance radius or assignment margin.
 - **Review overlay**: immutable human curation keyed by `(model_version, archetype_id)`.
+- **Pressure clock**: daily, hazard-specific weather-derived evidence with a
+  separate effective date and knowledge time; missing is not zero.
+- **S2 acquisition clock**: irregular Sentinel-2 source dates and their
+  availability times; echoes are aging, not new observations.
+- **Story checkpoint clock**: the latest weekly incident state whose knowledge
+  time is available at the selected daily as-of time.
+- **Reconstructed availability**: diagnostic historical replay in which true
+  ingest timestamps were unavailable and are reconstructed by a declared rule.
+- **Strict availability**: operational mode requiring retained source
+  availability timestamps for weather, stage, and Sentinel-2 evidence.
+- **Motif**: a review-gated similarity descriptor learned from one terminal
+  vector per eligible completed story; it never creates or changes a story.
+- **Maturity stratum**: an exact crop/hazard × observed-weather-day × distinct
+  usable-S2-source-date support bucket used for live prefix comparison.

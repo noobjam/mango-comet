@@ -4,7 +4,23 @@ Portable, no-Docker server for reviewing precomputed crop-risk stories on a
 map. MapLibre/deck.gl render in the browser; the Python server reads Parquet
 artifacts with DuckDB.
 
-## Crop-impact Incident V3 authority
+## Crop-impact Incident V4 authority
+
+[`CROP_INCIDENT_STORIES_V4.md`](CROP_INCIDENT_STORIES_V4.md) is the current
+monitoring contract. V4 retains the stable V3 crop-incident identity while
+separating daily weather pressure, irregular acquisition-grain crop evidence,
+and knowledge-gated weekly story checkpoints. The map uses a daily playhead,
+shows crop stage, preserves simultaneous hazard lanes, reports rejected S2
+attempts, and never treats echoed spectral values as new observations.
+
+Use [`INCIDENT_V4_VM_RUNBOOK.md`](INCIDENT_V4_VM_RUNBOOK.md) for the exact
+durable source-preparation/build/serve/benchmark sequence. Point
+`STORY_MAP_RUN_DIR` only at its completed `incident_viewer_v4_*` output.
+Learned motifs are a separate immutable diagnostic workflow: they cannot change
+story identity and cannot appear as approved labels without expert review,
+calibration, and sealed holdout replay.
+
+## Crop-impact Incident V3 foundation
 
 [`CROP_INCIDENT_STORIES_V3.md`](CROP_INCIDENT_STORIES_V3.md) is the current
 definition of a product **story**. A weekly local component receives a
@@ -92,6 +108,9 @@ gates, Phase A artifacts, and VM commands, read
 For the current V3 crop-impact story contract and full VM build, read
 [`CROP_INCIDENT_STORIES_V3.md`](CROP_INCIDENT_STORIES_V3.md) and
 [`INCIDENT_V3_VM_RUNBOOK.md`](INCIDENT_V3_VM_RUNBOOK.md).
+For the daily-weather/irregular-S2 successor, read
+[`CROP_INCIDENT_STORIES_V4.md`](CROP_INCIDENT_STORIES_V4.md) and run
+[`INCIDENT_V4_VM_RUNBOOK.md`](INCIDENT_V4_VM_RUNBOOK.md).
 For the exact first full-release sequence, durable `nohup` commands, quality
 gates, current full-scale export blocker, bundle promotion, and map acceptance
 checks, use [`VM_MAP_RELEASE_RUNBOOK.md`](VM_MAP_RELEASE_RUNBOOK.md).

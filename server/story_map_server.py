@@ -5,11 +5,12 @@ import json
 import logging
 import math
 import mimetypes
+from numbers import Real
 import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import lru_cache
 import gzip
 from http import HTTPStatus
@@ -17,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import BoundedSemaphore, RLock
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 import duckdb
 
@@ -26,6 +27,10 @@ LOGGER = logging.getLogger("story_map_server")
 
 MAX_GEOMETRY_IDS = 2000
 MAX_GEOMETRY_REQUEST_BYTES = 256 * 1024
+V4_INCIDENT_DEFAULT_LOOKBACK_DAYS = 366
+V4_INCIDENT_MAX_LOOKBACK_DAYS = 3660
+V4_INCIDENT_DEFAULT_HISTORY_LIMIT = 5000
+V4_INCIDENT_MAX_HISTORY_LIMIT = 20000
 
 FRAME_STATE_FIELDS = (
     "timeline_bucket",
@@ -67,6 +72,20 @@ INCIDENT_V3_ARTIFACT_NAMES = {
     "lineage": "incident_lineage.parquet",
 }
 
+INCIDENT_V4_ARTIFACT_NAMES = {
+    "timeline": "daily_timeline_v4.parquet",
+    "field_state": "field_day_state_v4.parquet",
+    "pressure_observations": "pressure_observations_v4.parquet",
+    "grid": "daily_field_grid_v4.parquet",
+    "pressure_grid": "daily_pressure_grid_v4.parquet",
+    "s2_attempts": "s2_attempts_v4.parquet",
+    "s2_updates": "s2_updates_v4.parquet",
+    "story_checkpoints": "story_checkpoints_v4.parquet",
+    "story_footprints": "story_footprints_v4.parquet",
+}
+INCIDENT_V4_CLOSED_STORY_RETENTION_DAYS = 28
+INCIDENT_V4_STORY_CHECKPOINT_LOOKBACK_DAYS = 56
+
 INCIDENT_FOOTPRINT_FILTER_COLUMNS = frozenset(
     {
         "incident_id",
@@ -74,6 +93,17 @@ INCIDENT_FOOTPRINT_FILTER_COLUMNS = frozenset(
         "hazard_family",
         "incident_state",
         "stage_bucket",
+    }
+)
+
+API_CACHE_QUERY_KEYS = frozenset(
+    {
+        "as_of", "bbox", "bucket", "limit", "lookback", "lookback_days",
+        "history_limit", "q",
+        "story_cluster_id", "incident_id", "crop_instance_id", "crop_name", "stage_bucket",
+        "incident_state", "max_risk_band", "current_risk_band",
+        "hazard_signature", "hazard_family", "response_signature",
+        "motif_family",
     }
 )
 
@@ -435,6 +465,31 @@ class StoryMapStore:
         self.incident_stage_summary_path = self.run_dir / INCIDENT_V3_ARTIFACT_NAMES["stage_summary"]
         self.incident_windows_path = self.run_dir / INCIDENT_V3_ARTIFACT_NAMES["windows"]
         self.incident_lineage_path = self.run_dir / INCIDENT_V3_ARTIFACT_NAMES["lineage"]
+        self.incident_membership_path = self.run_dir / "incident_membership.parquet"
+        self.v4_timeline_path = self.run_dir / INCIDENT_V4_ARTIFACT_NAMES["timeline"]
+        self.v4_field_state_path = self.run_dir / INCIDENT_V4_ARTIFACT_NAMES["field_state"]
+        self.v4_pressure_observations_path = (
+            self.run_dir / INCIDENT_V4_ARTIFACT_NAMES["pressure_observations"]
+        )
+        self.v4_grid_path = self.run_dir / INCIDENT_V4_ARTIFACT_NAMES["grid"]
+        self.v4_pressure_grid_path = (
+            self.run_dir / INCIDENT_V4_ARTIFACT_NAMES["pressure_grid"]
+        )
+        self.v4_s2_attempts_path = (
+            self.run_dir / INCIDENT_V4_ARTIFACT_NAMES["s2_attempts"]
+        )
+        self.v4_s2_updates_path = self.run_dir / INCIDENT_V4_ARTIFACT_NAMES["s2_updates"]
+        self.v4_story_checkpoints_path = (
+            self.run_dir / INCIDENT_V4_ARTIFACT_NAMES["story_checkpoints"]
+        )
+        self.v4_story_footprints_path = (
+            self.run_dir / INCIDENT_V4_ARTIFACT_NAMES["story_footprints"]
+        )
+        self.v4_viewer_validation: dict[str, Any] | None = None
+        if any(path.exists() for path in self._incident_v4_paths().values()):
+            from story_monitor.incident_viewer_v4 import validate_viewer_directory
+
+            self.v4_viewer_validation = validate_viewer_directory(self.run_dir)
         self.frame_columns = self._parquet_columns(self.frame_path)
         self.timeline_summary_columns = self._parquet_columns(self.timeline_summary_path)
         self.incident_footprint_columns = self._parquet_columns(self.incident_footprints_path)
@@ -442,6 +497,17 @@ class StoryMapStore:
         self.incident_stage_summary_columns = self._parquet_columns(self.incident_stage_summary_path)
         self.incident_window_columns = self._parquet_columns(self.incident_windows_path)
         self.incident_lineage_columns = self._parquet_columns(self.incident_lineage_path)
+        self.incident_membership_columns = self._parquet_columns(
+            self.incident_membership_path
+        )
+        self.v4_field_state_columns = self._parquet_columns(self.v4_field_state_path)
+        self.v4_grid_columns = self._parquet_columns(self.v4_grid_path)
+        self.v4_story_checkpoint_columns = self._parquet_columns(
+            self.v4_story_checkpoints_path
+        )
+        self.v4_story_footprint_columns = self._parquet_columns(
+            self.v4_story_footprints_path
+        )
         self.timeline_summary_mapping = self._timeline_summary_mapping()
         LOGGER.info(
             "story_map_store run_dir=%s optimized_geometry=%s frame_columns=%s timeline_summary=%s",
@@ -486,9 +552,34 @@ class StoryMapStore:
             "lineage": self.incident_lineage_path,
         }
 
+    def _incident_v4_paths(self) -> dict[str, Path]:
+        return {
+            "timeline": self.v4_timeline_path,
+            "field_state": self.v4_field_state_path,
+            "pressure_observations": self.v4_pressure_observations_path,
+            "grid": self.v4_grid_path,
+            "pressure_grid": self.v4_pressure_grid_path,
+            "s2_attempts": self.v4_s2_attempts_path,
+            "s2_updates": self.v4_s2_updates_path,
+            "story_checkpoints": self.v4_story_checkpoints_path,
+            "story_footprints": self.v4_story_footprints_path,
+        }
+
     def has_incident_v3(self) -> bool:
         """Return whether the complete optional Incident V3 API bundle is present."""
         return all(path.is_file() for path in self._incident_v3_paths().values())
+
+    def has_incident_v4(self) -> bool:
+        """Return whether the complete optional dual-clock projection is present."""
+        return self.has_incident_v3() and all(
+            path.is_file() for path in self._incident_v4_paths().values()
+        )
+
+    def require_incident_v4(self) -> None:
+        if not self.has_incident_v4():
+            raise ResourceNotFoundError(
+                "Incident V4 dual-clock data is not available for this viewer bundle."
+            )
 
     def require_incident_v3(self) -> None:
         if not self.has_incident_v3():
@@ -946,6 +1037,1249 @@ class StoryMapStore:
             "stage_rows": stage_rows,
             "footprints": footprint_rows,
             "lineage": {"incoming": incoming, "outgoing": outgoing},
+        }
+
+    def v4_timeline(self) -> dict[str, Any]:
+        """Return the precomputed daily pressure/S2/story clock ledger."""
+        self.require_incident_v4()
+        with duckdb.connect(":memory:") as con:
+            rows = _records(
+                con.execute(
+                    """
+                    SELECT * FROM read_parquet(?) ORDER BY calendar_date
+                    """,
+                    [str(self.v4_timeline_path)],
+                ).fetchdf()
+            )
+        for row in rows:
+            day = str(row.get("calendar_date") or "")[:10]
+            row["calendar_date"] = day
+            # Compatibility aliases let the existing accessible slider consume
+            # V4 without changing any V3 timeline payload.
+            row["timeline_bucket"] = day
+            row["activity_count"] = int(row.get("elevated_pressure_field_count") or 0)
+            row["activity_unit"] = "daily_pressure_fields"
+        return {
+            "days": rows,
+            "buckets": rows,
+            "source": "precomputed_dual_clock_v4",
+            "clock": "daily_as_of",
+            "complete": True,
+        }
+
+    def v4_frame(
+        self,
+        *,
+        calendar_date: str,
+        bbox: tuple[float, float, float, float] | None,
+        limit: int,
+        filters: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Return one precomputed low-zoom grid plus optional high-zoom fields."""
+        self.require_incident_v4()
+        started = time.perf_counter()
+        clean_filters = _clean_incident_filters(filters)
+        grid_clauses: list[str] = []
+        grid_params: list[Any] = []
+        if bbox:
+            min_lon, min_lat, max_lon, max_lat = bbox
+            grid_clauses.append(
+                "AND NOT (max_lon < ? OR min_lon > ? OR max_lat < ? OR min_lat > ?)"
+            )
+            grid_params.extend([min_lon, max_lon, min_lat, max_lat])
+        grid_where = "\n".join(grid_clauses)
+        with duckdb.connect(":memory:") as con:
+            timeline_rows = _records(
+                con.execute(
+                    """
+                    SELECT * FROM read_parquet(?)
+                    WHERE CAST(calendar_date AS DATE) = CAST(? AS DATE)
+                    """,
+                    [str(self.v4_timeline_path), calendar_date],
+                ).fetchdf()
+            )
+            if not timeline_rows:
+                raise ResourceNotFoundError("Daily V4 frame was not found.")
+            grid_rows = _records(
+                con.execute(
+                    f"""
+                    SELECT * FROM read_parquet(?)
+                    WHERE CAST(calendar_date AS DATE) = CAST(? AS DATE)
+                    {grid_where}
+                    ORDER BY grid_x, grid_y
+                    """,
+                    [str(self.v4_grid_path), calendar_date, *grid_params],
+                ).fetchdf()
+            )
+            pressure_clause = ""
+            pressure_params: list[Any] = []
+            if clean_filters.get("hazard_family"):
+                pressure_clause = "AND CAST(hazard_family AS VARCHAR) = ?"
+                pressure_params.append(clean_filters["hazard_family"])
+            if bbox:
+                pressure_clause += (
+                    "\nAND NOT (max_lon < ? OR min_lon > ? "
+                    "OR max_lat < ? OR min_lat > ?)"
+                )
+                pressure_params.extend([min_lon, max_lon, min_lat, max_lat])
+            pressure_rows = _records(
+                con.execute(
+                    f"""
+                    SELECT * FROM read_parquet(?)
+                    WHERE CAST(calendar_date AS DATE) = CAST(? AS DATE)
+                    {pressure_clause}
+                    ORDER BY hazard_family, grid_x, grid_y
+                    """,
+                    [
+                        str(self.v4_pressure_grid_path), calendar_date,
+                        *pressure_params,
+                    ],
+                ).fetchdf()
+            )
+            story_filter, story_params = _incident_filter_sql(clean_filters, "f")
+            story_spatial = ""
+            story_spatial_params: list[Any] = []
+            if bbox:
+                story_spatial = (
+                    "AND NOT (f.max_lon < ? OR f.min_lon > ? "
+                    "OR f.max_lat < ? OR f.min_lat > ?)"
+                )
+                story_spatial_params.extend([min_lon, max_lon, min_lat, max_lat])
+            story_rows = _records(
+                con.execute(
+                    f"""
+                    WITH eligible AS (
+                        SELECT f.*,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY CAST(f.incident_id AS VARCHAR)
+                                ORDER BY CAST(f.story_known_date AS DATE) DESC,
+                                    CAST(f.story_week AS DATE) DESC
+                            ) AS _rank
+                        FROM read_parquet(?) AS f
+                        WHERE CAST(f.story_known_date AS DATE)
+                          BETWEEN CAST(? AS DATE)
+                              - INTERVAL '{INCIDENT_V4_STORY_CHECKPOINT_LOOKBACK_DAYS} days'
+                          AND CAST(? AS DATE)
+                    ), latest AS (
+                        SELECT * EXCLUDE (_rank) FROM eligible WHERE _rank = 1
+                    )
+                    SELECT f.* FROM latest AS f
+                    WHERE 1 = 1
+                      {story_filter}
+                      {story_spatial}
+                      AND (
+                        (
+                          UPPER(COALESCE(CAST(incident_state AS VARCHAR), ''))
+                              NOT LIKE 'CLOSED_%'
+                          AND UPPER(COALESCE(CAST(incident_state AS VARCHAR), ''))
+                              <> 'MERGED_INTO'
+                        )
+                        OR DATE_DIFF(
+                            'day', CAST(story_known_date AS DATE), CAST(? AS DATE)
+                        ) <= {INCIDENT_V4_CLOSED_STORY_RETENTION_DAYS}
+                      )
+                    ORDER BY CAST(incident_id AS VARCHAR)
+                    """,
+                    [
+                        str(self.v4_story_footprints_path), calendar_date, calendar_date,
+                        *story_params, *story_spatial_params, calendar_date,
+                    ],
+                ).fetchdf()
+            )
+            field_rows: list[dict[str, Any]] = []
+            source_field_count = 0
+            truncated = False
+            if bbox:
+                field_rows, source_field_count, truncated = self._v4_field_rows(
+                    con,
+                    calendar_date=calendar_date,
+                    bbox=bbox,
+                    limit=limit,
+                    filters=clean_filters,
+                )
+
+        overview_features = [_v4_grid_feature(row, "field_overview") for row in grid_rows]
+        pressure_features = [
+            _v4_grid_feature(row, "pressure")
+            for row in pressure_rows
+            if int(row.get("pressure_field_count") or 0) > 0
+        ]
+        crop_features = [
+            _v4_grid_feature(row, "crop_impact")
+            for row in grid_rows
+            if int(row.get("decline_field_count") or 0)
+            + int(row.get("recovery_field_count") or 0) > 0
+        ]
+        story_features = [_v4_story_feature(row) for row in story_rows]
+        timeline = timeline_rows[0]
+        represented = int(timeline.get("represented_field_count") or 0)
+        monitored = int(timeline.get("monitored_field_count") or 0)
+        unmappable = int(timeline.get("unmappable_field_count") or 0)
+        accounted = int(
+            timeline.get("accounted_field_count")
+            if timeline.get("accounted_field_count") is not None
+            else represented + unmappable
+        )
+        source_day_present = bool(timeline.get("source_day_present"))
+        country_truncated = False
+        complete_country = bool(
+            bbox is None
+            and source_day_present
+            and not country_truncated
+            and accounted == monitored
+        )
+        representation_warnings = (
+            [{
+                "code": "unmappable_fields",
+                "field_count": unmappable,
+                "message": (
+                    f"{unmappable} monitored fields are accounted for but cannot "
+                    "be drawn because valid map coordinates are unavailable."
+                ),
+            }]
+            if unmappable else []
+        )
+        latest_story_known = max(
+            (str(row.get("story_known_date") or "")[:10] for row in story_rows),
+            default=None,
+        )
+        latest_story_known_time = max(
+            (
+                str(row.get("story_known_time") or row.get("knowledge_time") or "")
+                for row in story_rows
+            ),
+            default=None,
+        )
+        payload = {
+            "calendar_date": calendar_date,
+            "clocks": {
+                "pressure_as_of_date": calendar_date,
+                "crop_knowledge_cutoff": calendar_date,
+                "story_knowledge_cutoff": calendar_date,
+                "latest_story_known_date": latest_story_known,
+                "latest_story_known_time": latest_story_known_time,
+            },
+            "field_overview": {
+                "type": "FeatureCollection", "features": overview_features,
+                "meta": {
+                    "complete": complete_country,
+                    "truncated": country_truncated,
+                    "representation": (
+                        "complete_centroid_aggregation"
+                        if bbox is None else "viewport_centroid_aggregation"
+                    ),
+                    "represented_field_count": represented,
+                    "monitored_field_count": monitored,
+                    "source_field_count": monitored,
+                    "unmappable_field_count": unmappable,
+                    "accounted_field_count": accounted,
+                    "unmappable_warning": bool(unmappable),
+                    "warnings": representation_warnings,
+                    "source_day_present": source_day_present,
+                    "filtered": False,
+                    "filter_scope": "unfiltered_all_field_context",
+                    "viewport_scoped": bbox is not None,
+                },
+            },
+            "pressure": {
+                "type": "FeatureCollection", "features": pressure_features,
+                "meta": {
+                    "as_of_date": calendar_date,
+                    "source": "daily_field_pressure",
+                    "complete": True,
+                    "geometry_substituted": False,
+                },
+            },
+            "crop_impact": {
+                "type": "FeatureCollection", "features": crop_features,
+                "meta": {
+                    "knowledge_cutoff": calendar_date,
+                    "step_held": True,
+                    "interpolated": False,
+                    "geometry_substituted": False,
+                },
+            },
+            "story_footprints": {
+                "type": "FeatureCollection", "features": story_features,
+                "meta": {
+                    "knowledge_cutoff": calendar_date,
+                    "complete": True,
+                    "truncated": False,
+                    "is_physical_movement": False,
+                },
+            },
+            "fields": {
+                "type": "FeatureCollection", "features": field_rows,
+                "meta": {
+                    "viewport_only": bbox is not None,
+                    "source_field_count": source_field_count,
+                    "feature_count": len(field_rows),
+                    "truncated": truncated,
+                },
+            },
+            "timeline": timeline,
+            "meta": {
+                "mode": "crop_incident_v4_dual_clock",
+                "calendar_date": calendar_date,
+                "complete_country_representation": complete_country,
+                "source_day_present": source_day_present,
+                "country_representation_truncated": country_truncated,
+                "represented_field_count": represented,
+                "source_field_count": monitored,
+                "unmappable_field_count": unmappable,
+                "accounted_field_count": accounted,
+                "unmappable_warning": bool(unmappable),
+                "warnings": representation_warnings,
+                "all_monitored_fields_mapped": bool(
+                    timeline.get("all_monitored_fields_mapped")
+                ),
+                "closed_story_retention_days": (
+                    INCIDENT_V4_CLOSED_STORY_RETENTION_DAYS
+                ),
+                "story_checkpoint_query_lookback_days": (
+                    INCIDENT_V4_STORY_CHECKPOINT_LOOKBACK_DAYS
+                ),
+                "filters": clean_filters,
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+            },
+        }
+        return payload
+
+    def _v4_field_rows(
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        *,
+        calendar_date: str,
+        bbox: tuple[float, float, float, float],
+        limit: int,
+        filters: dict[str, str],
+    ) -> tuple[list[dict[str, Any]], int, bool]:
+        effective_limit = _feature_limit(limit, self.settings.max_feature_limit)
+        clauses: list[str] = []
+        params: list[Any] = []
+        names = {
+            "crop_name": "s.crop_name",
+            "hazard_family": "s.hazard_family",
+            "stage_bucket": "s.stage_bucket",
+        }
+        for key, expression in names.items():
+            if key in filters:
+                clauses.append(f"AND CAST({expression} AS VARCHAR) = ?")
+                params.append(filters[key])
+        min_lon, min_lat, max_lon, max_lat = bbox
+        sql = f"""
+            WITH state_day AS (
+                SELECT * FROM read_parquet(?)
+                WHERE CAST(calendar_date AS DATE) = CAST(? AS DATE)
+            ), hazards AS (
+                SELECT field_id,
+                    STRING_AGG(
+                        DISTINCT CAST(hazard_family AS VARCHAR), ','
+                        ORDER BY CAST(hazard_family AS VARCHAR)
+                    ) FILTER (WHERE pressure_active) AS active_hazards,
+                    MAX(risk_rank) FILTER (WHERE pressure_observed)
+                        AS field_max_risk_rank,
+                    ARG_MAX(hazard_family, risk_rank) FILTER (WHERE pressure_observed)
+                        AS highest_pressure_hazard
+                FROM state_day GROUP BY field_id
+            ), eligible AS (
+                SELECT s.*, h.active_hazards, h.field_max_risk_rank,
+                    h.highest_pressure_hazard,
+                    g.geometry_geojson,
+                    CAST('geojson' AS VARCHAR) AS geometry_format,
+                    g.min_lon, g.min_lat, g.max_lon, g.max_lat,
+                    COUNT(DISTINCT s.field_id) OVER () AS _source_count,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.field_id
+                        ORDER BY s.pressure_active DESC, s.risk_rank DESC,
+                            s.monitored DESC, s.evaluable DESC,
+                            s.s2_knowledge_date DESC NULLS LAST,
+                            s.crop_instance_id, s.hazard_family
+                    ) AS _rank
+                FROM state_day s
+                JOIN read_parquet(?) g USING (field_id)
+                JOIN hazards h USING (field_id)
+                WHERE NOT (
+                    g.max_lon < ? OR g.min_lon > ? OR g.max_lat < ? OR g.min_lat > ?
+                )
+                {' '.join(clauses)}
+            )
+            SELECT * EXCLUDE (_rank) FROM eligible WHERE _rank = 1
+            ORDER BY field_max_risk_rank DESC NULLS LAST, field_id
+        """
+        query_params: list[Any] = [
+            str(self.v4_field_state_path), calendar_date, str(self.geometry_path),
+            min_lon, max_lon, min_lat, max_lat, *params,
+        ]
+        if effective_limit is not None:
+            sql += "\nLIMIT ?"
+            query_params.append(effective_limit + 1)
+        rows = _records(connection.execute(sql, query_params).fetchdf())
+        source_count = int(rows[0].get("_source_count") or 0) if rows else 0
+        truncated = effective_limit is not None and source_count > effective_limit
+        if effective_limit is not None:
+            rows = rows[:effective_limit]
+        features: list[dict[str, Any]] = []
+        for row in rows:
+            raw_geometry = row.get("geometry_geojson")
+            geometry = (
+                json.loads(raw_geometry)
+                if isinstance(raw_geometry, str) else dict(raw_geometry or {})
+            )
+            if geometry.get("type") not in {"Polygon", "MultiPolygon"}:
+                raise RuntimeError("V4 field geometry must be Polygon or MultiPolygon")
+            geom_bbox = [
+                float(row.get("min_lon")), float(row.get("min_lat")),
+                float(row.get("max_lon")), float(row.get("max_lat")),
+            ]
+            properties = {
+                key: value for key, value in row.items()
+                if key not in {
+                    "geometry_geojson", "geometry_format", "min_lon", "min_lat",
+                    "max_lon", "max_lat", "_source_count",
+                }
+            }
+            properties["bbox"] = geom_bbox
+            properties["timeline_bucket"] = calendar_date
+            features.append(
+                {"type": "Feature", "geometry": geometry, "properties": properties}
+            )
+        return features, source_count, truncated
+
+    def v4_frame_state(
+        self,
+        *,
+        calendar_date: str,
+        bbox: tuple[float, float, float, float] | None,
+        limit: int,
+        filters: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Return bounded V4 dynamic rows for hydration with cached geometry."""
+        self.require_incident_v4()
+        started = time.perf_counter()
+        requested_limit = limit
+        effective_limit = _feature_limit(limit, self.settings.max_feature_limit)
+        clean_filters = _clean_incident_filters(filters)
+        clauses: list[str] = []
+        params: list[Any] = []
+        for key, expression in {
+            "crop_name": "s.crop_name",
+            "hazard_family": "s.hazard_family",
+            "stage_bucket": "s.stage_bucket",
+        }.items():
+            if key in clean_filters:
+                clauses.append(f"AND CAST({expression} AS VARCHAR) = ?")
+                params.append(clean_filters[key])
+        bbox_clause = ""
+        bbox_params: list[Any] = []
+        if bbox:
+            bbox_clause = """
+                AND NOT (
+                    g.max_lon < ? OR g.min_lon > ? OR g.max_lat < ? OR g.min_lat > ?
+                )
+            """
+            min_lon, min_lat, max_lon, max_lat = bbox
+            bbox_params = [min_lon, max_lon, min_lat, max_lat]
+        sql = f"""
+            WITH state_day AS (
+                SELECT * FROM read_parquet(?)
+                WHERE CAST(calendar_date AS DATE) = CAST(? AS DATE)
+            ), hazards AS (
+                SELECT field_id,
+                    STRING_AGG(
+                        DISTINCT CAST(hazard_family AS VARCHAR), ','
+                        ORDER BY CAST(hazard_family AS VARCHAR)
+                    ) FILTER (WHERE pressure_active) AS active_hazards,
+                    MAX(risk_rank) FILTER (WHERE pressure_observed)
+                        AS field_max_risk_rank,
+                    ARG_MAX(hazard_family, risk_rank) FILTER (WHERE pressure_observed)
+                        AS highest_pressure_hazard
+                FROM state_day GROUP BY field_id
+            ), eligible AS (
+                SELECT s.*, h.active_hazards, h.field_max_risk_rank,
+                    h.highest_pressure_hazard,
+                    COUNT(DISTINCT s.field_id) OVER () AS _source_count,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.field_id
+                        ORDER BY s.pressure_active DESC, s.risk_rank DESC,
+                            s.monitored DESC, s.evaluable DESC,
+                            s.s2_knowledge_date DESC NULLS LAST,
+                            s.crop_instance_id, s.hazard_family
+                    ) AS _rank
+                FROM state_day AS s
+                JOIN read_parquet(?) AS g USING (field_id)
+                JOIN hazards AS h USING (field_id)
+                WHERE 1 = 1
+                {bbox_clause}
+                {' '.join(clauses)}
+            )
+            SELECT * EXCLUDE (_rank) FROM eligible WHERE _rank = 1
+            ORDER BY field_max_risk_rank DESC NULLS LAST, field_id
+        """
+        query_params: list[Any] = [
+            str(self.v4_field_state_path), calendar_date, str(self.geometry_path),
+            *bbox_params, *params,
+        ]
+        if effective_limit is not None:
+            sql += "\nLIMIT ?"
+            query_params.append(effective_limit + 1)
+        with duckdb.connect(":memory:") as con:
+            source_rows = _records(con.execute(sql, query_params).fetchdf())
+        source_count = int(source_rows[0].get("_source_count") or 0) if source_rows else 0
+        render_rows = source_rows[:effective_limit] if effective_limit is not None else source_rows
+        rows: list[dict[str, Any]] = []
+        for source in render_rows:
+            row = {key: value for key, value in source.items() if key != "_source_count"}
+            row.update(
+                {
+                    "timeline_bucket": calendar_date,
+                    "current_risk_band": row.get("risk_band"),
+                    "max_risk_band": row.get("risk_band"),
+                    "current_risk_rank": row.get("risk_rank"),
+                    "max_risk_rank": row.get("risk_rank"),
+                    "hazard_signature": row.get("highest_pressure_hazard")
+                        or row.get("hazard_family"),
+                    "response_signature": row.get("response_class"),
+                }
+            )
+            rows.append(row)
+        truncated = effective_limit is not None and source_count > effective_limit
+        return {
+            "geometry_version": self.geometry_version(),
+            "rows": rows,
+            "meta": {
+                "mode": "crop_incident_v4_dual_clock",
+                "calendar_date": calendar_date,
+                "timeline_bucket": calendar_date,
+                "state_count": len(rows),
+                "source_row_count": source_count,
+                "query_row_count": len(source_rows),
+                "limit": effective_limit,
+                "requested_limit": requested_limit,
+                "truncated": truncated,
+                "limit_hit": truncated,
+                "bbox_applied": bbox is not None,
+                "filters": clean_filters,
+                "transport": "compact_v4_state_plus_cached_geometry",
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+            },
+        }
+
+    def v4_field_detail(
+        self,
+        field_id: str,
+        *,
+        as_of_date: str | None,
+        crop_instance_id: str | None = None,
+        lookback_days: int = V4_INCIDENT_DEFAULT_LOOKBACK_DAYS,
+        history_limit: int = V4_INCIDENT_DEFAULT_HISTORY_LIMIT,
+    ) -> dict[str, Any]:
+        """Return three bounded causal evidence lanes for one mapped field."""
+        self.require_incident_v4()
+        lookback_days = max(1, min(int(lookback_days), V4_INCIDENT_MAX_LOOKBACK_DAYS))
+        history_limit = max(1, min(int(history_limit), V4_INCIDENT_MAX_HISTORY_LIMIT))
+        crop_instance_id = str(crop_instance_id or "").strip() or None
+        with duckdb.connect(":memory:") as con:
+            exists = int(
+                con.execute(
+                    """
+                    SELECT COUNT(*) FROM read_parquet(?)
+                    WHERE CAST(field_id AS VARCHAR) = ?
+                    """,
+                    [str(self.geometry_path), field_id],
+                ).fetchone()[0]
+            )
+            if not exists:
+                raise ResourceNotFoundError("Field was not found.")
+            if as_of_date is None:
+                value = con.execute(
+                    "SELECT MAX(calendar_date) FROM read_parquet(?)",
+                    [str(self.v4_timeline_path)],
+                ).fetchone()[0]
+                if value is None:
+                    raise ResourceNotFoundError("Incident V4 timeline is empty.")
+                as_of_date = str(value)[:10]
+            as_of_date = _parse_iso_date_segment(str(as_of_date))
+            history_start = (
+                date.fromisoformat(as_of_date) - timedelta(days=lookback_days - 1)
+            ).isoformat()
+
+            state_crop_clause = ""
+            state_crop_params: list[Any] = []
+            if crop_instance_id:
+                state_crop_clause = "AND CAST(s.crop_instance_id AS VARCHAR) = ?"
+                state_crop_params.append(crop_instance_id)
+            state_date_clause = (
+                "AND CAST(s.calendar_date AS DATE) <= CAST(? AS DATE)"
+                if crop_instance_id
+                else "AND CAST(s.calendar_date AS DATE) = CAST(? AS DATE)"
+            )
+            current_rows = _records(
+                con.execute(
+                    f"""
+                    SELECT s.* FROM read_parquet(?) AS s
+                    WHERE CAST(s.field_id AS VARCHAR) = ?
+                      {state_date_clause}
+                      {state_crop_clause}
+                    QUALIFY ROW_NUMBER() OVER (
+                        PARTITION BY s.crop_instance_id, s.hazard_family
+                        ORDER BY s.calendar_date DESC, s.risk_rank DESC
+                    ) = 1
+                    ORDER BY s.crop_instance_id, s.hazard_family
+                    LIMIT ?
+                    """,
+                    [
+                        str(self.v4_field_state_path), field_id, as_of_date,
+                        *state_crop_params, history_limit + 1,
+                    ],
+                ).fetchdf()
+            )
+            current_truncated = len(current_rows) > history_limit
+            current_rows = current_rows[:history_limit]
+
+            membership_knowledge = (
+                "COALESCE(TRY_CAST(m.knowledge_time AS DATE), "
+                "TRY_CAST(m.timeline_bucket AS DATE))"
+                if "knowledge_time" in self.incident_membership_columns
+                else "TRY_CAST(m.timeline_bucket AS DATE)"
+            )
+            membership_crop_clause = ""
+            membership_crop_params: list[Any] = []
+            if crop_instance_id:
+                membership_crop_clause = "AND CAST(m.crop_instance_id AS VARCHAR) = ?"
+                membership_crop_params.append(crop_instance_id)
+            pressure_crop_clause = ""
+            pressure_crop_params: list[Any] = []
+            if crop_instance_id:
+                pressure_crop_clause = "AND CAST(p.crop_instance_id AS VARCHAR) = ?"
+                pressure_crop_params.append(crop_instance_id)
+            pressure_desc = con.execute(
+                f"""
+                WITH memberships AS (
+                    SELECT DISTINCT
+                        CAST(m.crop_instance_id AS VARCHAR) AS crop_instance_id,
+                        LOWER(CAST(m.hazard_family AS VARCHAR)) AS hazard_family,
+                        CAST(m.timeline_bucket AS DATE) AS membership_week,
+                        CAST(m.incident_id AS VARCHAR) AS incident_id
+                    FROM read_parquet(?) AS m
+                    WHERE CAST(m.field_id AS VARCHAR) = ?
+                      AND CAST(m.timeline_bucket AS DATE) <= CAST(? AS DATE)
+                      AND CAST(m.timeline_bucket AS DATE) + INTERVAL 6 DAY
+                            >= CAST(? AS DATE)
+                      AND {membership_knowledge} <= CAST(? AS DATE)
+                      {membership_crop_clause}
+                ), pressure_candidates AS (
+                    SELECT
+                        s.calendar_date,
+                        s.pressure_observation_date,
+                        CAST(s.pressure_observation_date AS DATE)
+                            AS pressure_effective_date,
+                        s.pressure_knowledge_time,
+                        s.weather_available_at,
+                        s.field_id, s.crop_instance_id, s.hazard_family,
+                        s.risk_rank, s.risk_band, s.pressure_score,
+                        s.pressure_observed, s.pressure_active
+                    FROM read_parquet(?) AS s
+                    WHERE CAST(s.field_id AS VARCHAR) = ?
+                      AND CAST(s.pressure_observation_date AS DATE)
+                          BETWEEN CAST(? AS DATE)
+                          AND CAST(? AS DATE)
+                      AND CAST(s.pressure_knowledge_time AS TIMESTAMP)
+                            < CAST(? AS DATE) + INTERVAL 1 DAY
+                      AND COALESCE(TRY_CAST(s.pressure_observed AS BOOLEAN), FALSE)
+                      {state_crop_clause}
+                    UNION ALL
+                    SELECT
+                        p.calendar_date, p.pressure_observation_date,
+                        p.pressure_effective_date, p.pressure_knowledge_time,
+                        p.weather_available_at, p.field_id, p.crop_instance_id,
+                        p.hazard_family, p.risk_rank, p.risk_band,
+                        p.pressure_score, p.pressure_observed, p.pressure_active
+                    FROM read_parquet(?) AS p
+                    WHERE CAST(p.field_id AS VARCHAR) = ?
+                      AND CAST(p.pressure_effective_date AS DATE)
+                          BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+                      AND CAST(p.pressure_knowledge_time AS TIMESTAMP)
+                            < CAST(? AS DATE) + INTERVAL 1 DAY
+                      {pressure_crop_clause}
+                ), pressure_rows AS (
+                    SELECT * FROM pressure_candidates AS p
+                    QUALIFY ROW_NUMBER() OVER (
+                        PARTITION BY p.pressure_effective_date, p.crop_instance_id,
+                            p.hazard_family
+                        ORDER BY p.pressure_knowledge_time DESC,
+                            p.pressure_active DESC, p.risk_rank DESC
+                    ) = 1
+                )
+                SELECT p.*,
+                    STRING_AGG(DISTINCT m.incident_id, ',' ORDER BY m.incident_id)
+                        AS attributed_incident_ids
+                FROM pressure_rows AS p
+                LEFT JOIN memberships AS m
+                  ON CAST(p.crop_instance_id AS VARCHAR) = m.crop_instance_id
+                 AND LOWER(CAST(p.hazard_family AS VARCHAR)) = m.hazard_family
+                 AND CAST(p.calendar_date AS DATE) BETWEEN m.membership_week
+                     AND m.membership_week + INTERVAL 6 DAY
+                GROUP BY ALL
+                ORDER BY p.calendar_date DESC, p.hazard_family DESC,
+                    p.crop_instance_id DESC
+                LIMIT ?
+                """,
+                [
+                    str(self.incident_membership_path), field_id, as_of_date,
+                    history_start, as_of_date, *membership_crop_params,
+                    str(self.v4_field_state_path), field_id, history_start,
+                    as_of_date, as_of_date, *state_crop_params,
+                    str(self.v4_pressure_observations_path), field_id,
+                    history_start, as_of_date, as_of_date, *pressure_crop_params,
+                    history_limit + 1,
+                ],
+            ).fetchdf()
+            daily_pressure, pressure_truncated = _bounded_recent_records(
+                pressure_desc, history_limit
+            )
+
+            attempt_crop_clause = ""
+            attempt_crop_params: list[Any] = []
+            if crop_instance_id:
+                attempt_crop_clause = "AND CAST(a.crop_instance_id AS VARCHAR) = ?"
+                attempt_crop_params.append(crop_instance_id)
+            attempt_desc = con.execute(
+                f"""
+                SELECT a.* FROM read_parquet(?) AS a
+                WHERE CAST(a.field_id AS VARCHAR) = ?
+                  AND CAST(a.knowledge_date AS DATE) BETWEEN CAST(? AS DATE)
+                      AND CAST(? AS DATE)
+                  {attempt_crop_clause}
+                ORDER BY a.knowledge_date DESC, a.spectral_source_date DESC NULLS LAST,
+                    a.crop_instance_id DESC
+                LIMIT ?
+                """,
+                [
+                    str(self.v4_s2_attempts_path), field_id, history_start,
+                    as_of_date, *attempt_crop_params, history_limit + 1,
+                ],
+            ).fetchdf()
+            s2_attempts, attempts_truncated = _bounded_recent_records(
+                attempt_desc, history_limit
+            )
+
+            story_desc = con.execute(
+                f"""
+                WITH memberships AS (
+                    SELECT
+                        CAST(m.incident_id AS VARCHAR) AS incident_id,
+                        CAST(m.exposure_id AS VARCHAR) AS exposure_id,
+                        CAST(m.crop_instance_id AS VARCHAR) AS crop_instance_id,
+                        LOWER(CAST(m.hazard_family AS VARCHAR)) AS hazard_family,
+                        CAST(m.timeline_bucket AS DATE) AS story_week,
+                        CAST({membership_knowledge} AS DATE) AS membership_known_date,
+                        CAST(m.stage_bucket AS VARCHAR) AS stage_bucket,
+                        CAST(m.membership_role AS VARCHAR) AS membership_role,
+                        CAST(m.event_state AS VARCHAR) AS field_event_state,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY m.incident_id, m.crop_instance_id,
+                                m.hazard_family, CAST(m.timeline_bucket AS DATE)
+                            ORDER BY {membership_knowledge} DESC,
+                                CAST(m.episode_id AS VARCHAR)
+                        ) AS _membership_rank
+                    FROM read_parquet(?) AS m
+                    WHERE CAST(m.field_id AS VARCHAR) = ?
+                      AND {membership_knowledge} <= CAST(? AS DATE)
+                      AND CAST(m.timeline_bucket AS DATE) <= CAST(? AS DATE)
+                      {membership_crop_clause}
+                ), joined AS (
+                    SELECT m.* EXCLUDE (_membership_rank),
+                        CAST(c.story_known_date AS DATE) AS story_known_date,
+                        CAST(c.incident_state AS VARCHAR) AS incident_state,
+                        CAST(c.stage_distribution AS VARCHAR) AS stage_distribution,
+                        COALESCE(TRY_CAST(c.right_censored AS BOOLEAN), FALSE)
+                            AS right_censored,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY m.incident_id, m.crop_instance_id,
+                                m.hazard_family
+                            ORDER BY c.story_known_date DESC, c.story_week DESC
+                        ) AS _latest_rank
+                    FROM memberships AS m
+                    JOIN read_parquet(?) AS c
+                      ON CAST(c.incident_id AS VARCHAR) = m.incident_id
+                     AND CAST(c.story_week AS DATE) = m.story_week
+                    WHERE m._membership_rank = 1
+                      AND CAST(c.story_known_date AS DATE) <= CAST(? AS DATE)
+                )
+                SELECT * EXCLUDE (_latest_rank) FROM joined
+                WHERE CAST(story_known_date AS DATE) >= CAST(? AS DATE)
+                   OR _latest_rank = 1
+                ORDER BY story_known_date DESC, story_week DESC,
+                    incident_id DESC, hazard_family DESC
+                LIMIT ?
+                """,
+                [
+                    str(self.incident_membership_path), field_id, as_of_date,
+                    as_of_date, *membership_crop_params,
+                    str(self.v4_story_checkpoints_path), as_of_date, history_start,
+                    history_limit + 1,
+                ],
+            ).fetchdf()
+            story_checkpoints, story_truncated = _bounded_recent_records(
+                story_desc, history_limit
+            )
+
+        truncated = {
+            "current_state": current_truncated,
+            "daily_pressure": pressure_truncated,
+            "s2_attempts": attempts_truncated,
+            "story_checkpoints": story_truncated,
+        }
+        returned = {
+            "current_state": len(current_rows),
+            "daily_pressure": len(daily_pressure),
+            "s2_attempts": len(s2_attempts),
+            "story_checkpoints": len(story_checkpoints),
+        }
+        return {
+            "field_id": field_id,
+            "crop_instance_id": crop_instance_id,
+            "as_of_date": as_of_date,
+            "current_state_scope": (
+                "explicit_crop_latest_known_state"
+                if crop_instance_id else "crops_active_on_as_of_date"
+            ),
+            "current_state": current_rows,
+            "daily_pressure": daily_pressure,
+            "s2_attempts": s2_attempts,
+            "story_checkpoints": story_checkpoints,
+            "lanes": {
+                "daily_pressure": daily_pressure,
+                "s2_attempts": s2_attempts,
+                "story_checkpoints": story_checkpoints,
+            },
+            "history": {
+                "contract": "bounded_causal_field_evidence_v1",
+                "window_start": history_start,
+                "window_end": as_of_date,
+                "lookback_days": lookback_days,
+                "history_limit_per_collection": history_limit,
+                "truncated": truncated,
+                "any_truncated": any(truncated.values()),
+                "returned": returned,
+            },
+            "clocks": {
+                "pressure_cutoff": as_of_date,
+                "s2_knowledge_cutoff": as_of_date,
+                "story_knowledge_cutoff": as_of_date,
+            },
+        }
+
+    def v4_incident_detail(
+        self,
+        incident_id: str,
+        *,
+        as_of_date: str | None,
+        lookback_days: int = V4_INCIDENT_DEFAULT_LOOKBACK_DAYS,
+        history_limit: int = V4_INCIDENT_DEFAULT_HISTORY_LIMIT,
+    ) -> dict[str, Any]:
+        """Return one bounded incident history using only evidence known as-of."""
+        self.require_incident_v4()
+        lookback_days = max(1, min(int(lookback_days), V4_INCIDENT_MAX_LOOKBACK_DAYS))
+        history_limit = max(1, min(int(history_limit), V4_INCIDENT_MAX_HISTORY_LIMIT))
+        with duckdb.connect(":memory:") as con:
+            if as_of_date is None:
+                value = con.execute(
+                    "SELECT MAX(calendar_date) FROM read_parquet(?)",
+                    [str(self.v4_timeline_path)],
+                ).fetchone()[0]
+                if value is None:
+                    raise ResourceNotFoundError("Incident V4 timeline is empty.")
+                as_of_date = str(value)[:10]
+            as_of_date = _parse_iso_date_segment(str(as_of_date))
+            history_start = (
+                date.fromisoformat(as_of_date) - timedelta(days=lookback_days - 1)
+            ).isoformat()
+
+            base_windows = _records(
+                con.execute(
+                    """
+                    SELECT * FROM read_parquet(?)
+                    WHERE CAST(incident_id AS VARCHAR) = ?
+                    LIMIT 2
+                    """,
+                    [str(self.incident_windows_path), incident_id],
+                ).fetchdf()
+            )
+            if not base_windows:
+                raise ResourceNotFoundError("Incident was not found.")
+            if len(base_windows) != 1:
+                raise RuntimeError("Incident V3 windows are not unique by incident_id")
+
+            current_rows = _records(
+                con.execute(
+                    """
+                    SELECT * FROM read_parquet(?)
+                    WHERE CAST(incident_id AS VARCHAR) = ?
+                      AND CAST(story_known_date AS DATE) <= CAST(? AS DATE)
+                    ORDER BY story_known_date DESC, story_week DESC
+                    LIMIT 1
+                    """,
+                    [str(self.v4_story_checkpoints_path), incident_id, as_of_date],
+                ).fetchdf()
+            )
+            if not current_rows:
+                raise ResourceNotFoundError(
+                    "Incident was not known by the requested as-of date."
+                )
+            current_checkpoint = current_rows[0]
+            gap_count_sql = (
+                "COUNT(*) FILTER (WHERE COALESCE(TRY_CAST(is_data_gap AS BOOLEAN), FALSE))"
+                if "is_data_gap" in self.v4_story_checkpoint_columns
+                else "0"
+            )
+            checkpoint_summary = con.execute(
+                f"""
+                SELECT MIN(CAST(story_week AS DATE)) AS first_story_week,
+                    COUNT(*)::BIGINT AS observed_week_count,
+                    ({gap_count_sql})::BIGINT AS data_gap_count
+                FROM read_parquet(?)
+                WHERE CAST(incident_id AS VARCHAR) = ?
+                  AND CAST(story_known_date AS DATE) <= CAST(? AS DATE)
+                """,
+                [str(self.v4_story_checkpoints_path), incident_id, as_of_date],
+            ).fetchone()
+
+            checkpoint_desc = con.execute(
+                """
+                WITH ranked AS (
+                    SELECT *, ROW_NUMBER() OVER (
+                        ORDER BY story_known_date DESC, story_week DESC
+                    ) AS _rank
+                    FROM read_parquet(?)
+                    WHERE CAST(incident_id AS VARCHAR) = ?
+                      AND CAST(story_known_date AS DATE) <= CAST(? AS DATE)
+                )
+                SELECT * EXCLUDE (_rank) FROM ranked
+                WHERE CAST(story_known_date AS DATE) >= CAST(? AS DATE)
+                   OR _rank = 1
+                ORDER BY story_known_date DESC, story_week DESC
+                LIMIT ?
+                """,
+                [
+                    str(self.v4_story_checkpoints_path), incident_id, as_of_date,
+                    history_start, history_limit + 1,
+                ],
+            ).fetchdf()
+            checkpoints, checkpoints_truncated = _bounded_recent_records(
+                checkpoint_desc, history_limit
+            )
+
+            stage_desc = con.execute(
+                """
+                WITH ranked AS (
+                    SELECT story_week, story_known_date, ROW_NUMBER() OVER (
+                        ORDER BY story_known_date DESC, story_week DESC
+                    ) AS _rank
+                    FROM read_parquet(?)
+                    WHERE CAST(incident_id AS VARCHAR) = ?
+                      AND CAST(story_known_date AS DATE) <= CAST(? AS DATE)
+                ), causal_weeks AS (
+                    SELECT DISTINCT CAST(story_week AS DATE) AS story_week
+                    FROM ranked
+                    WHERE CAST(story_known_date AS DATE) >= CAST(? AS DATE)
+                       OR _rank = 1
+                )
+                SELECT s.* FROM read_parquet(?) AS s
+                JOIN causal_weeks c
+                  ON CAST(s.timeline_bucket AS DATE) = c.story_week
+                WHERE CAST(s.incident_id AS VARCHAR) = ?
+                ORDER BY s.timeline_bucket DESC, s.stage_bucket DESC
+                LIMIT ?
+                """,
+                [
+                    str(self.v4_story_checkpoints_path), incident_id, as_of_date,
+                    history_start, str(self.incident_stage_summary_path), incident_id,
+                    history_limit + 1,
+                ],
+            ).fetchdf()
+            stage_rows, stage_truncated = _bounded_recent_records(
+                stage_desc, history_limit
+            )
+
+            footprint_desc = con.execute(
+                """
+                WITH ranked AS (
+                    SELECT *, ROW_NUMBER() OVER (
+                        ORDER BY story_known_date DESC, story_week DESC
+                    ) AS _rank
+                    FROM read_parquet(?)
+                    WHERE CAST(incident_id AS VARCHAR) = ?
+                      AND CAST(story_known_date AS DATE) <= CAST(? AS DATE)
+                )
+                SELECT * EXCLUDE (_rank) FROM ranked
+                WHERE CAST(story_known_date AS DATE) >= CAST(? AS DATE)
+                   OR _rank = 1
+                ORDER BY story_known_date DESC, story_week DESC
+                LIMIT ?
+                """,
+                [
+                    str(self.v4_story_footprints_path), incident_id, as_of_date,
+                    history_start, history_limit + 1,
+                ],
+            ).fetchdf()
+            footprints, footprints_truncated = _bounded_recent_records(
+                footprint_desc, history_limit
+            )
+
+            membership_knowledge = (
+                "COALESCE(TRY_CAST(m.knowledge_time AS DATE), "
+                "TRY_CAST(m.timeline_bucket AS DATE))"
+                if "knowledge_time" in self.incident_membership_columns
+                else "TRY_CAST(m.timeline_bucket AS DATE)"
+            )
+            membership_cte = f"""
+                members AS (
+                    SELECT DISTINCT
+                        CAST(m.field_id AS VARCHAR) AS field_id,
+                        CAST(m.crop_instance_id AS VARCHAR) AS crop_instance_id,
+                        CAST(m.timeline_bucket AS DATE) AS membership_week,
+                        LOWER(CAST(m.hazard_family AS VARCHAR)) AS hazard_family
+                    FROM read_parquet(?) AS m
+                    WHERE CAST(m.incident_id AS VARCHAR) = ?
+                      AND CAST(m.timeline_bucket AS DATE) <= CAST(? AS DATE)
+                      AND CAST(m.timeline_bucket AS DATE) + INTERVAL 6 DAY
+                            >= CAST(? AS DATE)
+                      AND {membership_knowledge} <= CAST(? AS DATE)
+                ), member_fields AS (
+                    SELECT DISTINCT field_id, crop_instance_id, membership_week
+                    FROM members
+                )
+            """
+            member_params: list[Any] = [
+                str(self.incident_membership_path), incident_id, as_of_date,
+                history_start, as_of_date,
+            ]
+
+            s2_update_desc = con.execute(
+                f"""
+                WITH {membership_cte}
+                SELECT a.* FROM read_parquet(?) AS a
+                JOIN member_fields m
+                  ON CAST(a.field_id AS VARCHAR) = m.field_id
+                 AND CAST(a.crop_instance_id AS VARCHAR) = m.crop_instance_id
+                 AND CAST(a.knowledge_date AS DATE) BETWEEN m.membership_week
+                     AND m.membership_week + INTERVAL 6 DAY
+                WHERE CAST(a.knowledge_date AS DATE) BETWEEN CAST(? AS DATE)
+                    AND CAST(? AS DATE)
+                ORDER BY a.knowledge_date DESC, a.field_id DESC,
+                    a.crop_instance_id DESC, a.spectral_source_date DESC
+                LIMIT ?
+                """,
+                [
+                    *member_params, str(self.v4_s2_updates_path), history_start,
+                    as_of_date, history_limit + 1,
+                ],
+            ).fetchdf()
+            s2_updates, s2_updates_truncated = _bounded_recent_records(
+                s2_update_desc, history_limit
+            )
+
+            s2_attempt_desc = con.execute(
+                f"""
+                WITH {membership_cte}
+                SELECT a.* FROM read_parquet(?) AS a
+                JOIN member_fields m
+                  ON CAST(a.field_id AS VARCHAR) = m.field_id
+                 AND CAST(a.crop_instance_id AS VARCHAR) = m.crop_instance_id
+                 AND CAST(a.knowledge_date AS DATE) BETWEEN m.membership_week
+                     AND m.membership_week + INTERVAL 6 DAY
+                WHERE CAST(a.knowledge_date AS DATE) BETWEEN CAST(? AS DATE)
+                    AND CAST(? AS DATE)
+                ORDER BY a.knowledge_date DESC, a.field_id DESC,
+                    a.crop_instance_id DESC, a.spectral_source_date DESC NULLS LAST
+                LIMIT ?
+                """,
+                [
+                    *member_params, str(self.v4_s2_attempts_path), history_start,
+                    as_of_date, history_limit + 1,
+                ],
+            ).fetchdf()
+            s2_attempts, s2_attempts_truncated = _bounded_recent_records(
+                s2_attempt_desc, history_limit
+            )
+
+            pressure_desc = con.execute(
+                f"""
+                WITH {membership_cte}
+                SELECT s.calendar_date,
+                    COUNT(DISTINCT s.field_id)::BIGINT AS monitored_field_count,
+                    COUNT(DISTINCT s.field_id) FILTER (
+                        WHERE s.pressure_observed
+                    )::BIGINT AS pressure_field_count,
+                    MAX(s.risk_rank)::INTEGER AS max_risk_rank,
+                    LOWER(CAST(s.hazard_family AS VARCHAR)) AS hazard_family
+                FROM read_parquet(?) AS s
+                JOIN members m
+                 ON CAST(s.field_id AS VARCHAR) = m.field_id
+                 AND CAST(s.crop_instance_id AS VARCHAR) = m.crop_instance_id
+                 AND LOWER(CAST(s.hazard_family AS VARCHAR)) = m.hazard_family
+                 AND CAST(s.calendar_date AS DATE) BETWEEN m.membership_week
+                     AND m.membership_week + INTERVAL 6 DAY
+                WHERE CAST(s.calendar_date AS DATE) BETWEEN CAST(? AS DATE)
+                    AND CAST(? AS DATE)
+                GROUP BY s.calendar_date, s.hazard_family
+                ORDER BY s.calendar_date DESC, s.hazard_family DESC
+                LIMIT ?
+                """,
+                [
+                    *member_params, str(self.v4_field_state_path), history_start,
+                    as_of_date, history_limit + 1,
+                ],
+            ).fetchdf()
+            daily_pressure, pressure_truncated = _bounded_recent_records(
+                pressure_desc, history_limit
+            )
+
+            lineage_time_column = next(
+                (
+                    name for name in (
+                        "knowledge_time", "story_known_date", "timeline_bucket",
+                        "effective_date", "lineage_date",
+                    )
+                    if name in self.incident_lineage_columns
+                ),
+                None,
+            )
+            incoming: list[dict[str, Any]] = []
+            outgoing: list[dict[str, Any]] = []
+            incoming_truncated = False
+            outgoing_truncated = False
+            if lineage_time_column and {
+                "parent_incident_id", "child_incident_id"
+            }.issubset(self.incident_lineage_columns):
+                time_sql = f'TRY_CAST("{lineage_time_column}" AS DATE)'
+                incoming_desc = con.execute(
+                    f"""
+                    SELECT * FROM read_parquet(?)
+                    WHERE CAST(child_incident_id AS VARCHAR) = ?
+                      AND {time_sql} BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+                    ORDER BY {time_sql} DESC, CAST(parent_incident_id AS VARCHAR) DESC
+                    LIMIT ?
+                    """,
+                    [
+                        str(self.incident_lineage_path), incident_id, history_start,
+                        as_of_date, history_limit + 1,
+                    ],
+                ).fetchdf()
+                incoming, incoming_truncated = _bounded_recent_records(
+                    incoming_desc, history_limit
+                )
+                outgoing_desc = con.execute(
+                    f"""
+                    SELECT * FROM read_parquet(?)
+                    WHERE CAST(parent_incident_id AS VARCHAR) = ?
+                      AND {time_sql} BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+                    ORDER BY {time_sql} DESC, CAST(child_incident_id AS VARCHAR) DESC
+                    LIMIT ?
+                    """,
+                    [
+                        str(self.incident_lineage_path), incident_id, history_start,
+                        as_of_date, history_limit + 1,
+                    ],
+                ).fetchdf()
+                outgoing, outgoing_truncated = _bounded_recent_records(
+                    outgoing_desc, history_limit
+                )
+
+        for row in footprints:
+            geometry, _ = _precomputed_geojson_and_bbox(
+                row.pop("geometry_geojson", None),
+                row.get("geometry_type"),
+                (
+                    row.get("min_lon"), row.get("min_lat"),
+                    row.get("max_lon"), row.get("max_lat"),
+                ),
+            )
+            row["geometry"] = geometry
+            for role in ("pressure", "impact", "watch"):
+                raw = row.pop(f"{role}_geometry_geojson", None)
+                row[f"{role}_geometry"] = (
+                    _geometry_to_geojson_and_bbox(raw, "geojson")[0]
+                    if _has_geometry_value(raw) else None
+                )
+
+        first_story_week = str(checkpoint_summary[0])[:10]
+        causal_window = _causal_v4_incident_window(
+            base_windows[0],
+            current_checkpoint,
+            as_of_date=as_of_date,
+            first_story_week=first_story_week,
+            observed_week_count=int(checkpoint_summary[1] or 0),
+            data_gap_count=int(checkpoint_summary[2] or 0),
+            split_count=sum(
+                1 for row in outgoing
+                if str(row.get("lineage_type") or "").lower() == "split"
+            ),
+            merge_count=sum(
+                1 for row in incoming
+                if str(row.get("lineage_type") or "").lower() == "merge"
+            ),
+        )
+        truncated = {
+            "weekly_state": checkpoints_truncated,
+            "stage_summary": stage_truncated,
+            "footprints": footprints_truncated,
+            "daily_pressure": pressure_truncated,
+            "s2_updates": s2_updates_truncated,
+            "s2_attempts": s2_attempts_truncated,
+            "lineage_incoming": incoming_truncated,
+            "lineage_outgoing": outgoing_truncated,
+        }
+        returned = {
+            "weekly_state": len(checkpoints),
+            "stage_summary": len(stage_rows),
+            "footprints": len(footprints),
+            "daily_pressure": len(daily_pressure),
+            "s2_updates": len(s2_updates),
+            "s2_attempts": len(s2_attempts),
+            "lineage_incoming": len(incoming),
+            "lineage_outgoing": len(outgoing),
+        }
+        return {
+            "incident_id": incident_id,
+            "window": causal_window,
+            "as_of_date": as_of_date,
+            "weekly_state": checkpoints,
+            "stage_summary": stage_rows,
+            "stage_rows": stage_rows,
+            "footprints": footprints,
+            "lineage": {"incoming": incoming, "outgoing": outgoing},
+            "daily_pressure": daily_pressure,
+            "s2_updates": s2_updates,
+            "s2_attempts": s2_attempts,
+            "history": {
+                "contract": "bounded_causal_incident_history_v1",
+                "window_start": history_start,
+                "window_end": as_of_date,
+                "lookback_days": lookback_days,
+                "history_limit_per_collection": history_limit,
+                "current_checkpoint_always_included": True,
+                "current_checkpoint_outside_lookback": (
+                    str(current_checkpoint.get("story_known_date") or "")[:10]
+                    < history_start
+                ),
+                "membership_scope": (
+                    "evidence_knowledge_date_must_fall_in_a_causally_known_"
+                    "incident_membership_week"
+                ),
+                "lineage_time_field": lineage_time_column,
+                "undated_lineage_omitted": lineage_time_column is None,
+                "truncated": truncated,
+                "any_truncated": any(truncated.values()),
+                "returned": returned,
+            },
+            "clocks": {
+                "pressure_as_of_date": as_of_date,
+                "crop_knowledge_cutoff": as_of_date,
+                "story_knowledge_cutoff": as_of_date,
+            },
         }
 
     def story_palette(self, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -3010,6 +4344,63 @@ class StoryMapStore:
         return diagnostics
 
 
+def _v4_grid_feature(row: dict[str, Any], layer_role: str) -> dict[str, Any]:
+    min_lon = float(row["min_lon"])
+    min_lat = float(row["min_lat"])
+    max_lon = float(row["max_lon"])
+    max_lat = float(row["max_lat"])
+    geometry = {
+        "type": "Polygon",
+        "coordinates": [[
+            [min_lon, min_lat], [max_lon, min_lat], [max_lon, max_lat],
+            [min_lon, max_lat], [min_lon, min_lat],
+        ]],
+    }
+    properties = dict(row)
+    day = str(properties.get("calendar_date") or "")[:10]
+    properties.update(
+        {
+            "calendar_date": day,
+            "timeline_bucket": day,
+            "layer_role": layer_role,
+            "bbox": [min_lon, min_lat, max_lon, max_lat],
+            "hazard_signature": properties.get("hazard_family")
+                or properties.get("dominant_hazard_family"),
+            "stage_bucket": properties.get("dominant_stage_bucket"),
+            "crop_name": properties.get("dominant_crop_name"),
+            "is_physical_movement": False,
+        }
+    )
+    return {"type": "Feature", "geometry": geometry, "properties": properties}
+
+
+def _v4_story_feature(row: dict[str, Any]) -> dict[str, Any]:
+    geometry, geom_bbox = _precomputed_geojson_and_bbox(
+        row.get("geometry_geojson"),
+        row.get("geometry_type"),
+        (
+            row.get("min_lon"), row.get("min_lat"),
+            row.get("max_lon"), row.get("max_lat"),
+        ),
+    )
+    properties = {
+        key: value for key, value in row.items()
+        if key != "geometry_geojson"
+    }
+    for role in ("pressure", "impact", "watch"):
+        raw = properties.pop(f"{role}_geometry_geojson", None)
+        properties[f"{role}_geometry"] = raw
+    properties["timeline_bucket"] = str(
+        properties.get("story_week") or properties.get("timeline_bucket") or ""
+    )[:10]
+    properties["story_known_date"] = str(
+        properties.get("story_known_date") or properties.get("knowledge_time") or ""
+    )[:10]
+    properties["bbox"] = geom_bbox
+    properties["is_physical_movement"] = False
+    return {"type": "Feature", "geometry": geometry, "properties": properties}
+
+
 def make_handler(store: StoryMapStore, settings: Settings) -> type[BaseHTTPRequestHandler]:
     api_cache_bytes, static_cache_bytes = _cache_byte_budgets(
         settings.cache_max_bytes
@@ -3051,8 +4442,8 @@ def make_handler(store: StoryMapStore, settings: Settings) -> type[BaseHTTPReque
                 )
             try:
                 if path.startswith("/api/") and path != "/api/health":
-                    self._api_cache_key = self.path
-                    cached = api_cache.get(self.path)
+                    self._api_cache_key = _canonical_api_cache_key(path, query)
+                    cached = api_cache.get(self._api_cache_key)
                     if cached is not None:
                         self._send_cached_json(cached, cache_status="HIT")
                         return
@@ -3068,6 +4459,124 @@ def make_handler(store: StoryMapStore, settings: Settings) -> type[BaseHTTPReque
                 if path == "/api/timeline":
                     self._json(self._query(store.timeline))
                     return
+                if path == "/api/v4/timeline":
+                    self._json(self._query(store.v4_timeline))
+                    return
+                if path.startswith("/api/v4/frame-state/"):
+                    day = _parse_iso_date_segment(
+                        unquote(path.removeprefix("/api/v4/frame-state/"))
+                    )
+                    self._json(
+                        self._query(
+                            lambda: store.v4_frame_state(
+                                calendar_date=day,
+                                bbox=_parse_bbox(_first(query, "bbox")),
+                                filters=_incident_filters_from_query(query),
+                                limit=_feature_limit_query(
+                                    query,
+                                    "limit",
+                                    settings.default_feature_limit,
+                                    settings.max_feature_limit,
+                                ),
+                            )
+                        )
+                    )
+                    return
+                if path == "/api/v4/frame-state":
+                    raise RequestValidationError(
+                        "date path parameter is required in YYYY-MM-DD format"
+                    )
+                if path.startswith("/api/v4/frame/"):
+                    day = _parse_iso_date_segment(
+                        unquote(path.removeprefix("/api/v4/frame/"))
+                    )
+                    self._json(
+                        self._query(
+                            lambda: store.v4_frame(
+                                calendar_date=day,
+                                bbox=_parse_bbox(_first(query, "bbox")),
+                                filters=_incident_filters_from_query(query),
+                                limit=_feature_limit_query(
+                                    query,
+                                    "limit",
+                                    settings.default_feature_limit,
+                                    settings.max_feature_limit,
+                                ),
+                            )
+                        )
+                    )
+                    return
+                if path == "/api/v4/frame":
+                    raise RequestValidationError(
+                        "date path parameter is required in YYYY-MM-DD format"
+                    )
+                if path.startswith("/api/v4/field/"):
+                    field_id = _validate_field_id(
+                        unquote(path.removeprefix("/api/v4/field/"))
+                    )
+                    raw_as_of = _first(query, "as_of")
+                    raw_crop_instance = _first(query, "crop_instance_id")
+                    self._json(
+                        self._query(
+                            lambda: store.v4_field_detail(
+                                field_id,
+                                as_of_date=(
+                                    _parse_iso_date_segment(raw_as_of)
+                                    if raw_as_of else None
+                                ),
+                                crop_instance_id=(
+                                    _validate_crop_instance_id(raw_crop_instance)
+                                    if raw_crop_instance else None
+                                ),
+                                lookback_days=_int_query(
+                                    query,
+                                    "lookback_days",
+                                    V4_INCIDENT_DEFAULT_LOOKBACK_DAYS,
+                                    V4_INCIDENT_MAX_LOOKBACK_DAYS,
+                                ),
+                                history_limit=_int_query(
+                                    query,
+                                    "history_limit",
+                                    V4_INCIDENT_DEFAULT_HISTORY_LIMIT,
+                                    V4_INCIDENT_MAX_HISTORY_LIMIT,
+                                ),
+                            )
+                        )
+                    )
+                    return
+                if path == "/api/v4/field":
+                    raise RequestValidationError("field_id path parameter is required")
+                if path.startswith("/api/v4/incident/"):
+                    incident_id = _validate_incident_id(
+                        unquote(path.removeprefix("/api/v4/incident/"))
+                    )
+                    raw_as_of = _first(query, "as_of")
+                    as_of = (
+                        _parse_iso_date_segment(raw_as_of) if raw_as_of else None
+                    )
+                    self._json(
+                        self._query(
+                            lambda: store.v4_incident_detail(
+                                incident_id,
+                                as_of_date=as_of,
+                                lookback_days=_int_query(
+                                    query,
+                                    "lookback_days",
+                                    V4_INCIDENT_DEFAULT_LOOKBACK_DAYS,
+                                    V4_INCIDENT_MAX_LOOKBACK_DAYS,
+                                ),
+                                history_limit=_int_query(
+                                    query,
+                                    "history_limit",
+                                    V4_INCIDENT_DEFAULT_HISTORY_LIMIT,
+                                    V4_INCIDENT_MAX_HISTORY_LIMIT,
+                                ),
+                            )
+                        )
+                    )
+                    return
+                if path == "/api/v4/incident":
+                    raise RequestValidationError("incident_id path parameter is required")
                 if path == "/api/motifs":
                     self._json(
                         self._query(
@@ -3586,6 +5095,20 @@ FILTER_COLUMNS = {
 }
 
 
+def _canonical_api_cache_key(
+    path: str, query: dict[str, list[str]],
+) -> str:
+    """Ignore unknown cache-buster parameters and normalize query ordering."""
+    items = [
+        (key, value)
+        for key in sorted(query)
+        if key in API_CACHE_QUERY_KEYS
+        for value in sorted(str(item) for item in query[key])
+    ]
+    suffix = urlencode(items, doseq=True)
+    return path + (f"?{suffix}" if suffix else "")
+
+
 def _incident_filters_from_query(query: dict[str, list[str]]) -> dict[str, str]:
     filters: dict[str, str] = {}
     for key in INCIDENT_FOOTPRINT_FILTER_COLUMNS:
@@ -3635,6 +5158,22 @@ def _validate_incident_id(raw: str) -> str:
         raise RequestValidationError("incident_id must be a nonempty string")
     if len(raw) > 512:
         raise RequestValidationError("incident_id may not exceed 512 characters")
+    return raw
+
+
+def _validate_field_id(raw: str) -> str:
+    if not raw or raw != raw.strip():
+        raise RequestValidationError("field_id must be a nonempty string")
+    if len(raw) > 512:
+        raise RequestValidationError("field_id may not exceed 512 characters")
+    return raw
+
+
+def _validate_crop_instance_id(raw: str) -> str:
+    if not raw or raw != raw.strip():
+        raise RequestValidationError("crop_instance_id must be a nonempty string")
+    if len(raw) > 512:
+        raise RequestValidationError("crop_instance_id may not exceed 512 characters")
     return raw
 
 
@@ -3867,6 +5406,14 @@ def _geometry_to_geojson_and_bbox(text: Any, fmt: str) -> tuple[dict[str, Any], 
     return dict(geometry), [float(min_lon), float(min_lat), float(max_lon), float(max_lat)]
 
 
+def _has_geometry_value(value: Any) -> bool:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return False
+    if isinstance(value, Real):
+        return False
+    return True
+
+
 def _precomputed_geojson_and_bbox(
     raw_geometry: Any,
     geometry_type: Any,
@@ -3909,8 +5456,110 @@ def _intersects(a: list[float], b: tuple[float, float, float, float]) -> bool:
 def _records(df: Any) -> list[dict[str, Any]]:
     if len(df) == 0:
         return []
-    clean_df = df.where(df.notnull(), None)
+    # ``DataFrame.where(..., None)`` retains IEEE NaN values in float-backed
+    # columns.  That leaks non-JSON values through the direct store API and is
+    # especially visible for nullable identifiers produced by LEFT JOINs.
+    # Object dtype is required before pandas can represent the missing value as
+    # an actual Python ``None``.
+    clean_df = df.astype(object).where(df.notnull(), None)
     return clean_df.to_dict(orient="records")
+
+
+def _bounded_recent_records(df: Any, limit: int) -> tuple[list[dict[str, Any]], bool]:
+    """Trim a newest-first result and restore chronological presentation order."""
+    records = _records(df)
+    truncated = len(records) > limit
+    selected = records[:limit]
+    selected.reverse()
+    return selected, truncated
+
+
+def _causal_v4_incident_window(
+    base_window: dict[str, Any],
+    current_checkpoint: dict[str, Any],
+    *,
+    as_of_date: str,
+    first_story_week: str,
+    observed_week_count: int,
+    data_gap_count: int,
+    split_count: int,
+    merge_count: int,
+) -> dict[str, Any]:
+    """Project a V3 lifetime window into facts knowable at one V4 cutoff."""
+
+    def first(*values: Any) -> Any:
+        return next((value for value in values if value not in (None, "")), None)
+
+    def causal_date(*values: Any) -> str | None:
+        for value in values:
+            if value in (None, ""):
+                continue
+            normalized = str(value)[:10]
+            try:
+                if date.fromisoformat(normalized) <= date.fromisoformat(as_of_date):
+                    return normalized
+            except ValueError:
+                continue
+        return None
+
+    state = first(
+        current_checkpoint.get("incident_state"),
+        current_checkpoint.get("current_state"),
+        "UNKNOWN",
+    )
+    window: dict[str, Any] = {
+        "incident_id": first(
+            current_checkpoint.get("incident_id"), base_window.get("incident_id")
+        ),
+        "exposure_id": first(
+            current_checkpoint.get("exposure_id"), base_window.get("exposure_id")
+        ),
+        "crop_name": first(
+            current_checkpoint.get("crop_name"), base_window.get("crop_name")
+        ),
+        "hazard_family": first(
+            current_checkpoint.get("hazard_family"), base_window.get("hazard_family")
+        ),
+        "first_evidence_week": first_story_week,
+        "confirmed_week": causal_date(
+            current_checkpoint.get("confirmed_week")
+        ),
+        "pressure_off_week": causal_date(
+            current_checkpoint.get("pressure_off_week")
+        ),
+        "recovered_week": causal_date(
+            current_checkpoint.get("recovered_week")
+        ),
+        "closed_week": causal_date(
+            current_checkpoint.get("closed_week")
+        ),
+        "peak_week": causal_date(
+            current_checkpoint.get("peak_week")
+        ),
+        "terminal_state": state,
+        "incident_state": state,
+        "right_censored": bool(current_checkpoint.get("right_censored")),
+        "observed_week_count": observed_week_count,
+        "relapse_count": int(current_checkpoint.get("relapse_count") or 0),
+        "data_gap_count": data_gap_count,
+        "split_count": split_count,
+        "merge_count": merge_count,
+        "snapshot_as_of_date": as_of_date,
+        "story_known_date": str(
+            current_checkpoint.get("story_known_date") or ""
+        )[:10],
+    }
+    for key in (
+        "component_id", "stage_bucket", "stage_distribution", "monitored_count",
+        "evaluable_count", "affected_count", "active_count", "severe_count",
+        "pressure_core_field_count", "impact_lag_field_count",
+        "fresh_decline_field_count", "fresh_recovery_field_count",
+        "coverage_adequate", "coverage_missing_cell_count",
+        "global_crop_week_unmappable_instance_count", "footprint_carried_forward",
+    ):
+        if key in current_checkpoint:
+            window[key] = current_checkpoint.get(key)
+    return window
 
 
 def _rounded_float(value: Any, digits: int) -> float | None:

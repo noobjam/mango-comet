@@ -8,6 +8,7 @@ export class TimelineController {
     this.playing = false;
     this.timer = null;
     this.inputTimer = null;
+    this.clockMode = "weekly";
     this.reducedMotion = Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
     this.elements = Object.fromEntries([
       "timelineSlider", "timelineLabel", "timelineHistogram", "timelineStart", "timelineEnd",
@@ -17,6 +18,10 @@ export class TimelineController {
     if (this.reducedMotion) {
       this.elements.playTimeline.title = "Reduced-motion mode: playback uses discrete, slower frame changes.";
     }
+  }
+
+  setClockMode(mode) {
+    this.clockMode = mode === "daily" ? "daily" : "weekly";
   }
 
   bind() {
@@ -70,7 +75,10 @@ export class TimelineController {
     this.pendingIndex = clamp(index, 0, Math.max(0, this.buckets.length - 1));
     const bucket = this.currentBucket();
     this.elements.timelineSlider.value = String(this.pendingIndex);
-    this.elements.timelineSlider.setAttribute("aria-valuetext", bucket ? `Week of ${formatLong(bucket.timeline_bucket)}` : "No week");
+    this.elements.timelineSlider.setAttribute(
+      "aria-valuetext",
+      bucket ? timelineDateLabel(this.clockMode, bucket.timeline_bucket) : "No date",
+    );
     this.renderHistogram();
   }
 
@@ -78,7 +86,9 @@ export class TimelineController {
     if (index !== this.pendingIndex) return;
     this.committedIndex = index;
     const bucket = this.buckets[index];
-    this.elements.timelineLabel.textContent = bucket ? `Week of ${formatLong(bucket.timeline_bucket)}` : "No week selected";
+    this.elements.timelineLabel.textContent = bucket
+      ? timelineDateLabel(this.clockMode, bucket.timeline_bucket)
+      : "No date selected";
     this.elements.frameStats.textContent = frameText || "No visible activity";
     this.renderHistogram();
   }
@@ -103,6 +113,31 @@ export class TimelineController {
     const fragment = document.createDocumentFragment();
     counts.forEach((count, index) => {
       const activityRow = this.activity.get(this.buckets[index].timeline_bucket) || {};
+      if (this.clockMode === "daily") {
+        const slot = document.createElement("span");
+        slot.className = "timeline-day";
+        if (index === this.pendingIndex) slot.classList.add("is-current");
+        slot.dataset.index = String(index);
+        const pressure = document.createElement("i");
+        pressure.className = "timeline-pressure-bar";
+        pressure.style.setProperty(
+          "--bar-height",
+          count ? `${Math.max(3, Math.round((count / maximum) * 21))}px` : "1px",
+        );
+        slot.appendChild(pressure);
+        if (Number(activityRow.new_s2_field_count || 0) > 0) {
+          slot.appendChild(marker("timeline-s2-marker", "Usable S2 update"));
+        }
+        if (Number(activityRow.rejected_s2_attempt_count || 0) > 0) {
+          slot.appendChild(marker("timeline-s2-rejected", "Rejected S2 opportunity"));
+        }
+        if (Number(activityRow.story_checkpoint_count || 0) > 0) {
+          slot.appendChild(marker("timeline-story-tick", "Story checkpoint known"));
+        }
+        slot.title = dailyTitle(this.buckets[index].timeline_bucket, activityRow);
+        fragment.appendChild(slot);
+        return;
+      }
       const bar = document.createElement("span");
       bar.className = "timeline-bar";
       if (!count) bar.classList.add("is-gap");
@@ -157,6 +192,23 @@ export class TimelineController {
   }
 }
 
+function marker(className, label) {
+  const value = document.createElement("i");
+  value.className = className;
+  value.setAttribute("aria-label", label);
+  return value;
+}
+
+function dailyTitle(day, row = {}) {
+  return [
+    formatLong(day),
+    `${Number(row.elevated_pressure_field_count || 0).toLocaleString()} pressure fields`,
+    `${Number(row.new_s2_field_count || 0).toLocaleString()} usable S2 updates`,
+    `${Number(row.rejected_s2_attempt_count || 0).toLocaleString()} rejected S2 opportunities`,
+    `${Number(row.story_checkpoint_count || 0).toLocaleString()} story checkpoints`,
+  ].join(" · ");
+}
+
 export function activityCount(row = {}) {
   if (isIncidentActivity(row)) {
     return Number(row?.activity_count ?? row?.incident_count ?? row?.story_cluster_count ?? 0);
@@ -170,6 +222,10 @@ export function activityCount(row = {}) {
       ?? row?.story_cluster_count
       ?? 0,
   );
+}
+
+export function timelineDateLabel(clockMode, value) {
+  return `${clockMode === "daily" ? "As of" : "Week of"} ${formatLong(value)}`;
 }
 
 function isIncidentActivity(row = {}) {

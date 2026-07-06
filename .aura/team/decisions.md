@@ -124,3 +124,24 @@ coverage floor and a per-supported-crop floor before the release is accepted.
 The analytics `incidents_v3_*` directory is the append/audit source. Only its
 derived `incident_viewer_v3_*` directory may be used as `STORY_MAP_RUN_DIR`.
 The server performs no clustering or lifecycle reconstruction on request.
+
+## ADR-010: V4 separates pressure, crop evidence, and story knowledge clocks
+
+Status: accepted, 2026-07-06.
+
+The V3 `component_id -> exposure_id -> incident_id` hierarchy remains story
+identity. V4 adds independent daily hazard-pressure and acquisition-grain
+Sentinel-2 ledgers plus a daily as-of viewer projection. Incident checkpoints
+are visible only after their recorded knowledge time; an incident ID is never
+back-projected into a daily prelude.
+
+Repeated spectral echoes only age the last acquisition. Missing weather cannot
+advance a quiet clock, rejected/cloudy acquisitions cannot become spectral
+references, and absent usable post-pressure observations produce censoring
+rather than recovery, unresolved damage, or crop-death claims.
+
+Historical data without retained ingest timestamps uses an explicitly
+diagnostic reconstructed-availability mode. Operational replay requires source
+availability timestamps. Learned motifs are reviewed, completed-story
+descriptors with weather- and acquisition-matched prefix prototypes; they never
+control incident identity or lifecycle.

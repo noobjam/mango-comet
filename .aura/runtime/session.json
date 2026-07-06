@@ -1,8 +1,8 @@
 {
-  "started_at": "2026-07-04T17:30:45Z",
+  "started_at": "2026-07-06T11:21:18Z",
   "mode": "orchestrate",
-  "objective": "Build and verify Incident V3 crop-impact stories and map viewer",
+  "objective": "Build and verify dual-clock Incident V4 monitoring, trajectories, and reviewed motif learning",
   "config_hash": "6829e8fe3df3db561237234733b68dc9b8ce7c37",
-  "phase": "v3-release-verification",
+  "phase": "v4-release-verification",
   "status": "locally_verified_ready_for_commit_and_vm_execution"
 }

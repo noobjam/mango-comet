@@ -13,11 +13,17 @@ export class FrameDataLoader {
     this.missingGeometry = new Set();
   }
 
-  async load({ bucket, query = {}, legacyUrl }) {
+  async load({
+    bucket,
+    query = {},
+    legacyUrl,
+    statePath = "/api/frame-state",
+    selectLegacy = (payload) => payload,
+  }) {
     this.api.abortPrefix("frame-data:");
     if (this.compactSupported !== false) {
       try {
-        const frame = await this.loadCompact(bucket, query);
+        const frame = await this.loadCompact(bucket, query, statePath);
         this.compactSupported = true;
         return frame;
       } catch (error) {
@@ -26,21 +32,25 @@ export class FrameDataLoader {
         this.resetGeometry();
       }
     }
-    return this.api.get(legacyUrl, { channel: "frame-data:legacy", cache: true });
+    const payload = await this.api.get(legacyUrl, {
+      channel: "frame-data:legacy",
+      cache: true,
+    });
+    return selectLegacy(payload);
   }
 
-  preload({ bucket, query = {}, legacyUrl }) {
+  preload({ bucket, query = {}, legacyUrl, statePath = "/api/frame-state" }) {
     if (this.compactSupported === false) {
       this.api.preload(legacyUrl);
       return;
     }
-    this.api.preload(withQuery(`/api/frame-state/${encodeURIComponent(bucket)}`, query));
+    this.api.preload(withQuery(`${statePath}/${encodeURIComponent(bucket)}`, query));
   }
 
-  async loadCompact(bucket, query) {
+  async loadCompact(bucket, query, statePath = "/api/frame-state") {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const stateUrl = withQuery(
-        `/api/frame-state/${encodeURIComponent(bucket)}`,
+        `${statePath}/${encodeURIComponent(bucket)}`,
         attempt ? { ...query, geometry_retry: Date.now() } : query
       );
       const state = await this.api.get(stateUrl, {

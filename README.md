@@ -29,9 +29,10 @@ failure, inspect `env | grep -i proxy`; the VM may also have stale `HTTP_PROXY`,
 `HTTPS_PROXY`, or `ALL_PROXY` variables unrelated to pip's package index.
 
 Edit `server/.env` and point `STORY_MAP_RUN_DIR` at the directory you intend to
-serve. For Incident V3 this must be the completed `incident_viewer_v3_*`
-directory emitted by the durable runner; the intermediate `incidents_v3_*`
-analytics release is not a viewer bundle. Legacy raw runs remain supported for
+serve. For the current dual-clock app this must be the completed
+`incident_viewer_v4_*` directory emitted by `run_incident_v4.py`. Incident V3
+similarly requires `incident_viewer_v3_*`; intermediate analytics/evidence
+directories are not viewer bundles. Legacy raw runs remain supported for
 bounded current-frame exploration.
 
 ```bash
@@ -89,6 +90,16 @@ map-ready `STORY_MAP_RUN_DIR`. Use the durable runner and promotion/latency
 gates in the runbook; the intermediate `incidents_v3_*` analytics directory is
 not a drop-in viewer bundle.
 
+Incident V4 keeps that identity and corrects the monitoring clocks: weather is
+daily, Sentinel-2 is acquisition-grain and irregular, and weekly story states
+appear only after their knowledge time. It adds country-scale field coverage,
+daily pressure bands, usable/rejected S2 markers, crop stage, causal story
+drilldown, and a separate review-gated motif-learning workflow. Use
+[`server/INCIDENT_V4_VM_RUNBOOK.md`](server/INCIDENT_V4_VM_RUNBOOK.md) for the
+single durable VM sequence and
+[`server/CROP_INCIDENT_STORIES_V4.md`](server/CROP_INCIDENT_STORIES_V4.md) for
+the truth contract.
+
 ## Verify on the VM
 
 ```bash
@@ -104,6 +115,8 @@ precomputation, and the production vector-tile direction, see
 For the current lifecycle semantics, as-of causality rule, exact-footprint
 trajectory contract, validation gates, and safe presentation language, read
 [`server/CROP_INCIDENT_STORIES_V3.md`](server/CROP_INCIDENT_STORIES_V3.md).
+The V4 dual-clock successor is documented in
+[`server/CROP_INCIDENT_STORIES_V4.md`](server/CROP_INCIDENT_STORIES_V4.md).
 [`server/MONITORING_STORIES.md`](server/MONITORING_STORIES.md) remains the V1
 field-episode provenance contract.
 

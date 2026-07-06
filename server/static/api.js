@@ -1,6 +1,8 @@
 export class ApiClient {
-  constructor({ cacheLimit = 18 } = {}) {
+  constructor({ cacheLimit = 18, cacheByteLimit = 32 * 1024 * 1024 } = {}) {
     this.cacheLimit = cacheLimit;
+    this.cacheByteLimit = cacheByteLimit;
+    this.cacheBytesUsed = 0;
     this.cache = new Map();
     this.controllers = new Map();
     this.inflight = new Map();
@@ -9,10 +11,10 @@ export class ApiClient {
   async get(url, { channel = url, cache = false } = {}) {
     this.abort(channel);
     if (cache && this.cache.has(url)) {
-      const value = this.cache.get(url);
+      const entry = this.cache.get(url);
       this.cache.delete(url);
-      this.cache.set(url, value);
-      return value;
+      this.cache.set(url, entry);
+      return entry.value;
     }
 
     const existing = this.inflight.get(url);
@@ -103,13 +105,25 @@ export class ApiClient {
   }
 
   forget(url) {
+    const entry = this.cache.get(url);
+    if (entry) this.cacheBytesUsed = Math.max(0, this.cacheBytesUsed - entry.bytes);
     this.cache.delete(url);
   }
 
   remember(url, value) {
-    this.cache.set(url, value);
-    while (this.cache.size > this.cacheLimit) {
-      this.cache.delete(this.cache.keys().next().value);
+    let bytes;
+    try {
+      bytes = new TextEncoder().encode(JSON.stringify(value)).byteLength;
+    } catch (_error) {
+      return;
+    }
+    this.forget(url);
+    if (bytes > this.cacheByteLimit) return;
+    this.cache.set(url, { value, bytes });
+    this.cacheBytesUsed += bytes;
+    while (this.cache.size > this.cacheLimit || this.cacheBytesUsed > this.cacheByteLimit) {
+      const oldest = this.cache.keys().next().value;
+      this.forget(oldest);
     }
   }
 }

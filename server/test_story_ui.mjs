@@ -19,11 +19,14 @@ import {
   footprintVisualModel,
   incidentDetailModel,
   incidentHitCandidates,
+  isCropIncident,
   isCropIncidentV3,
+  isCropIncidentV4,
   nextIncidentCandidate,
   normalizeFootprintCollection,
   shouldLoadEvolution,
   v3LayerModel,
+  v4LayerModel,
 } from "./static/incident-v3.js";
 import {
   footprintHistoryVisualModel,
@@ -31,11 +34,15 @@ import {
   incidentSelectionTransition,
   incidentStoryArc,
 } from "./static/incident-story.js";
-import { lifecycleModel, prefixTrajectoryModel } from "./static/inspector.js";
+import {
+  fieldEvidenceRibbonModel,
+  lifecycleModel,
+  prefixTrajectoryModel,
+} from "./static/inspector.js";
 import { buildEvolutionModel } from "./static/map-evolution.js";
 import { MapView } from "./static/map-view.js";
 import { alphaForState, lineColorFor } from "./static/palette.js";
-import { activityCount } from "./static/timeline.js";
+import { activityCount, timelineDateLabel } from "./static/timeline.js";
 
 test("compact state merges cached static geometry with dynamic properties", () => {
   const geometry = new Map([["A", {
@@ -100,6 +107,45 @@ test("unsupported compact endpoints fall back to the legacy frame", async () => 
   assert.equal(loader.compactSupported, false);
 });
 
+test("V4 compact state path hydrates cached geometry without using the polygon frame", async () => {
+  const gets = [];
+  const api = {
+    abortPrefix() {},
+    preload() {},
+    async get(url) {
+      gets.push(url);
+      return {
+        geometry_version: "v4-geometry",
+        rows: [{ field_id: "field-1", timeline_bucket: "2025-01-06" }],
+        meta: {},
+      };
+    },
+    async post() {
+      return {
+        geometry_version: "v4-geometry",
+        features: [{
+          type: "Feature",
+          geometry: { type: "Polygon", coordinates: [] },
+          properties: { field_id: "field-1" },
+        }],
+        meta: { missing_field_ids: [] },
+      };
+    },
+  };
+  const loader = new FrameDataLoader(api);
+  const frame = await loader.load({
+    bucket: "2025-01-06",
+    query: { bbox: "29,-2,30,-1" },
+    statePath: "/api/v4/frame-state",
+    legacyUrl: "/api/v4/frame/2025-01-06",
+    selectLegacy: (payload) => payload.fields,
+  });
+  assert.match(gets[0], /^\/api\/v4\/frame-state\/2025-01-06\?/);
+  assert.equal(gets.includes("/api/v4/frame/2025-01-06"), false);
+  assert.equal(frame.features.length, 1);
+  assert.equal(frame.meta.transport, "compact-state-plus-geometry");
+});
+
 test("stale geometry responses cannot repopulate a newer-version cache", () => {
   const loader = new FrameDataLoader({});
   loader.geometryVersion = "new";
@@ -161,6 +207,44 @@ test("causal prefix trajectory preserves gaps and selected week", () => {
   assert.equal(states[0].gapBefore, false);
   assert.equal(states[1].selected, true);
   assert.equal(states[2].gapBefore, true);
+});
+
+test("V4 field ribbon keeps pressure, S2 source-known, and story-known clocks separate", () => {
+  const model = fieldEvidenceRibbonModel({
+    as_of_date: "2025-01-12",
+    history: { window_start: "2025-01-01", window_end: "2025-01-12" },
+    lanes: {
+      daily_pressure: [
+        { calendar_date: "2025-01-05", hazard_family: "heat", risk_rank: 3, pressure_active: true },
+        { calendar_date: "2025-01-05", hazard_family: "drought", risk_rank: 2, pressure_active: true },
+      ],
+      s2_attempts: [
+        {
+          spectral_source_date: "2025-01-04", knowledge_date: "2025-01-06",
+          marker_type: "acquisition", spectral_usable: true,
+        },
+        {
+          spectral_source_date: "2025-01-09", knowledge_date: "2025-01-10",
+          marker_type: "rejected", spectral_usable: false,
+        },
+      ],
+      story_checkpoints: [{
+        story_week: "2025-01-06", story_known_date: "2025-01-12",
+        incident_state: "RECOVERING", stage_bucket: "flowering",
+      }],
+    },
+  }, "2025-01-12");
+  assert.deepEqual(model.hazardFamilies, ["drought", "heat"]);
+  assert.equal(model.lanes.pressure.length, 2);
+  assert.notEqual(
+    model.lanes.pressure[0].hazardIndex,
+    model.lanes.pressure[1].hazardIndex,
+  );
+  assert.ok(model.lanes.s2[0].sourceX < model.lanes.s2[0].knowledgeX);
+  assert.equal(model.lanes.s2[1].rejected, true);
+  assert.ok(model.lanes.story[0].sourceX < model.lanes.story[0].knowledgeX);
+  assert.equal(model.lanes.story[0].stage, "flowering");
+  assert.equal(model.selectedX, 100);
 });
 
 test("history is fetched only for an enabled filtered comparison", () => {
@@ -227,6 +311,24 @@ test("crop incident V3 is detected at either manifest mode location", () => {
   assert.equal(isCropIncidentV3({ mode: "legacy" }), false);
   assert.equal(shouldLoadEvolution({ mode: "crop_incident_v3" }), false);
   assert.equal(shouldLoadEvolution({ mode: "legacy" }), true);
+});
+
+test("dual-clock V4 mode uses daily labels and audited country representation", () => {
+  const manifest = { mode: "crop_incident_v4_dual_clock" };
+  assert.equal(isCropIncidentV4(manifest), true);
+  assert.equal(isCropIncident(manifest), true);
+  assert.equal(isCropIncidentV3(manifest), false);
+  assert.equal(shouldLoadEvolution(manifest), false);
+  assert.match(timelineDateLabel("daily", "2026-05-17"), /^As of /);
+  assert.match(timelineDateLabel("weekly", "2026-05-11"), /^Week of /);
+  const overview = v4LayerModel(8);
+  assert.equal(overview.fieldOverview.visible, true);
+  assert.equal(overview.fieldOverview.completeness, "api-audited");
+  assert.equal(overview.fields.visible, false);
+  assert.equal(v4LayerModel(12).fields.visible, true);
+  assert.equal(overview.pressure.clock, "daily");
+  assert.equal(overview.cropImpact.clock, "s2-step-held");
+  assert.equal(overview.story.clock, "weekly-knowledge-gated");
 });
 
 test("V3 layer model keeps exact complete footprints primary and hides movement trails", () => {
@@ -297,6 +399,27 @@ test("V3 timeline prefetch targets both adjacent weeks", () => {
     adjacentBuckets(buckets, 0).map((row) => row.timeline_bucket),
     ["2026-01-12"],
   );
+});
+
+test("V4 footprint and story histories never cross the selected knowledge day", () => {
+  const geometry = { type: "Polygon", coordinates: [[[30, -1], [31, -1], [30, -1]]] };
+  const footprints = [
+    { incident_id: "i-1", story_week: "2026-01-05", story_known_date: "2026-01-11", geometry },
+    { incident_id: "i-1", story_week: "2026-01-12", story_known_date: "2026-01-18", geometry },
+  ];
+  const beforeSecond = incidentFootprintHistory(footprints, "2026-01-17", "i-1");
+  assert.equal(beforeSecond.current.properties.story_week, "2026-01-05");
+  assert.equal(beforeSecond.collection.features.length, 0);
+  const afterSecond = incidentFootprintHistory(footprints, "2026-01-18", "i-1");
+  assert.equal(afterSecond.current.properties.story_week, "2026-01-12");
+  assert.equal(afterSecond.collection.features.length, 1);
+
+  const arc = incidentStoryArc([
+    { timeline_bucket: "2026-01-05", story_known_date: "2026-01-11", incident_state: "ACTIVE" },
+    { timeline_bucket: "2026-01-12", story_known_date: "2026-01-18", incident_state: "RECOVERING" },
+  ], [], "2026-01-17");
+  assert.equal(arc.length, 1);
+  assert.equal(arc[0].knownDate, "2026-01-11");
 });
 
 test("selected crop incident persists while the timeline week changes", () => {
@@ -544,6 +667,19 @@ test("footprint prefetch coalesces without retaining payloads in the generic API
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("generic API cache evicts decoded payloads by bytes as well as count", () => {
+  const client = new ApiClient({ cacheLimit: 10, cacheByteLimit: 80 });
+  client.remember("/first", { value: "a".repeat(35) });
+  client.remember("/second", { value: "b".repeat(35) });
+  assert.equal(client.cache.has("/first"), false);
+  assert.equal(client.cache.has("/second"), true);
+  assert.ok(client.cacheBytesUsed <= 80);
+  client.remember("/oversized", { value: "x".repeat(200) });
+  assert.equal(client.cache.has("/oversized"), false);
+  client.forget("/second");
+  assert.equal(client.cacheBytesUsed, 0);
 });
 
 test("A to B to A scrubbing never reuses an already-aborted request", async () => {

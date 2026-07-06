@@ -1,6 +1,7 @@
 import { incidentFootprintHistory, incidentStoryArc } from "./incident-story.js";
 
 export const CROP_INCIDENT_MODE = "crop_incident_v3";
+export const CROP_INCIDENT_V4_MODE = "crop_incident_v4_dual_clock";
 export const INCIDENT_FIELD_MIN_ZOOM = 11;
 export const INCIDENT_TRUTH_LABEL = "Footprint evolution, not physical movement.";
 
@@ -8,8 +9,31 @@ export function isCropIncidentV3(manifest = {}) {
   return String(manifest.mode || manifest.run?.mode || "") === CROP_INCIDENT_MODE;
 }
 
+export function isCropIncidentV4(manifest = {}) {
+  return String(manifest.mode || manifest.run?.mode || "") === CROP_INCIDENT_V4_MODE;
+}
+
+export function isCropIncident(manifest = {}) {
+  return isCropIncidentV3(manifest) || isCropIncidentV4(manifest);
+}
+
 export function shouldLoadEvolution(manifest = {}) {
-  return !isCropIncidentV3(manifest);
+  return !isCropIncident(manifest);
+}
+
+export function v4LayerModel(zoom = 0) {
+  return {
+    primaryLayer: "daily-pressure-crop-story",
+    fieldOverview: {
+      visible: Number(zoom) < INCIDENT_FIELD_MIN_ZOOM,
+      completeness: "api-audited",
+    },
+    pressure: { visible: true, clock: "daily" },
+    cropImpact: { visible: true, clock: "s2-step-held" },
+    story: { visible: true, clock: "weekly-knowledge-gated" },
+    fields: { visible: Number(zoom) >= INCIDENT_FIELD_MIN_ZOOM, role: "drilldown-detail" },
+    evolution: { visible: false },
+  };
 }
 
 export function v3LayerModel(zoom = 0) {

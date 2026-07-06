@@ -1,0 +1,55 @@
+{
+  "policy_schema_version": "incident-source-policy-v4/1",
+  "policy_version": "crop-impact-incident-source-v4.0.0-uncalibrated",
+  "calibration_status": "STARTER_SOURCE_THRESHOLDS_UNCALIBRATED_REQUIRES_AGRONOMIST_VALIDATION",
+  "warning": "UNCALIBRATED monitoring evidence policy. Pressure ranks and spectral response thresholds are diagnostic signals, not diagnoses, crop-loss estimates, causal claims, or crop-death evidence.",
+  "availability_modes": ["strict", "reconstructed"],
+  "hazard_families": ["drought", "ponding_flooding", "heat", "damaging_wind"],
+  "spectral_freshness_days": {
+    "fresh": 7,
+    "aging": 14
+  },
+  "reference_window_days": {
+    "minimum": 7,
+    "maximum": 21
+  },
+  "spectral_quality": {
+    "minimum_valid_pixel_fraction": 0.4,
+    "maximum_cloud_pct": 40.0,
+    "rejected_quality_flags": ["no_valid_pixels", "poor"]
+  },
+  "spectral_change_thresholds": {
+    "medium_ndvi_delta": -0.08,
+    "medium_ndmi_delta": -0.06,
+    "medium_psri_delta": 0.05,
+    "severe_ndvi_delta": -0.15,
+    "severe_ndmi_delta": -0.1,
+    "severe_psri_delta": 0.1,
+    "recovery_ndvi_delta": 0.05,
+    "recovery_ndmi_delta": 0.04,
+    "recovery_psri_delta": -0.05
+  },
+  "pressure_rank_thresholds": {
+    "low_medium": 3.0,
+    "medium_high": 5.0,
+    "high": 8.0
+  },
+  "stage_buckets": [
+    "emergence",
+    "vegetative",
+    "flowering",
+    "fruiting_or_grain_fill",
+    "maturity_or_harvest",
+    "off_season",
+    "unknown"
+  ],
+  "stage_aliases": {
+    "emergence": ["planting", "sowing", "germination", "emergence", "seedling", "nursery", "transplanting"],
+    "vegetative": ["vegetative", "leaf_development", "tillering", "rosette", "stem_elongation"],
+    "flowering": ["booting", "heading", "anthesis", "flowering"],
+    "fruiting_or_grain_fill": ["fruiting_or_grain_fill", "yield_formation", "grain_fill", "grain_filling", "fruit_development", "fruiting", "fruit_set", "pod_set", "pod_fill", "pod_filling", "bulking", "tuber_bulking"],
+    "maturity_or_harvest": ["maturity_or_harvest", "maturation", "maturity", "ripening", "senescence", "harvest_ready", "harvest"],
+    "off_season": ["off_season", "fallow"],
+    "unknown": ["unknown", "unknown_stage"]
+  }
+}

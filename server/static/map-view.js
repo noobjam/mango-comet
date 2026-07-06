@@ -12,6 +12,7 @@ import {
   incidentHitCandidates,
   nextIncidentCandidate,
   v3LayerModel,
+  v4LayerModel,
 } from "./incident-v3.js";
 import { footprintHistoryVisualModel } from "./incident-story.js";
 
@@ -19,7 +20,7 @@ const EMPTY = { type: "FeatureCollection", features: [], meta: {} };
 
 export class MapView {
   constructor({
-    container, config, bounds, incidentMode = false,
+    container, config, bounds, incidentMode = false, v4Mode = false,
     onReady, onHover, onSelect, onSelectIncident, onViewportChange,
   }) {
     this.container = container;
@@ -40,6 +41,8 @@ export class MapView {
     this.selectedFieldId = "";
     this.selectedIncidentId = "";
     this.incidentMode = Boolean(incidentMode);
+    this.v4Mode = Boolean(v4Mode);
+    this.v4Frame = null;
     this.evolution = null;
     this.evolutionBucket = "";
     this.overlay = null;
@@ -139,6 +142,14 @@ export class MapView {
     this.render();
   }
 
+  setV4Data(payload, bucket = "") {
+    this.v4Frame = payload || null;
+    this.frame = payload?.fields || EMPTY;
+    this.footprints = payload?.story_footprints || EMPTY;
+    this.evolutionBucket = String(bucket || payload?.calendar_date || "");
+    this.render();
+  }
+
   setColorMode(mode) {
     this.colorMode = mode === "risk" ? "risk" : "family";
     this.render();
@@ -191,7 +202,9 @@ export class MapView {
 
   incidentFieldsVisible() {
     if (!this.incidentMode) return true;
-    return v3LayerModel(this.map?.getZoom?.() || 0).fields.visible;
+    const model = this.v4Mode ? v4LayerModel(this.map?.getZoom?.() || 0)
+      : v3LayerModel(this.map?.getZoom?.() || 0);
+    return model.fields.visible;
   }
 
   render() {
@@ -228,11 +241,78 @@ export class MapView {
 
   incidentDeckLayers() {
     const zoom = this.map?.getZoom?.() || 0;
-    const model = v3LayerModel(zoom);
+    const model = this.v4Mode ? v4LayerModel(zoom) : v3LayerModel(zoom);
     const dashExtension = deck.PathStyleExtension
       ? [new deck.PathStyleExtension({ dash: true })]
       : [];
     const layers = [];
+    if (this.v4Mode && model.fieldOverview.visible) {
+      layers.push(new deck.GeoJsonLayer({
+        id: "v4-complete-field-overview",
+        data: this.v4Frame?.field_overview || EMPTY,
+        pickable: false,
+        filled: true,
+        stroked: false,
+        getFillColor: (feature) => {
+          const count = Math.max(0, Number(feature.properties?.represented_field_count || 0));
+          return [69, 117, 102, Math.min(105, 18 + Math.round(Math.log2(count + 1) * 12))];
+        },
+      }));
+    }
+    if (this.v4Mode) {
+      const pressure = this.v4Frame?.pressure || EMPTY;
+      layers.push(new deck.GeoJsonLayer({
+        id: "v4-daily-pressure-fill",
+        data: pressure,
+        pickable: false,
+        filled: true,
+        stroked: false,
+        getFillColor: (feature) => colorFor(
+          feature.properties,
+          "family",
+          Math.min(72, 18 + Number(feature.properties?.max_risk_rank || 0) * 14),
+        ),
+      }));
+      const pressureHazards = [...new Set(
+        (pressure.features || [])
+          .map((feature) => String(feature.properties?.hazard_family || ""))
+          .filter(Boolean),
+      )].sort();
+      pressureHazards.forEach((hazard, index) => {
+        const features = (pressure.features || []).filter(
+          (feature) => String(feature.properties?.hazard_family || "") === hazard,
+        );
+        layers.push(new deck.GeoJsonLayer({
+          id: `v4-daily-pressure-lane-${hazard}`,
+          data: { type: "FeatureCollection", features },
+          pickable: false,
+          filled: false,
+          stroked: true,
+          getLineColor: (feature) => colorFor(feature.properties, "family", 230),
+          getLineWidth: 2 + (pressureHazards.length - index) * 2,
+          lineWidthUnits: "pixels",
+          lineWidthMinPixels: 2,
+        }));
+      });
+      layers.push(new deck.GeoJsonLayer({
+        id: "v4-s2-crop-impact",
+        data: this.v4Frame?.crop_impact || EMPTY,
+        pickable: false,
+        filled: true,
+        stroked: true,
+        getFillColor: (feature) => {
+          const decline = Number(feature.properties?.decline_field_count || 0);
+          const recovery = Number(feature.properties?.recovery_field_count || 0);
+          const stale = Number(feature.properties?.stale_evidence_field_count || 0);
+          const evidence = Math.max(1, Number(feature.properties?.crop_evidence_field_count || 0));
+          const alpha = stale >= evidence ? 45 : 105;
+          return decline >= recovery ? [204, 121, 167, alpha] : [0, 158, 115, alpha];
+        },
+        getLineColor: [235, 225, 233, 180],
+        getLineWidth: 0.8,
+        lineWidthUnits: "pixels",
+      }));
+    }
     layers.push(new deck.GeoJsonLayer({
       id: "incident-exact-complete-footprints",
       data: this.footprints,

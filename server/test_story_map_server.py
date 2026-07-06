@@ -1213,7 +1213,8 @@ class StoryMapServerTests(unittest.TestCase):
     def test_http_gzip_and_raw_response_cache_headers(self) -> None:
         url = (
             f"http://127.0.0.1:{self.httpd.server_port}"
-            "/api/activity?story_cluster_id=story-A&cache_test=1"
+            "/api/activity?story_cluster_id=story-A"
+            "&current_risk_band=__cache_header_test__&cache_test=1"
         )
         request = Request(url, headers={"Accept-Encoding": "gzip"})
         with urlopen(request, timeout=3) as response:
@@ -1228,6 +1229,13 @@ class StoryMapServerTests(unittest.TestCase):
             second_body = gzip.decompress(response.read())
             self.assertEqual(response.headers["X-Cache"], "HIT")
         self.assertEqual(first_body, second_body)
+        canonical_request = Request(
+            url.replace("cache_test=1", "ignored_cache_buster=999"),
+            headers={"Accept-Encoding": "gzip"},
+        )
+        with urlopen(canonical_request, timeout=3) as response:
+            self.assertEqual(response.headers["X-Cache"], "HIT")
+            self.assertEqual(gzip.decompress(response.read()), first_body)
 
     def test_public_api_metadata_does_not_disclose_host_paths(self) -> None:
         base_url = f"http://127.0.0.1:{self.httpd.server_port}"
@@ -1411,7 +1419,7 @@ class StoryMapServerTests(unittest.TestCase):
         server_thread = Thread(target=httpd.serve_forever, daemon=True)
         server_thread.start()
         base_url = f"http://127.0.0.1:{httpd.server_port}"
-        cached_url = f"{base_url}/api/timeline?response_gate_cached=1"
+        cached_url = f"{base_url}/api/config?response_gate_cached=1"
         with urlopen(cached_url, timeout=3) as response:
             response.read()
             self.assertEqual(response.headers["X-Cache"], "MISS")
@@ -1471,7 +1479,7 @@ class StoryMapServerTests(unittest.TestCase):
                     self.assertEqual(response.headers["X-Cache"], "HIT")
                 self.assertLess(time.perf_counter() - request_started, 1.0)
 
-                rejected_url = f"{base_url}/api/timeline?response_gate_rejected=1"
+                rejected_url = f"{base_url}/api/manifest?response_gate_rejected=1"
                 request_started = time.perf_counter()
                 with self.assertRaises(HTTPError) as raised:
                     urlopen(rejected_url, timeout=1)

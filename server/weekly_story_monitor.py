@@ -11,6 +11,7 @@ from story_monitor.contracts import load_policy
 from story_monitor.motif_export import export_motif_generation
 from story_monitor.motifs import DiscoveryConfig, discover_motifs
 from story_monitor.incident_policy_v3 import DEFAULT_INCIDENT_POLICY_V3_PATH
+from story_monitor.incident_policy_v4 import DEFAULT_INCIDENT_POLICY_V4_PATH
 from story_monitor.partitioned_pipeline import PartitionOptions, build_partitioned_generation
 from story_monitor.pipeline import BOUNDED_V1_MAX_FIELDS, DEFAULT_POLICY_PATH, build_generation
 from story_monitor.prefix_features import load_training_prefixes
@@ -203,6 +204,39 @@ def build_parser() -> argparse.ArgumentParser:
     train_incident_archetypes_v3.add_argument(
         "--radius-quantile", type=float, default=0.95
     )
+    evidence_v4 = subparsers.add_parser(
+        "build-evidence-v4",
+        help=(
+            "Build immutable daily pressure and acquisition-grain crop-evidence "
+            "ledgers beside an existing source generation."
+        ),
+    )
+    evidence_v4.add_argument("--generation-dir", type=Path, required=True)
+    evidence_v4.add_argument("--evidence-dir", type=Path, required=True)
+    evidence_v4.add_argument(
+        "--released-at", required=True,
+        help="Monotonic timezone-aware ingest/release watermark (normalized to UTC).",
+    )
+    evidence_v4.add_argument("--enriched-source-parquet", type=Path)
+    evidence_v4.add_argument(
+        "--acquisition-parquet",
+        type=Path,
+        help=(
+            "Partial or complete attempt ledger merged with acquisitions derived "
+            "from the enriched daily source."
+        ),
+    )
+    evidence_v4.add_argument(
+        "--availability-mode",
+        choices=("strict", "reconstructed"),
+        default="reconstructed",
+    )
+    evidence_v4.add_argument(
+        "--policy", type=Path, default=DEFAULT_INCIDENT_POLICY_V4_PATH
+    )
+    evidence_v4.add_argument("--threads", type=_positive_int, default=16)
+    evidence_v4.add_argument("--memory-limit")
+    evidence_v4.add_argument("--temp-dir", type=Path)
     return parser
 
 
@@ -365,6 +399,27 @@ def main() -> None:
                 "incident_id."
             ),
         }
+    elif args.command == "build-evidence-v4":
+        from story_monitor.incident_context_v4 import build_incident_context_v4
+        from story_monitor.incident_policy_v4 import load_incident_policy_v4
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)sZ %(levelname)s %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
+        payload = build_incident_context_v4(
+            args.generation_dir,
+            args.evidence_dir,
+            released_at=args.released_at,
+            enriched_source_parquet=args.enriched_source_parquet,
+            acquisition_parquet=args.acquisition_parquet,
+            availability_mode=args.availability_mode,
+            policy=load_incident_policy_v4(args.policy),
+            threads=args.threads,
+            memory_limit=args.memory_limit,
+            temp_dir=args.temp_dir,
+        )
     else:
         from story_monitor.incident_policy_v3 import load_incident_policy_v3
         from story_monitor.incident_workflow_v3 import build_incident_generation_v3

@@ -19,15 +19,20 @@ export function incidentSelectionTransition({
 export function incidentStoryArc(weeklyValue = [], stageValue = [], selectedBucket = "") {
   const cutoff = validBucket(selectedBucket) ? String(selectedBucket).slice(0, 10) : "";
   const stagesByWeek = groupByBucket(rows(stageValue));
-  return rows(weeklyValue)
-    .map((row) => ({ ...row, bucket: bucketOf(row) }))
-    .filter((row) => validBucket(row.bucket) && (!cutoff || row.bucket <= cutoff))
+  const eligible = rows(weeklyValue)
+    .map((row) => ({ ...row, bucket: bucketOf(row), knownDate: knownDateOf(row) }))
+    .filter((row) => validBucket(row.bucket)
+      && (!cutoff || (row.knownDate || row.bucket) <= cutoff))
     .sort((left, right) => left.bucket.localeCompare(right.bucket))
-    .map((row) => {
+    .map((row, index, values) => {
       const stage = dominantAffectedStage(stagesByWeek.get(row.bucket) || []);
       return {
         bucket: row.bucket,
-        selected: Boolean(cutoff && row.bucket === cutoff),
+        knownDate: row.knownDate || row.bucket,
+        selected: Boolean(cutoff && (
+          (row.knownDate && index === values.length - 1)
+          || (!row.knownDate && row.bucket === cutoff)
+        )),
         lifecycle: first(row.incident_state, row.lifecycle_state, row.current_state, "Unknown"),
         stage: first(
           stage,
@@ -54,6 +59,7 @@ export function incidentStoryArc(weeklyValue = [], stageValue = [], selectedBuck
         carriedForward: truthy(row.footprint_carried_forward),
       };
     });
+  return eligible;
 }
 
 export function incidentFootprintHistory(
@@ -71,17 +77,27 @@ export function incidentFootprintHistory(
     (feature) => String(feature.properties.incident_id || "") === selectedId,
   );
   const cutoff = requested || matching.at(-1)?.properties?.timeline_bucket || "";
-  const eligible = matching.filter(
-    (feature) => !cutoff || feature.properties.timeline_bucket <= cutoff,
+  const knowledgeClock = matching.some(
+    (feature) => validBucket(feature.properties.story_known_date),
   );
-  const current = eligible.find(
-    (feature) => feature.properties.timeline_bucket === cutoff,
-  ) || null;
+  const eligible = matching.filter(
+    (feature) => !cutoff || (
+      knowledgeClock
+        ? feature.properties.story_known_date <= cutoff
+        : feature.properties.timeline_bucket <= cutoff
+    ),
+  );
+  const current = knowledgeClock
+    ? eligible.at(-1) || null
+    : eligible.find((feature) => feature.properties.timeline_bucket === cutoff) || null;
   const priorRows = eligible.filter(
-    (feature) => feature.properties.timeline_bucket < cutoff,
+    (feature) => feature !== current,
   );
   const historyFeatures = priorRows.map((feature) => {
-    const ageWeeks = weekDistance(feature.properties.timeline_bucket, cutoff);
+    const ageWeeks = weekDistance(
+      knowledgeClock ? feature.properties.story_known_date : feature.properties.timeline_bucket,
+      cutoff,
+    );
     return {
       ...feature,
       properties: {
@@ -128,6 +144,8 @@ function footprintFeature(row, fallbackIncidentId) {
   delete properties.geometry;
   delete properties.geometry_geojson;
   properties.timeline_bucket = bucket;
+  const knownDate = knownDateOf(properties);
+  if (knownDate) properties.story_known_date = knownDate;
   properties.incident_id = String(
     properties.incident_id || fallbackIncidentId || "",
   );
@@ -186,7 +204,17 @@ function weekDistance(bucket, cutoff) {
 }
 
 function bucketOf(row = {}) {
-  return String(row.timeline_bucket || row.properties?.timeline_bucket || "").slice(0, 10);
+  return String(
+    row.story_week || row.timeline_bucket
+      || row.properties?.story_week || row.properties?.timeline_bucket || "",
+  ).slice(0, 10);
+}
+
+function knownDateOf(row = {}) {
+  const value = row.story_known_date || row.knowledge_time
+    || row.properties?.story_known_date || row.properties?.knowledge_time || "";
+  const day = String(value).slice(0, 10);
+  return validBucket(day) ? day : "";
 }
 
 function validBucket(value) {

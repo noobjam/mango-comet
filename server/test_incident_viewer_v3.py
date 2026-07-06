@@ -69,7 +69,11 @@ class IncidentViewerV3Tests(unittest.TestCase):
             self.assertEqual(footprints["footprint_area_km2"].tolist(), [50.0, 50.0])
             self.assertIsNotNone(footprints.iloc[0]["pressure_geometry_geojson"])
             self.assertEqual(footprints.iloc[0]["pressure_cell_count"], 2)
-            self.assertIsNone(footprints.iloc[0]["impact_geometry_geojson"])
+            # Parquet nulls may be materialized by pandas as None, pd.NA, or
+            # NaN depending on the inferred column dtype.
+            self.assertTrue(
+                pd.isna(footprints.iloc[0]["impact_geometry_geojson"])
+            )
             self.assertIsNotNone(footprints.iloc[1]["impact_geometry_geojson"])
             self.assertEqual(footprints.iloc[1]["impact_cell_count"], 2)
 
