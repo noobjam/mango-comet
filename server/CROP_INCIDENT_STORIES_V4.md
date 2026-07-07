@@ -15,9 +15,12 @@ daily field pressure
   -> exposure_id x crop = stable incident_id
 ```
 
-The deterministic V3 identity hierarchy remains authoritative. A learned
-motif may describe a completed or sufficiently mature incident, but it never
-creates, merges, splits, closes, or renames an incident.
+The deterministic V3 identity hierarchy remains authoritative. A V4-native
+replay recomputes that hierarchy from V4 evidence and does not force an old V3
+ID when a component changes; the old release contributes only an explicit
+old-to-new overlap crosswalk. A learned motif may describe a completed or
+sufficiently mature incident, but it never creates, merges, splits, closes, or
+renames an incident.
 
 V4 fixes the evidence clocks around that identity. It does not silently turn
 the weekly reporting bucket into the time at which weather or Sentinel-2
@@ -71,10 +74,11 @@ date and becomes knowable no earlier than both the attempt and crop context.
 
 ### Story checkpoint clock
 
-Incident identity and lifecycle remain immutable V3 checkpoints. On an as-of
-day, a checkpoint is visible only when its full `story_known_time` is not later
-than the playhead day. That timestamp is the maximum of the source checkpoint
-time and the attributed membership, pressure, crop/stage, and applicable S2
+Legacy projection keeps immutable V3 identity/lifecycle checkpoints; native
+mode uses immutable checkpoints emitted by the V4 replay. On an as-of day, a
+checkpoint is visible only when its full `story_known_time` is not later than
+the playhead day. That timestamp is the maximum of the source checkpoint time
+and the attributed membership, pressure, crop/stage, and applicable S2
 impact/recovery knowledge times for the checkpoint week; `story_known_date` is
 only its display date. Daily pressure and sparse Sentinel-2 evidence can appear
 as an unassigned prelude before the first known checkpoint; the future incident
@@ -86,15 +90,24 @@ required field/crop/hazard evidence. Reconstructed releases may raise the bound
 but remain explicitly diagnostic and retain the source and component timestamps
 for audit.
 
-Viewer schema `crop-incident-viewer-v4/2` adds a required
-`lifecycle_reconciliation_v4.parquet` ledger. For every displayed checkpoint it
-reconciles the V3 membership counts and every positive pressure, decline, and
-recovery claim against evidence known by that checkpoint. Any contradiction
+In legacy projection mode, viewer schema `crop-incident-viewer-v4/2` adds a
+required `lifecycle_reconciliation_v4.parquet` ledger. For every displayed
+checkpoint it reconciles the V3 membership counts and every positive pressure,
+decline, and recovery claim against evidence known by that checkpoint. Any contradiction
 blocks the bundle atomically. This is deliberately narrower than replaying the
 V3 lifecycle: V4 does **not** recompute lifecycle state, infer component
 absence, or claim that V4 alone owns story start/end. The correct presentation
 claim is “knowledge-gated V3 lifecycle with fail-closed V4 positive-evidence
 reconciliation.” Older V4/1 bundles are rejected and must be rebuilt.
+
+Native replay mode uses the same viewer schema and API with
+`run.native_replay=true`. Its incident input must be
+`crop-impact-incident-story-replay-v4/1` in mode
+`crop_incident_story_replay_v4`. Lifecycle, component absence, coverage, and
+ownership were then replayed upstream from V4 ledgers, while the viewer still
+fails closed on every positive-evidence and membership-counter contradiction.
+Evidence is attributed to the week it became knowable, so late evidence cannot
+silently rewrite an earlier visible prefix.
 
 ## Authoritative V4 evidence ledgers
 
@@ -133,6 +146,27 @@ assignment is not attached to that future crop. It is excluded from this
 crop-qualified ledger and counted by origin under
 `reconciliation.s2_acquisitions.excluded_without_causal_crop_count` in the
 evidence manifest.
+
+## V4-native story replay
+
+The native runner consumes only the validated V4 evidence release, immutable
+field geometry/admin data, and an old incident release for audit overlap. It
+binds both policies because the V4 source policy owns evidence QA/severity while
+the frozen V3 tracking policy owns baseline, grid, component, exposure, and
+lifecycle thresholds.
+
+Its day-major episode adapter evaluates all hazard lanes once per decision day.
+The decision date is no earlier than both effective and knowledge time.
+Rejected, carried, unknown-QA, and insufficient-reference S2 attempts never
+create decline or recovery; missing weather never advances a quiet clock; exact
+V4 medium/severe class drives the transition; and recovery requires a later
+usable acquisition. Work is hash-partitioned by field for bounded memory.
+
+The runner checkpoints context, baseline, cells, components, exposures,
+crop-story scaffolds, and lifecycle artifacts before atomically publishing the
+new release and native viewer. Checkpoint reuse verifies immutable input and
+artifact fingerprints. Input order cannot influence partitions, identities,
+states, or counters.
 
 ## Availability modes
 

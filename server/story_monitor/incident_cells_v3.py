@@ -623,9 +623,13 @@ def _normalize_lane_source(connection: duckdb.DuckDBPyConnection) -> None:
         else "FALSE"
     )
     knowledge = (
-        "CAST(snapshot_as_of_date AS DATE)"
-        if "snapshot_as_of_date" in columns
-        else "CAST(timeline_bucket AS DATE) + INTERVAL 6 DAY"
+        "TRY_CAST(knowledge_time AS TIMESTAMP)"
+        if "knowledge_time" in columns
+        else (
+            "CAST(snapshot_as_of_date AS TIMESTAMP)"
+            if "snapshot_as_of_date" in columns
+            else "CAST(timeline_bucket AS TIMESTAMP) + INTERVAL 6 DAY"
+        )
     )
     connection.execute(
         f"""

@@ -31,6 +31,8 @@ from .incident_viewer_v3 import export_incident_viewer_v3
 
 SCHEMA_VERSION = "crop-incident-viewer-v4/2"
 MODE = "crop_incident_v4_dual_clock"
+NATIVE_REPLAY_INCIDENT_SCHEMA_VERSION = "crop-impact-incident-story-replay-v4/1"
+NATIVE_REPLAY_INCIDENT_MODE = "crop_incident_story_replay_v4"
 PUBLICATION_STATUS = "diagnostic_uncalibrated_not_map_approved"
 LIFECYCLE_RECONCILIATION_SCHEMA_VERSION = (
     "incident-lifecycle-evidence-reconciliation-v4/1"
@@ -79,6 +81,7 @@ def export_incident_viewer_v4(
     display_grid_degrees: float = 0.05,
     freshness_fresh_days: int = 7,
     freshness_aging_days: int = 14,
+    native_replay: bool = False,
 ) -> dict[str, Any]:
     """Build an immutable V4 bundle while retaining every V3 artifact/API."""
     incident_dir = incident_dir.expanduser().resolve()
@@ -99,6 +102,8 @@ def export_incident_viewer_v4(
     ):
         if not directory.is_dir():
             raise FileNotFoundError(f"{name} does not exist: {directory}")
+    if native_replay:
+        _require_native_replay_incident_manifest(incident_dir)
     evidence_validation = validate_evidence_directory(evidence_dir)
     source_manifest_path = source_generation_dir / "manifest.json"
     evidence_manifest_path = evidence_dir / "manifest.json"
@@ -176,6 +181,7 @@ def export_incident_viewer_v4(
                     connection,
                     stage / OUTPUT_FILES["story_checkpoints"],
                     availability_mode=str(evidence_validation["availability_mode"]),
+                    native_replay=native_replay,
                 )
                 connection.read_parquet(
                     str(stage / OUTPUT_FILES["story_checkpoints"])
@@ -184,6 +190,7 @@ def export_incident_viewer_v4(
                     connection,
                     stage / OUTPUT_FILES["lifecycle_reconciliation"],
                     availability_mode=str(evidence_validation["availability_mode"]),
+                    native_replay=native_replay,
                 )
                 _write_story_footprints(
                     connection, stage / OUTPUT_FILES["story_footprints"]
@@ -204,7 +211,9 @@ def export_incident_viewer_v4(
                 _write_daily_timeline(
                     connection, stage / OUTPUT_FILES["timeline"]
                 )
-                validation = _validate_outputs(connection, stage)
+                validation = _validate_outputs(
+                    connection, stage, native_replay=native_replay
+                )
 
             base_manifest = json.loads((stage / "manifest.json").read_text(encoding="utf-8"))
             manifest = _manifest(
@@ -219,6 +228,7 @@ def export_incident_viewer_v4(
                 display_grid_degrees=float(display_grid_degrees),
                 freshness_fresh_days=int(freshness_fresh_days),
                 freshness_aging_days=int(freshness_aging_days),
+                native_replay=native_replay,
             )
             (stage / "manifest.json").write_text(
                 json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -233,6 +243,7 @@ def export_incident_viewer_v4(
         "status": "complete",
         "mode": MODE,
         "schema_version": SCHEMA_VERSION,
+        "native_replay": native_replay,
         "output_dir": str(output_dir),
         **validation,
     }
@@ -276,6 +287,28 @@ def _optional(columns: Sequence[str], aliases: Sequence[str], fallback: str) -> 
         if alias in columns:
             return f'"{alias}"'
     return fallback
+
+
+def _require_native_replay_incident_manifest(incident_dir: Path) -> None:
+    manifest_path = incident_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "Native replay requires a valid V4-native incident manifest"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("Native replay incident manifest must be a JSON object")
+    if (
+        manifest.get("mode") != NATIVE_REPLAY_INCIDENT_MODE
+        or manifest.get("schema_version")
+        != NATIVE_REPLAY_INCIDENT_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            "Native replay requires incident manifest mode "
+            f"{NATIVE_REPLAY_INCIDENT_MODE!r} and schema_version "
+            f"{NATIVE_REPLAY_INCIDENT_SCHEMA_VERSION!r}"
+        )
 
 
 def _register_canonical_inputs(
@@ -727,6 +760,7 @@ def _write_story_checkpoints(
     output_path: Path,
     *,
     availability_mode: str,
+    native_replay: bool = False,
 ) -> None:
     if availability_mode not in {"strict", "reconstructed"}:
         raise ValueError("Story checkpoint availability mode is invalid")
@@ -754,6 +788,26 @@ def _write_story_checkpoints(
     inferred_sql = (
         "COALESCE(TRY_CAST(w.knowledge_time_inferred AS BOOLEAN), TRUE)"
         if "knowledge_time_inferred" in weekly_columns else "TRUE"
+    )
+    pressure_decision_week = (
+        "CAST(p.pressure_knowledge_time AS DATE) BETWEEN m.story_week "
+        "AND m.story_week + INTERVAL 6 DAY"
+        if native_replay
+        else "p.pressure_observation_date BETWEEN m.story_week "
+        "AND m.story_week + INTERVAL 6 DAY"
+    )
+    crop_decision_week = (
+        "CAST(c.crop_knowledge_time AS DATE) BETWEEN m.story_week "
+        "AND m.story_week + INTERVAL 6 DAY"
+        if native_replay
+        else "c.stage_effective_date BETWEEN m.story_week "
+        "AND m.story_week + INTERVAL 6 DAY"
+    )
+    s2_decision_week = (
+        "a.knowledge_date BETWEEN m.story_week AND m.story_week + INTERVAL 6 DAY"
+        if native_replay
+        else "a.spectral_source_date BETWEEN m.story_week "
+        "AND m.story_week + INTERVAL 6 DAY"
     )
     invalid = int(
         connection.execute(
@@ -812,8 +866,7 @@ def _write_story_checkpoints(
                     WHERE p.field_id = m.field_id
                       AND p.crop_instance_id = m.crop_instance_id
                       AND p.hazard_family = m.hazard_family
-                      AND p.pressure_observation_date BETWEEN m.story_week
-                          AND m.story_week + INTERVAL 6 DAY
+                      AND {pressure_decision_week}
                 ) AS pressure_knowledge_time,
                 (
                     SELECT MAX(p.pressure_knowledge_time)
@@ -821,8 +874,7 @@ def _write_story_checkpoints(
                     WHERE p.field_id = m.field_id
                       AND p.crop_instance_id = m.crop_instance_id
                       AND p.hazard_family = m.hazard_family
-                      AND p.pressure_observation_date BETWEEN m.story_week
-                          AND m.story_week + INTERVAL 6 DAY
+                      AND {pressure_decision_week}
                       AND p.pressure_observed
                 ) AS observed_pressure_knowledge_time,
                 (
@@ -830,16 +882,14 @@ def _write_story_checkpoints(
                     FROM crop_events_v4 AS c
                     WHERE c.field_id = m.field_id
                       AND c.crop_instance_id = m.crop_instance_id
-                      AND c.stage_effective_date BETWEEN m.story_week
-                          AND m.story_week + INTERVAL 6 DAY
+                      AND {crop_decision_week}
                 ) AS crop_context_knowledge_time,
                 (
                     SELECT MAX(a.knowledge_time)
                     FROM s2_updates_v4 AS a
                     WHERE a.field_id = m.field_id
                       AND a.crop_instance_id = m.crop_instance_id
-                      AND a.spectral_source_date BETWEEN m.story_week
-                          AND m.story_week + INTERVAL 6 DAY
+                      AND {s2_decision_week}
                       AND a.new_response_evidence
                       AND a.response_class IN (
                           'medium_decline', 'severe_decline', 'recovery'
@@ -959,17 +1009,14 @@ def _write_lifecycle_reconciliation(
     output_path: Path,
     *,
     availability_mode: str,
+    native_replay: bool = False,
 ) -> None:
-    """Fail closed when V3 positive lifecycle claims contradict V4 evidence.
+    """Fail closed when positive lifecycle claims contradict V4 evidence.
 
-    This deliberately does not replay the V3 lifecycle.  A full replay requires
-    the frozen effective V3 policy values, component-significance inputs, and
-    weekly coverage denominator ledger, none of which are complete V4 inputs.
-    The artifact instead proves the narrower statement that every positive
-    pressure/response claim used by a published checkpoint is supported by the
-    immutable V4 ledgers and that the published checkpoint counters reconcile
-    with stable V3 membership.  Component *absence* remains explicitly
-    unreplayed; observed quiet and missing weather are recorded separately.
+    Default projection mode preserves the V3 lifecycle and proves only that its
+    positive pressure/response claims reconcile.  Native mode consumes the
+    lifecycle already replayed from V4 ledgers and records that stronger source
+    contract while retaining the same contradiction and counter gates.
     """
     if availability_mode not in {"strict", "reconstructed"}:
         raise ValueError("Lifecycle reconciliation availability mode is invalid")
@@ -988,6 +1035,35 @@ def _write_lifecycle_reconciliation(
             "Incident V4 lifecycle reconciliation requires checkpoint columns: "
             + ", ".join(missing_weekly)
         )
+    pressure_decision_week = (
+        "CAST(p.pressure_knowledge_time AS DATE) BETWEEN m.story_week "
+        "AND m.story_week + INTERVAL 6 DAY"
+        if native_replay
+        else "p.pressure_observation_date BETWEEN m.story_week "
+        "AND m.story_week + INTERVAL 6 DAY"
+    )
+    s2_decision_week = (
+        "a.knowledge_date BETWEEN p.story_week AND p.story_week + INTERVAL 6 DAY"
+        if native_replay
+        else "(a.spectral_source_date BETWEEN p.story_week "
+        "AND p.story_week + INTERVAL 6 DAY OR (a.knowledge_date BETWEEN "
+        "p.story_week AND p.story_week + INTERVAL 6 DAY "
+        "AND a.spectral_source_date < p.story_week))"
+    )
+    source_state_preserved = "FALSE" if native_replay else "TRUE"
+    native_lifecycle_replayed = "TRUE" if native_replay else "FALSE"
+    active_quiet_status = (
+        "active_field_pressure_present_after_component_absence_replay"
+        if native_replay
+        else "active_field_pressure_component_absence_not_replayed"
+    )
+    reconciliation_scope = (
+        "V4-native lifecycle, component absence, coverage registries, and policy "
+        "replayed upstream; positive claims and membership counters reconciled"
+        if native_replay
+        else "positive V3 pressure/response claims only; component absence, "
+        "coverage thresholds, registries, and lifecycle policy are not replayed"
+    )
 
     connection.execute(
         f"""
@@ -1040,30 +1116,34 @@ def _write_lifecycle_reconciliation(
                   ON p.field_id = m.field_id
                  AND p.crop_instance_id = m.crop_instance_id
                  AND p.hazard_family = m.hazard_family
-                 AND p.pressure_observation_date BETWEEN m.story_week
-                     AND m.story_week + INTERVAL 6 DAY
+                 AND {pressure_decision_week}
                  AND p.pressure_knowledge_time <= m.story_known_time
                 GROUP BY ALL
             ), member_support AS (
                 SELECT p.*,
                     COUNT(a.acquisition_id) FILTER (
                         WHERE a.new_response_evidence
-                          AND a.response_class = p.response_class
+                          AND (
+                              (
+                                  a.response_class IN (
+                                      'medium_decline', 'severe_decline'
+                                  )
+                                  AND p.response_class IN (
+                                      'medium_decline', 'severe_decline'
+                                  )
+                              )
+                              OR (
+                                  a.response_class = 'recovery'
+                                  AND p.response_class = 'recovery'
+                              )
+                          )
                     )::BIGINT AS matching_s2_response_count
                 FROM pressure_support AS p
                 LEFT JOIN s2_updates_v4 AS a
-                  ON a.field_id = p.field_id
+                 ON a.field_id = p.field_id
                  AND a.crop_instance_id = p.crop_instance_id
                  AND a.knowledge_time <= p.story_known_time
-                 AND (
-                     a.spectral_source_date BETWEEN p.story_week
-                         AND p.story_week + INTERVAL 6 DAY
-                     OR (
-                         a.knowledge_date BETWEEN p.story_week
-                             AND p.story_week + INTERVAL 6 DAY
-                         AND a.spectral_source_date < p.story_week
-                     )
-                 )
+                 AND {s2_decision_week}
                 GROUP BY ALL
             ), membership_evidence AS (
                 SELECT incident_id, story_week,
@@ -1261,7 +1341,7 @@ def _write_lifecycle_reconciliation(
                     WHEN missing_weather_member_field_count > 0
                         THEN 'missing_weather'
                     WHEN observed_active_member_field_count > 0
-                        THEN 'active_field_pressure_component_absence_not_replayed'
+                        THEN '{active_quiet_status}'
                     ELSE 'observed_quiet_for_attributed_members'
                 END AS quiet_evidence_status,
                 CASE WHEN contradiction_count > 0 THEN 'contradiction'
@@ -1269,16 +1349,12 @@ def _write_lifecycle_reconciliation(
                         THEN 'strict_positive_claims_reconciled'
                     ELSE 'diagnostic_positive_claims_reconciled'
                 END AS reconciliation_status,
-                TRUE AS source_state_preserved,
-                FALSE AS lifecycle_state_recomputed,
-                FALSE AS component_absence_replayed,
-                FALSE AS full_lifecycle_replay_supported,
-                FALSE AS lifecycle_causal_claim_supported,
-                CAST(
-                    'positive V3 pressure/response claims only; component absence, '
-                    'coverage thresholds, registries, and lifecycle policy are not replayed'
-                    AS VARCHAR
-                ) AS reconciliation_scope
+                {source_state_preserved} AS source_state_preserved,
+                {native_lifecycle_replayed} AS lifecycle_state_recomputed,
+                {native_lifecycle_replayed} AS component_absence_replayed,
+                {native_lifecycle_replayed} AS full_lifecycle_replay_supported,
+                {native_lifecycle_replayed} AS lifecycle_causal_claim_supported,
+                CAST('{reconciliation_scope}' AS VARCHAR) AS reconciliation_scope
             FROM scored
             ORDER BY story_week, incident_id
         ) TO ? (FORMAT PARQUET, COMPRESSION ZSTD)
@@ -1677,7 +1753,10 @@ def _write_daily_timeline(
 
 
 def _validate_outputs(
-    connection: duckdb.DuckDBPyConnection, stage: Path
+    connection: duckdb.DuckDBPyConnection,
+    stage: Path,
+    *,
+    native_replay: bool = False,
 ) -> dict[str, Any]:
     counts: dict[str, int] = {}
     for name, filename in OUTPUT_FILES.items():
@@ -1742,6 +1821,7 @@ def _validate_outputs(
         invalid_lifecycle_contract,
         quiet_observed_checkpoints,
         quiet_missing_checkpoints,
+        full_replay_supported_checkpoints,
     ) = (
         int(value or 0) for value in connection.execute(
             """
@@ -1749,20 +1829,26 @@ def _validate_outputs(
                 COUNT_IF(contradiction_count > 0),
                 COUNT_IF(
                     schema_version <> ?
-                    OR NOT source_state_preserved
-                    OR lifecycle_state_recomputed
-                    OR component_absence_replayed
-                    OR full_lifecycle_replay_supported
-                    OR lifecycle_causal_claim_supported
+                    OR source_state_preserved IS DISTINCT FROM ?
+                    OR lifecycle_state_recomputed IS DISTINCT FROM ?
+                    OR component_absence_replayed IS DISTINCT FROM ?
+                    OR full_lifecycle_replay_supported IS DISTINCT FROM ?
+                    OR lifecycle_causal_claim_supported IS DISTINCT FROM ?
                     OR positive_claim_reconciliation_complete
                         IS DISTINCT FROM (contradiction_count = 0)
                 ),
                 COUNT_IF(quiet_evidence_status = 'observed_quiet_for_attributed_members'),
-                COUNT_IF(quiet_evidence_status = 'missing_weather')
+                COUNT_IF(quiet_evidence_status = 'missing_weather'),
+                COUNT_IF(full_lifecycle_replay_supported)
             FROM read_parquet(?)
             """,
             [
                 LIFECYCLE_RECONCILIATION_SCHEMA_VERSION,
+                not native_replay,
+                native_replay,
+                native_replay,
+                native_replay,
+                native_replay,
                 str(stage / OUTPUT_FILES["lifecycle_reconciliation"]),
             ],
         ).fetchone()
@@ -1830,7 +1916,7 @@ def _validate_outputs(
         "story_checkpoint_incomplete_bound_count": incomplete_story_bound,
         "lifecycle_reconciliation_count": counts["lifecycle_reconciliation"],
         "lifecycle_reconciliation_contradiction_count": lifecycle_contradictions,
-        "lifecycle_full_replay_supported_count": 0,
+        "lifecycle_full_replay_supported_count": full_replay_supported_checkpoints,
         "lifecycle_quiet_observed_checkpoint_count": quiet_observed_checkpoints,
         "lifecycle_quiet_missing_checkpoint_count": quiet_missing_checkpoints,
         "counts": counts,
@@ -1850,6 +1936,7 @@ def _manifest(
     display_grid_degrees: float,
     freshness_fresh_days: int,
     freshness_aging_days: int,
+    native_replay: bool = False,
 ) -> dict[str, Any]:
     artifacts = _inventory(stage)
     content_hash = hashlib.sha256(
@@ -1869,6 +1956,7 @@ def _manifest(
             "viewer_ready": True,
             "dual_clock": True,
             "daily_timeline": True,
+            "native_replay": native_replay,
             "map_publication_approved": False,
             "publication_status": PUBLICATION_STATUS,
         }
@@ -1889,9 +1977,22 @@ def _manifest(
                 source_generation_dir / "manifest.json"
             ),
             "bundle_content_sha256": content_hash,
+            **(
+                {
+                    "incident_manifest_mode": NATIVE_REPLAY_INCIDENT_MODE,
+                    "incident_manifest_schema_version": (
+                        NATIVE_REPLAY_INCIDENT_SCHEMA_VERSION
+                    ),
+                }
+                if native_replay
+                else {}
+            ),
         },
         "semantics": {
             **dict(base_manifest.get("semantics") or {}),
+            "story_spine_source": (
+                "v4_native_story_replay" if native_replay else "v3_story_projection"
+            ),
             "calendar_clock": "daily_as_of_date",
             "pressure_clock": (
                 "effective_weather_observation_visible_no_earlier_than_knowledge_time"
@@ -1908,17 +2009,29 @@ def _manifest(
             ),
             "story_checkpoint_full_timestamp_preserved": True,
             "lifecycle_evidence_reconciliation": (
-                "fail_closed_positive_v3_pressure_and_response_claims_against_v4_ledgers"
+                "fail_closed_native_lifecycle_claims_against_v4_ledgers"
+                if native_replay
+                else "fail_closed_positive_v3_pressure_and_response_claims_against_v4_ledgers"
             ),
             "lifecycle_reconciliation_schema_version": (
                 LIFECYCLE_RECONCILIATION_SCHEMA_VERSION
             ),
-            "lifecycle_state_recomputed_from_v4": False,
-            "lifecycle_causal_ownership_claimed": False,
-            "component_absence_replayed_from_v4": False,
+            "lifecycle_state_recomputed_from_v4": native_replay,
+            "component_absence_replayed_from_v4": native_replay,
+            "source_state_preserved": not native_replay,
+            "full_lifecycle_replay_supported": native_replay,
+            "lifecycle_causal_ownership_claimed": native_replay,
             "lifecycle_reconciliation_scope": (
-                "positive_claims_only_component_absence_coverage_registries_"
+                "native_lifecycle_component_absence_coverage_registries_"
+                "and_policy_replayed_upstream"
+                if native_replay
+                else "positive_claims_only_component_absence_coverage_registries_"
                 "and_policy_not_replayed"
+            ),
+            "decision_week_evidence_attribution": (
+                "evidence_knowledge_time"
+                if native_replay
+                else "effective_or_source_date_with_late_known_s2_support"
             ),
             "strict_checkpoint_bound_enforced": (
                 evidence_validation.get("availability_mode") == "strict"
@@ -1956,7 +2069,11 @@ def _manifest(
         },
         "artifacts": artifacts,
         "warning": (
-            "Incident V4 is a dual-clock diagnostic viewer. Freshness, lifecycle, "
+            "Incident V4 is a native-replay dual-clock diagnostic viewer. Freshness "
+            "and response thresholds remain uncalibrated; pressure is a field-risk "
+            "signal unless an independently identified weather-grid source is supplied."
+            if native_replay
+            else "Incident V4 is a dual-clock diagnostic viewer. Freshness, lifecycle, "
             "and response thresholds remain uncalibrated; pressure is a field-risk "
             "signal unless an independently identified weather-grid source is supplied."
         ),
@@ -1999,12 +2116,23 @@ def validate_viewer_directory(viewer_dir: Path) -> dict[str, Any]:
         raise ValueError("V4 viewer schema_version does not match the validator")
     if str(manifest.get("mode") or run.get("mode") or "") != MODE:
         raise ValueError("Viewer manifest is not a dual-clock Incident V4 bundle")
+    native_replay_value = run.get("native_replay", False)
+    if not isinstance(native_replay_value, bool):
+        raise ValueError("V4 viewer native_replay marker must be boolean")
+    native_replay = native_replay_value
     if (
         run.get("status") != "complete"
         or run.get("immutable") is not True
         or run.get("viewer_ready") is not True
     ):
         raise ValueError("V4 viewer manifest is not complete, immutable, and ready")
+    source = manifest.get("source") or {}
+    if native_replay and (
+        source.get("incident_manifest_mode") != NATIVE_REPLAY_INCIDENT_MODE
+        or source.get("incident_manifest_schema_version")
+        != NATIVE_REPLAY_INCIDENT_SCHEMA_VERSION
+    ):
+        raise ValueError("Native V4 viewer source manifest contract is invalid")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict) or not artifacts:
         raise ValueError("V4 viewer manifest has no artifact inventory")
@@ -2114,11 +2242,11 @@ def validate_viewer_directory(viewer_dir: Path) -> dict[str, Any]:
                 SELECT
                     COUNT_IF(
                         schema_version <> ?
-                        OR NOT source_state_preserved
-                        OR lifecycle_state_recomputed
-                        OR component_absence_replayed
-                        OR full_lifecycle_replay_supported
-                        OR lifecycle_causal_claim_supported
+                        OR source_state_preserved IS DISTINCT FROM ?
+                        OR lifecycle_state_recomputed IS DISTINCT FROM ?
+                        OR component_absence_replayed IS DISTINCT FROM ?
+                        OR full_lifecycle_replay_supported IS DISTINCT FROM ?
+                        OR lifecycle_causal_claim_supported IS DISTINCT FROM ?
                         OR positive_claim_reconciliation_complete
                             IS DISTINCT FROM (contradiction_count = 0)
                     ),
@@ -2127,6 +2255,11 @@ def validate_viewer_directory(viewer_dir: Path) -> dict[str, Any]:
                 """,
                 [
                     LIFECYCLE_RECONCILIATION_SCHEMA_VERSION,
+                    not native_replay,
+                    native_replay,
+                    native_replay,
+                    native_replay,
+                    native_replay,
                     str(root / lifecycle_name),
                 ],
             ).fetchone()
@@ -2182,18 +2315,27 @@ def validate_viewer_directory(viewer_dir: Path) -> dict[str, Any]:
     if content_sha != str((manifest.get("source") or {}).get("bundle_content_sha256") or ""):
         raise ValueError("V4 viewer bundle content hash does not match its inventory")
     semantics = manifest.get("semantics") or {}
+    source_state_preserved = semantics.get(
+        "source_state_preserved", True if not native_replay else None
+    )
+    full_lifecycle_replay_supported = semantics.get(
+        "full_lifecycle_replay_supported", False if not native_replay else None
+    )
     if (
         semantics.get("lifecycle_reconciliation_schema_version")
         != LIFECYCLE_RECONCILIATION_SCHEMA_VERSION
-        or semantics.get("lifecycle_state_recomputed_from_v4") is not False
-        or semantics.get("lifecycle_causal_ownership_claimed") is not False
-        or semantics.get("component_absence_replayed_from_v4") is not False
+        or semantics.get("lifecycle_state_recomputed_from_v4") is not native_replay
+        or semantics.get("component_absence_replayed_from_v4") is not native_replay
+        or source_state_preserved is not (not native_replay)
+        or full_lifecycle_replay_supported is not native_replay
+        or semantics.get("lifecycle_causal_ownership_claimed") is not native_replay
     ):
         raise ValueError("V4 viewer lifecycle reconciliation semantics are invalid")
     return {
         "status": "valid",
         "schema_version": SCHEMA_VERSION,
         "mode": MODE,
+        "native_replay": native_replay,
         "artifact_count": len(manifest_names),
         "parquet_count": len(verified_rows),
         "total_size_bytes": total_bytes,

@@ -1,5 +1,21 @@
 # V4 story replay handoff — 2026-07-07
 
+## Implementation status
+
+The requested separate path is now implemented in
+`story_monitor/incident_story_replay_v4.py` and
+`run_incident_story_replay_v4.py`. It uses seven immutable checkpoints, a
+day-major multi-hazard V4 context adapter, an audit-only old-to-new crosswalk,
+and the native mode of `export_incident_viewer_v4.py`. The isolated VM entry
+point is `server/vm_story_pipeline.sh replay-v4 .env.vm`; it cannot reach the
+old evidence build, failed-job resume/continue path, server launch, benchmark,
+or motif training.
+
+This records implementation completion, not VM acceptance. The preserved
+evidence and failed job below have not been mutated. Run the new path and
+accept its zero-contradiction/count reconciliation and trajectories before any
+motif retraining or promotion.
+
 ## Current stopping point
 
 Do **not** resume the failed V4 viewer export and do **not** run the outer

@@ -7,11 +7,14 @@ artifacts with DuckDB.
 ## Crop-impact Incident V4 authority
 
 [`CROP_INCIDENT_STORIES_V4.md`](CROP_INCIDENT_STORIES_V4.md) is the current
-monitoring contract. V4 retains the stable V3 crop-incident identity while
+monitoring contract. V4 retains the deterministic V3 identity hierarchy while
 separating daily weather pressure, irregular acquisition-grain crop evidence,
-and knowledge-gated weekly story checkpoints. The map uses a daily playhead,
-shows crop stage, preserves simultaneous hazard lanes, reports rejected S2
-attempts, and never treats echoed spectral values as new observations.
+and knowledge-gated weekly story checkpoints. If an old V3 spine fails V4
+reconciliation, `run_incident_story_replay_v4.py` recomputes new identities
+from the V4 ledgers and publishes the old IDs only in an audit crosswalk. The
+map uses a daily playhead, shows crop stage, preserves simultaneous hazard
+lanes, reports rejected S2 attempts, and never treats echoed spectral values as
+new observations.
 
 Use [`INCIDENT_V4_VM_RUNBOOK.md`](INCIDENT_V4_VM_RUNBOOK.md) for the exact
 durable source-preparation/build/serve/benchmark sequence. Point

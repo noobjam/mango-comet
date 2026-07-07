@@ -8,6 +8,7 @@ import unittest
 import pandas as pd
 
 from story_monitor.incident_story_states_v3 import (
+    _augment_followup_memberships,
     _reconcile_direct_unresolved_claims,
     build_crop_story_artifacts,
     build_crop_story_scaffold,
@@ -17,6 +18,202 @@ from story_monitor.incident_story_states_v3 import (
 
 
 class IncidentStoryStatesV3Tests(unittest.TestCase):
+    def test_followup_merges_into_canonical_membership_and_reconciles_count(self) -> None:
+        week = pd.Timestamp("2026-01-19")
+        membership = pd.DataFrame(
+            [
+                {
+                    "timeline_bucket": week,
+                    "incident_id": "incident-1",
+                    "exposure_id": "exposure-1",
+                    "component_id": "component-1",
+                    "crop_name_normalized": "maize",
+                    "hazard_family": "heat",
+                    "field_id": "field-1",
+                    "crop_instance_id": "crop-1",
+                    "episode_id": "episode-1",
+                    "membership_role": "pressure_core",
+                    "event_state": "ACTIVE",
+                    "response_class": "no_new_event_response",
+                    "fresh_response_evidence": False,
+                    "evaluable": True,
+                    "is_data_gap": False,
+                    "stage_bucket": "flowering",
+                    "grid_id": "g:1:1",
+                    "knowledge_time": week,
+                }
+            ]
+        )
+        followup = pd.DataFrame(
+            [
+                {
+                    "timeline_bucket": week,
+                    "incident_id": "incident-1",
+                    "field_id": "field-1",
+                    "crop_instance_id": "crop-1",
+                    "episode_id": "episode-1",
+                    "hazard_family": "heat",
+                    "event_state": "ACTIVE",
+                    "response_class": "medium_decline",
+                    "stage_bucket": "flowering",
+                    "knowledge_time": week + pd.Timedelta(hours=8),
+                    "fresh_decline_evidence": True,
+                    "fresh_recovery_evidence": False,
+                }
+            ]
+        )
+
+        merged = _augment_followup_memberships(
+            membership, followup, {("incident-1", week)}
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged.iloc[0]["membership_role"], "pressure_core")
+        self.assertTrue(bool(merged.iloc[0]["fresh_response_evidence"]))
+        self.assertEqual(merged.iloc[0]["response_class"], "medium_decline")
+        source_fresh_decline_field_count = 1
+        membership_fresh_decline_field_count = merged.loc[
+            merged["fresh_response_evidence"].astype(bool)
+            & merged["response_class"].isin({"medium_decline", "severe_decline"}),
+            "field_id",
+        ].nunique()
+        self.assertEqual(
+            membership_fresh_decline_field_count,
+            source_fresh_decline_field_count,
+        )
+
+    def test_followup_merge_rejects_identity_and_response_conflicts(self) -> None:
+        week = pd.Timestamp("2026-01-19")
+        membership = pd.DataFrame(
+            [
+                {
+                    "timeline_bucket": week,
+                    "incident_id": "incident-1",
+                    "exposure_id": "exposure-1",
+                    "component_id": "component-1",
+                    "crop_name_normalized": "maize",
+                    "hazard_family": "heat",
+                    "field_id": "field-1",
+                    "crop_instance_id": "crop-1",
+                    "episode_id": "episode-1",
+                    "membership_role": "pressure_core",
+                    "event_state": "ACTIVE",
+                    "response_class": "recovery",
+                    "fresh_response_evidence": True,
+                    "evaluable": True,
+                    "is_data_gap": False,
+                    "stage_bucket": "flowering",
+                    "grid_id": "g:1:1",
+                    "knowledge_time": week,
+                }
+            ]
+        )
+        followup = pd.DataFrame(
+            [
+                {
+                    "timeline_bucket": week,
+                    "incident_id": "incident-1",
+                    "field_id": "field-1",
+                    "crop_instance_id": "crop-1",
+                    "episode_id": "episode-1",
+                    "hazard_family": "heat",
+                    "event_state": "ACTIVE",
+                    "response_class": "medium_decline",
+                    "stage_bucket": "flowering",
+                    "knowledge_time": week,
+                    "fresh_decline_evidence": True,
+                    "fresh_recovery_evidence": False,
+                }
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "response conflict"):
+            _augment_followup_memberships(
+                membership, followup, {("incident-1", week)}
+            )
+
+        wrong_episode = followup.copy()
+        wrong_episode["episode_id"] = "episode-other"
+        stale_membership = membership.assign(
+            response_class="no_new_event_response",
+            fresh_response_evidence=False,
+        )
+        with self.assertRaisesRegex(ValueError, "identity conflict.*episode_id"):
+            _augment_followup_memberships(
+                stale_membership, wrong_episode, {("incident-1", week)}
+            )
+
+    def test_new_followups_are_canonical_by_story_week_and_field(self) -> None:
+        week = pd.Timestamp("2026-01-19")
+        membership = pd.DataFrame(
+            [
+                {
+                    "timeline_bucket": week,
+                    "incident_id": "incident-1",
+                    "exposure_id": "exposure-1",
+                    "component_id": "component-1",
+                    "crop_name_normalized": "maize",
+                    "hazard_family": "heat",
+                    "field_id": "field-anchor",
+                    "crop_instance_id": "crop-anchor",
+                    "episode_id": "episode-anchor",
+                    "membership_role": "pressure_core",
+                    "event_state": "ACTIVE",
+                    "response_class": "no_new_event_response",
+                    "fresh_response_evidence": False,
+                    "evaluable": True,
+                    "is_data_gap": False,
+                    "stage_bucket": "flowering",
+                    "grid_id": "g:1:1",
+                    "knowledge_time": week,
+                }
+            ]
+        )
+        followup = pd.DataFrame(
+            [
+                {
+                    "timeline_bucket": week,
+                    "incident_id": "incident-1",
+                    "field_id": "field-new",
+                    "crop_instance_id": "crop-new",
+                    "episode_id": "episode-new",
+                    "hazard_family": "heat",
+                    "event_state": "ACTIVE",
+                    "response_class": response_class,
+                    "stage_bucket": "flowering",
+                    "knowledge_time": week + pd.Timedelta(hours=hours),
+                    "fresh_decline_evidence": True,
+                    "fresh_recovery_evidence": False,
+                }
+                for response_class, hours in (
+                    ("medium_decline", 4),
+                    ("severe_decline", 8),
+                )
+            ]
+        )
+
+        merged = _augment_followup_memberships(
+            membership, followup, {("incident-1", week)}
+        )
+
+        new_membership = merged[merged["field_id"].eq("field-new")]
+        self.assertEqual(len(new_membership), 1)
+        self.assertEqual(new_membership.iloc[0]["response_class"], "severe_decline")
+        self.assertEqual(
+            pd.Timestamp(new_membership.iloc[0]["knowledge_time"]),
+            week + pd.Timedelta(hours=8),
+        )
+        self.assertFalse(
+            merged.duplicated(["incident_id", "timeline_bucket", "field_id"]).any()
+        )
+
+        conflicting = followup.copy()
+        conflicting.loc[1, "episode_id"] = "episode-other"
+        with self.assertRaisesRegex(ValueError, "identity conflict.*episode_id"):
+            _augment_followup_memberships(
+                membership, conflicting, {("incident-1", week)}
+            )
+
     def test_crop_story_confirms_then_closes_without_rewriting_stage_identity(self) -> None:
         weeks = pd.to_datetime(["2026-01-05", "2026-01-12", "2026-01-19", "2026-01-26"])
         exposure_id = "exposure_abc"
@@ -341,6 +538,7 @@ class IncidentStoryStatesV3Tests(unittest.TestCase):
                 {
                     "timeline_bucket": "2026-01-12", "event_id": "episode-1",
                     "snapshot_as_of_date": "2026-01-14",
+                    "knowledge_time": "2026-01-16T18:00:00Z",
                     "field_id": "field-1", "crop_instance_id": "crop-1",
                     "hazard_family": "heat", "event_state": "RECOVERING",
                     "signal_response_class": "recovery",
@@ -349,6 +547,7 @@ class IncidentStoryStatesV3Tests(unittest.TestCase):
                 {
                     "timeline_bucket": "2026-01-12", "event_id": "unrelated-episode",
                     "snapshot_as_of_date": "2026-01-14",
+                    "knowledge_time": "2026-01-17T18:00:00Z",
                     "field_id": "field-1", "crop_instance_id": "crop-1",
                     "hazard_family": "heat", "event_state": "SEVERE",
                     "signal_response_class": "severe_decline",
@@ -366,6 +565,10 @@ class IncidentStoryStatesV3Tests(unittest.TestCase):
         self.assertEqual(followup.iloc[0]["episode_id"], "episode-1")
         self.assertTrue(bool(followup.iloc[0]["fresh_recovery_evidence"]))
         self.assertFalse(bool(followup.iloc[0]["fresh_decline_evidence"]))
+        self.assertEqual(
+            pd.to_datetime(followup.iloc[0]["knowledge_time"], utc=True),
+            pd.Timestamp("2026-01-16T18:00:00Z"),
+        )
 
     def test_carried_unresolved_impact_cell_remains_in_exact_footprint(self) -> None:
         weeks = pd.to_datetime(["2026-01-05", "2026-01-12"])

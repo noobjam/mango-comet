@@ -13,6 +13,7 @@ import unittest
 import duckdb
 import pandas as pd
 
+from export_incident_viewer_v4 import build_parser
 from story_map_server import (
     ResourceNotFoundError,
     Settings,
@@ -21,6 +22,8 @@ from story_map_server import (
 )
 from story_monitor.incident_viewer_v4 import (
     LIFECYCLE_RECONCILIATION_SCHEMA_VERSION,
+    NATIVE_REPLAY_INCIDENT_MODE,
+    NATIVE_REPLAY_INCIDENT_SCHEMA_VERSION,
     _write_daily_grid,
     export_incident_viewer_v4,
     validate_viewer_directory,
@@ -53,6 +56,7 @@ class IncidentViewerV4Tests(unittest.TestCase):
             )
 
             self.assertEqual(result["mode"], "crop_incident_v4_dual_clock")
+            self.assertFalse(result["native_replay"])
             self.assertEqual(validate_viewer_directory(output)["status"], "valid")
             lifecycle = pd.read_parquet(
                 output / "lifecycle_reconciliation_v4.parquet"
@@ -62,7 +66,10 @@ class IncidentViewerV4Tests(unittest.TestCase):
                 {LIFECYCLE_RECONCILIATION_SCHEMA_VERSION},
             )
             self.assertTrue(lifecycle["positive_claim_reconciliation_complete"].all())
+            self.assertTrue(lifecycle["source_state_preserved"].all())
             self.assertFalse(lifecycle["lifecycle_state_recomputed"].any())
+            self.assertFalse(lifecycle["component_absence_replayed"].any())
+            self.assertFalse(lifecycle["full_lifecycle_replay_supported"].any())
             self.assertFalse(lifecycle["lifecycle_causal_claim_supported"].any())
             quiet = lifecycle[
                 lifecycle["story_week"].astype(str).eq("2025-01-13")
@@ -354,6 +361,128 @@ class IncidentViewerV4Tests(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
                 thread.join(timeout=3)
+
+    def test_native_replay_requires_native_incident_manifest_contract(self) -> None:
+        for key, invalid in (
+            ("mode", "crop_incident_v3"),
+            ("schema_version", "crop-impact-incident-v3/1"),
+        ):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "source"
+                incident = root / "incident"
+                evidence = root / "evidence"
+                output = root / "viewer-v4"
+                _write_source(source)
+                _write_incident(incident, source)
+                _write_evidence(evidence)
+                _mark_incident_native(incident)
+                manifest_path = incident / "manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest[key] = invalid
+                manifest_path.write_text(
+                    json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError, "crop_incident_story_replay_v4"
+                ):
+                    export_incident_viewer_v4(
+                        incident,
+                        evidence,
+                        source,
+                        output,
+                        threads=1,
+                        min_valid_geometry_coverage=1.0,
+                        min_frame_geometry_coverage=1.0,
+                        native_replay=True,
+                    )
+                self.assertFalse(output.exists())
+
+    def test_native_replay_uses_decision_week_knowledge_and_reports_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            incident = root / "incident"
+            evidence = root / "evidence"
+            output = root / "viewer-v4"
+            _write_source(source)
+            _write_incident(incident, source)
+            _write_evidence(evidence)
+
+            weekly_path = incident / "incident_weekly_state.parquet"
+            weekly = pd.read_parquet(weekly_path)
+            decision_week = weekly["timeline_bucket"].astype(str).eq("2025-01-13")
+            weekly.loc[decision_week, "fresh_recovery_field_count"] = 1
+            weekly.to_parquet(weekly_path, index=False)
+            membership_path = incident / "incident_membership.parquet"
+            membership = pd.read_parquet(membership_path)
+            decision_member = membership["timeline_bucket"].astype(str).eq(
+                "2025-01-13"
+            )
+            membership.loc[decision_member, "fresh_response_evidence"] = True
+            membership.loc[decision_member, "response_class"] = "recovery"
+            membership.to_parquet(membership_path, index=False)
+            _refresh_artifact_hashes(incident, weekly_path, membership_path)
+            _mark_incident_native(incident)
+
+            s2_path = evidence / "field_s2_acquisition_v4.parquet"
+            s2 = pd.read_parquet(s2_path)
+            recovery = s2["acquisition_id"].eq("s2-2025-01-23-field-1")
+            s2.loc[recovery, "spectral_source_date"] = "2025-01-12"
+            s2.loc[recovery, "knowledge_time"] = "2025-01-13 10:45:00"
+            s2.to_parquet(s2_path, index=False)
+            _refresh_evidence_artifacts(evidence)
+
+            result = export_incident_viewer_v4(
+                incident,
+                evidence,
+                source,
+                output,
+                threads=1,
+                min_valid_geometry_coverage=1.0,
+                min_frame_geometry_coverage=1.0,
+                native_replay=True,
+            )
+
+            self.assertTrue(result["native_replay"])
+            validated = validate_viewer_directory(output)
+            self.assertTrue(validated["native_replay"])
+            manifest = json.loads((output / "manifest.json").read_text())
+            semantics = manifest["semantics"]
+            self.assertTrue(semantics["lifecycle_state_recomputed_from_v4"])
+            self.assertTrue(semantics["component_absence_replayed_from_v4"])
+            self.assertFalse(semantics["source_state_preserved"])
+            self.assertTrue(semantics["full_lifecycle_replay_supported"])
+            checkpoints = pd.read_parquet(output / "story_checkpoints_v4.parquet")
+            checkpoint = checkpoints[
+                checkpoints["story_week"].astype(str).eq("2025-01-13")
+            ].iloc[0]
+            self.assertEqual(
+                str(checkpoint["s2_response_knowledge_time"]),
+                "2025-01-13 10:45:00",
+            )
+            self.assertTrue(checkpoint["knowledge_bound_complete"])
+            lifecycle = pd.read_parquet(
+                output / "lifecycle_reconciliation_v4.parquet"
+            )
+            self.assertFalse(lifecycle["source_state_preserved"].any())
+            self.assertTrue(lifecycle["lifecycle_state_recomputed"].all())
+            self.assertTrue(lifecycle["component_absence_replayed"].all())
+            self.assertTrue(lifecycle["full_lifecycle_replay_supported"].all())
+
+    def test_native_replay_cli_flag_is_explicit(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--incident-dir", "incident",
+                "--evidence-dir", "evidence",
+                "--source-generation-dir", "source",
+                "--output-dir", "viewer",
+                "--native-replay",
+            ]
+        )
+        self.assertTrue(args.native_replay)
 
     def test_source_and_knowledge_clocks_are_preserved_without_daily_collapse(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -778,6 +907,117 @@ class IncidentViewerV4Tests(unittest.TestCase):
                 )
             self.assertFalse(output.exists())
 
+    def test_lifecycle_reconciliation_matches_decline_as_a_response_family(self) -> None:
+        for member_response, s2_response in (
+            ("medium_decline", "severe_decline"),
+            ("severe_decline", "medium_decline"),
+        ):
+            with self.subTest(
+                member_response=member_response, s2_response=s2_response
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "source"
+                incident = root / "incident"
+                evidence = root / "evidence"
+                output = root / "viewer-v4"
+                _write_source(source)
+                _write_incident(incident, source)
+                _write_evidence(evidence)
+
+                weekly_path = incident / "incident_weekly_state.parquet"
+                weekly = pd.read_parquet(weekly_path)
+                second_week = weekly["timeline_bucket"].astype(str).eq("2025-01-13")
+                weekly.loc[second_week, "fresh_decline_field_count"] = 1
+                weekly.to_parquet(weekly_path, index=False)
+
+                membership_path = incident / "incident_membership.parquet"
+                membership = pd.read_parquet(membership_path)
+                decline_member = membership["timeline_bucket"].astype(str).eq(
+                    "2025-01-13"
+                )
+                membership.loc[decline_member, "fresh_response_evidence"] = True
+                membership.loc[decline_member, "response_class"] = member_response
+                membership.to_parquet(membership_path, index=False)
+                _refresh_artifact_hashes(incident, weekly_path, membership_path)
+
+                s2_path = evidence / "field_s2_acquisition_v4.parquet"
+                s2 = pd.read_parquet(s2_path)
+                candidate = s2["acquisition_id"].eq("s2-2025-01-23-field-1")
+                s2.loc[candidate, "spectral_source_date"] = "2025-01-13"
+                s2.loc[candidate, "knowledge_time"] = "2025-01-13"
+                s2.loc[candidate, "response_class"] = s2_response
+                s2.to_parquet(s2_path, index=False)
+                _refresh_evidence_artifacts(evidence)
+
+                export_incident_viewer_v4(
+                    incident, evidence, source, output, threads=1,
+                    min_valid_geometry_coverage=1.0,
+                    min_frame_geometry_coverage=1.0,
+                )
+                lifecycle = pd.read_parquet(
+                    output / "lifecycle_reconciliation_v4.parquet"
+                )
+                checkpoint = lifecycle[
+                    lifecycle["story_week"].astype(str).eq("2025-01-13")
+                ].iloc[0]
+                self.assertEqual(checkpoint["supported_fresh_decline_field_count"], 1)
+                self.assertEqual(checkpoint["unsupported_fresh_decline_membership_count"], 0)
+
+    def test_lifecycle_reconciliation_does_not_cross_decline_and_recovery(self) -> None:
+        for member_response, s2_response, expected_reason in (
+            ("medium_decline", "recovery", "unsupported_fresh_decline_claim"),
+            ("recovery", "medium_decline", "unsupported_fresh_recovery_claim"),
+        ):
+            with self.subTest(
+                member_response=member_response, s2_response=s2_response
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "source"
+                incident = root / "incident"
+                evidence = root / "evidence"
+                output = root / "viewer-v4"
+                _write_source(source)
+                _write_incident(incident, source)
+                _write_evidence(evidence)
+
+                weekly_path = incident / "incident_weekly_state.parquet"
+                weekly = pd.read_parquet(weekly_path)
+                second_week = weekly["timeline_bucket"].astype(str).eq("2025-01-13")
+                count_column = (
+                    "fresh_recovery_field_count"
+                    if member_response == "recovery"
+                    else "fresh_decline_field_count"
+                )
+                weekly.loc[second_week, count_column] = 1
+                weekly.to_parquet(weekly_path, index=False)
+
+                membership_path = incident / "incident_membership.parquet"
+                membership = pd.read_parquet(membership_path)
+                response_member = membership["timeline_bucket"].astype(str).eq(
+                    "2025-01-13"
+                )
+                membership.loc[response_member, "fresh_response_evidence"] = True
+                membership.loc[response_member, "response_class"] = member_response
+                membership.to_parquet(membership_path, index=False)
+                _refresh_artifact_hashes(incident, weekly_path, membership_path)
+
+                s2_path = evidence / "field_s2_acquisition_v4.parquet"
+                s2 = pd.read_parquet(s2_path)
+                candidate = s2["acquisition_id"].eq("s2-2025-01-23-field-1")
+                s2.loc[candidate, "spectral_source_date"] = "2025-01-13"
+                s2.loc[candidate, "knowledge_time"] = "2025-01-13"
+                s2.loc[candidate, "response_class"] = s2_response
+                s2.to_parquet(s2_path, index=False)
+                _refresh_evidence_artifacts(evidence)
+
+                with self.assertRaisesRegex(ValueError, expected_reason):
+                    export_incident_viewer_v4(
+                        incident, evidence, source, output, threads=1,
+                        min_valid_geometry_coverage=1.0,
+                        min_frame_geometry_coverage=1.0,
+                    )
+                self.assertFalse(output.exists())
+
     def test_lifecycle_reconciliation_distinguishes_quiet_from_missing_weather(self) -> None:
         for missing_weather, expected in (
             (False, "observed_quiet_for_attributed_members"),
@@ -900,6 +1140,17 @@ class IncidentViewerV4Tests(unittest.TestCase):
                     min_frame_geometry_coverage=1.0,
                 )
             self.assertFalse(output.exists())
+
+
+def _mark_incident_native(root: Path) -> None:
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["mode"] = NATIVE_REPLAY_INCIDENT_MODE
+    manifest["schema_version"] = NATIVE_REPLAY_INCIDENT_SCHEMA_VERSION
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _write_evidence(root: Path) -> None:

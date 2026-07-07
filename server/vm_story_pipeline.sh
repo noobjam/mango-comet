@@ -10,6 +10,8 @@ usage() {
 Usage:
   server/vm_story_pipeline.sh launch [ENV_FILE]
   server/vm_story_pipeline.sh continue [ENV_FILE]
+  server/vm_story_pipeline.sh replay-v4 [ENV_FILE]
+  server/vm_story_pipeline.sh replay-v4-status [ENV_FILE]
   server/vm_story_pipeline.sh status [ENV_FILE]
   server/vm_story_pipeline.sh logs [ENV_FILE]
   server/vm_story_pipeline.sh check-node [ENV_FILE]
@@ -27,6 +29,10 @@ continue is a fail-closed recovery path for the latest outer pipeline only. It
 requires that the same-tag Incident V4 runner was resumed separately and is
 complete, then runs validation, server startup, and benchmarking without
 building V3, preparing a source, or rebuilding V4 evidence.
+
+replay-v4 starts a detached V4-native story replay from immutable V4 evidence,
+geometry, and an audit-only V3 incident release. replay-v4-status reports the
+latest replay runner job without entering the legacy pipeline.
 
 The default ENV_FILE is REPO/.env.vm. It is gitignored.
 EOF
@@ -166,6 +172,42 @@ preflight() {
     fail "repository is older than required commit $REQUIRED_COMMIT; run git pull --ff-only"
   mkdir -p "$ROOT/duckdb_tmp" "$ROOT/logs" "$ROOT/jobs" \
     "$ROOT/releases" "$ROOT/sources" "$ROOT/models" "$ROOT/evaluations"
+}
+
+replay_v4_preflight() {
+  for name in \
+    REPO PYTHON NODE ROOT \
+    V4_EVIDENCE_DIR V4_REPLAY_GEOMETRY_PARQUET V4_AUDIT_INCIDENT_DIR \
+    V4_REPLAY_BASELINE_THROUGH V4_REPLAY_PARTITIONS \
+    DUCKDB_THREADS DUCKDB_MEMORY_LIMIT HEARTBEAT_SECONDS; do
+    require_value "$name"
+  done
+  require_dir REPO
+  require_dir ROOT
+  require_dir V4_EVIDENCE_DIR
+  require_dir V4_AUDIT_INCIDENT_DIR
+  require_file PYTHON
+  require_file NODE
+  require_file V4_REPLAY_GEOMETRY_PARQUET
+  [[ -x "$PYTHON" ]] || fail "PYTHON is not executable: $PYTHON"
+  [[ -x "$NODE" ]] || fail "NODE is not executable: $NODE"
+  [[ "$("$NODE" --version 2>/dev/null || true)" == v* ]] || \
+    fail "NODE does not point to a working Node.js executable: $NODE"
+  [[ -f "$REPO/server/run_incident_story_replay_v4.py" ]] || \
+    fail "V4 story replay runner is missing from REPO"
+  mkdir -p "$ROOT/duckdb_tmp" "$ROOT/logs" "$ROOT/jobs" "$ROOT/releases"
+}
+
+replay_v4_status_preflight() {
+  for name in REPO PYTHON ROOT; do
+    require_value "$name"
+  done
+  require_dir REPO
+  require_dir ROOT
+  require_file PYTHON
+  [[ -x "$PYTHON" ]] || fail "PYTHON is not executable: $PYTHON"
+  [[ -f "$REPO/server/run_incident_story_replay_v4.py" ]] || \
+    fail "V4 story replay runner is missing from REPO"
 }
 
 resolve_compatible_v3_incident_dir() {
@@ -667,6 +709,42 @@ case "$command" in
     printf '%s\n' "$pipeline_pid" > "${base}.pid"
     printf 'Pipeline continuation started.\nTAG=%s\nPID=%s\nLOG=%s.log\n' \
       "$tag" "$pipeline_pid" "$base"
+    ;;
+  replay-v4)
+    replay_v4_preflight
+    exec 8> "$ROOT/logs/vm_story_replay_v4_launch.lock"
+    flock -n 8 || fail "another V4 story replay launch is being prepared"
+    cd "$REPO"
+    tag=$(date -u +%Y%m%dT%H%M%SZ)
+    replay_log="$ROOT/logs/vm_story_replay_v4_${tag}.log"
+    nohup "$PYTHON" server/run_incident_story_replay_v4.py run \
+      --root "$ROOT" \
+      --evidence-dir "$V4_EVIDENCE_DIR" \
+      --geometry-parquet "$V4_REPLAY_GEOMETRY_PARQUET" \
+      --audit-incident-dir "$V4_AUDIT_INCIDENT_DIR" \
+      --baseline-through "$V4_REPLAY_BASELINE_THROUGH" \
+      --python "$PYTHON" \
+      --node "$NODE" \
+      --threads "$DUCKDB_THREADS" \
+      --replay-partitions "$V4_REPLAY_PARTITIONS" \
+      --memory-limit "$DUCKDB_MEMORY_LIMIT" \
+      --temp-dir "$ROOT/duckdb_tmp" \
+      --heartbeat-seconds "$HEARTBEAT_SECONDS" \
+      --job-tag "$tag" \
+      > "$replay_log" 2>&1 < /dev/null &
+    replay_pid=$!
+    printf 'V4 story replay started.\nTAG=%s\nPID=%s\nLOG=%s\n' \
+      "$tag" "$replay_pid" "$replay_log"
+    ;;
+  replay-v4-status)
+    replay_v4_status_preflight
+    replay_pointer="$ROOT/logs/latest_incident_story_replay_v4_job.txt"
+    [[ -s "$replay_pointer" ]] || \
+      fail "no V4 story replay has been launched: $replay_pointer"
+    replay_job=$(tr -d '\r\n' < "$replay_pointer")
+    cd "$REPO"
+    "$PYTHON" server/run_incident_story_replay_v4.py status \
+      --job-dir "$replay_job"
     ;;
   __run)
     [[ $# -eq 3 ]] || fail "invalid internal pipeline invocation"

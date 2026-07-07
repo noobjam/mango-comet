@@ -57,6 +57,7 @@ class IncidentCellsV3Tests(unittest.TestCase):
                             "severe_decline" if week_index and index < 2 else "no_material_change"
                         ),
                         "fresh_response_evidence": bool(week_index and index < 2),
+                        "knowledge_time": f"{week}T18:30:00Z",
                     }
                 )
         context_rows.append(
@@ -107,6 +108,11 @@ class IncidentCellsV3Tests(unittest.TestCase):
             self.assertEqual(len(future_fields), 5)
             self.assertTrue(future_fields["episode_id"].is_unique)
             self.assertEqual(set(future_fields["stage_family"]), {"vegetative"})
+            self.assertTrue(
+                pd.to_datetime(future_fields["knowledge_time"], utc=True)
+                .eq(pd.Timestamp("2026-01-05T18:30:00Z"))
+                .all()
+            )
             repeated = build_weekly_exposure_cells(
                 context_path, lanes_path, baseline, policy=policy, threads=1
             )

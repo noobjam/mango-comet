@@ -337,6 +337,11 @@ def build_incident_followup_evidence(
             "COALESCE(CAST(l.stage_bucket AS VARCHAR), 'unknown')"
             if "stage_bucket" in lane_columns else "CAST('unknown' AS VARCHAR)"
         )
+        knowledge_sql = (
+            "TRY_CAST(l.knowledge_time AS TIMESTAMP)"
+            if "knowledge_time" in lane_columns
+            else "CAST(l.snapshot_as_of_date AS TIMESTAMP)"
+        )
         result = connection.execute(
             f"""
             WITH matched AS (
@@ -348,7 +353,7 @@ def build_incident_followup_evidence(
                     CAST(l.hazard_family AS VARCHAR) AS hazard_family,
                     UPPER(CAST(l.event_state AS VARCHAR)) AS event_state,
                     {stage_sql} AS stage_bucket,
-                    CAST(l.snapshot_as_of_date AS DATE) AS knowledge_time,
+                    {knowledge_sql} AS knowledge_time,
                     {response_sql} AS response_class,
                     {fresh_sql} AS fresh_response_evidence
                 FROM story_weeks w
@@ -1067,8 +1072,8 @@ def _incident_memberships(
         if fallback is not None:
             joined[name] = joined[name].fillna(fallback)
     joined["knowledge_time"] = pd.to_datetime(
-        joined["knowledge_time"], errors="coerce"
-    ).dt.normalize()
+        joined["knowledge_time"], errors="coerce", utc=True
+    ).dt.tz_localize(None)
     if joined.duplicated(["incident_id", "timeline_bucket", "field_id"]).any():
         raise ValueError("Incident membership is not canonical by story, week, and field")
     columns = [
@@ -2011,27 +2016,132 @@ def _augment_followup_memberships(
 ) -> pd.DataFrame:
     if followup.empty:
         return memberships.copy()
-    existing = {
-        (str(row.incident_id), pd.Timestamp(row.timeline_bucket).normalize(), str(row.field_id))
-        for row in memberships[["incident_id", "timeline_bucket", "field_id"]].itertuples(index=False)
-    }
+    output = memberships.copy().reset_index(drop=True)
+    existing: dict[tuple[str, pd.Timestamp, str], int] = {}
+    for index, row in output[
+        ["incident_id", "timeline_bucket", "field_id"]
+    ].iterrows():
+        key = (
+            str(row["incident_id"]),
+            pd.Timestamp(row["timeline_bucket"]).normalize(),
+            str(row["field_id"]),
+        )
+        if key in existing:
+            raise ValueError(
+                "Incident membership is not canonical by story, week, and field"
+            )
+        existing[key] = int(index)
     exposure_by_incident = (
-        memberships.groupby("incident_id", sort=False)["exposure_id"].first().astype(str).to_dict()
+        output.groupby("incident_id", sort=False)["exposure_id"].first().astype(str).to_dict()
     )
     crop_by_incident = (
-        memberships.groupby("incident_id", sort=False)["crop_name_normalized"].first().astype(str).to_dict()
+        output.groupby("incident_id", sort=False)["crop_name_normalized"].first().astype(str).to_dict()
     )
     records: list[dict[str, Any]] = []
+    pending: dict[tuple[str, pd.Timestamp, str], int] = {}
     for row in followup.to_dict("records"):
         incident_id = str(row["incident_id"])
         week = pd.Timestamp(row["timeline_bucket"]).normalize()
         field_id = str(row["field_id"])
-        if (incident_id, week) not in emitted_keys or (incident_id, week, field_id) in existing:
+        if (incident_id, week) not in emitted_keys:
             continue
         decline = bool(row.get("fresh_decline_evidence"))
         recovery = bool(row.get("fresh_recovery_evidence"))
         if not decline and not recovery:
             continue
+        response_class = str(row.get("response_class") or "").lower()
+        incoming_family = _fresh_response_family(response_class)
+        expected_family = "decline" if decline else "recovery"
+        if decline and recovery:
+            raise ValueError(
+                "Follow-up response conflict: decline and recovery are both fresh"
+            )
+        if incoming_family != expected_family:
+            raise ValueError(
+                "Follow-up response conflict: response_class does not match "
+                "fresh response flags"
+            )
+        membership_key = (incident_id, week, field_id)
+        existing_index = existing.get(membership_key)
+        if existing_index is not None:
+            canonical = output.loc[existing_index].to_dict()
+            identity_conflicts = [
+                name
+                for name in ("crop_instance_id", "episode_id", "hazard_family")
+                if str(canonical.get(name) or "") != str(row.get(name) or "")
+            ]
+            if identity_conflicts:
+                raise ValueError(
+                    "Follow-up identity conflict for canonical membership: "
+                    + ", ".join(identity_conflicts)
+                )
+            if bool(canonical.get("fresh_response_evidence")):
+                canonical_family = _fresh_response_family(
+                    str(canonical.get("response_class") or "").lower()
+                )
+                if canonical_family != incoming_family:
+                    raise ValueError(
+                        "Follow-up response conflict with canonical membership"
+                    )
+                if incoming_family == "decline":
+                    response_class = (
+                        "severe_decline"
+                        if "severe_decline"
+                        in {
+                            response_class,
+                            str(canonical.get("response_class") or "").lower(),
+                        }
+                        else "medium_decline"
+                    )
+            output.at[existing_index, "response_class"] = response_class
+            output.at[existing_index, "fresh_response_evidence"] = True
+            output.at[existing_index, "evaluable"] = True
+            output.at[existing_index, "is_data_gap"] = False
+            knowledge_times = [
+                pd.Timestamp(value)
+                for value in (
+                    canonical.get("knowledge_time"), row.get("knowledge_time")
+                )
+                if value is not None and not pd.isna(value)
+            ]
+            if knowledge_times:
+                output.at[existing_index, "knowledge_time"] = max(knowledge_times)
+            continue
+        pending_index = pending.get(membership_key)
+        if pending_index is not None:
+            canonical = records[pending_index]
+            identity_conflicts = [
+                name
+                for name in ("crop_instance_id", "episode_id", "hazard_family")
+                if str(canonical.get(name) or "") != str(row.get(name) or "")
+            ]
+            if identity_conflicts:
+                raise ValueError(
+                    "Follow-up identity conflict for canonical membership: "
+                    + ", ".join(identity_conflicts)
+                )
+            canonical_family = _fresh_response_family(
+                str(canonical.get("response_class") or "").lower()
+            )
+            if canonical_family != incoming_family:
+                raise ValueError(
+                    "Follow-up response conflict with canonical membership"
+                )
+            if incoming_family == "decline" and "severe_decline" in {
+                response_class,
+                str(canonical.get("response_class") or "").lower(),
+            }:
+                response_class = "severe_decline"
+            canonical["response_class"] = response_class
+            knowledge_times = [
+                pd.Timestamp(value)
+                for value in (canonical.get("knowledge_time"), row.get("knowledge_time"))
+                if value is not None and not pd.isna(value)
+            ]
+            if knowledge_times:
+                canonical["knowledge_time"] = max(knowledge_times)
+            continue
+        pending[membership_key] = len(records)
         records.append(
             {
                 "timeline_bucket": week,
@@ -2045,7 +2155,7 @@ def _augment_followup_memberships(
                 "episode_id": str(row["episode_id"]),
                 "membership_role": "unresolved" if decline else "recovered",
                 "event_state": str(row["event_state"]),
-                "response_class": str(row["response_class"]),
+                "response_class": response_class,
                 "fresh_response_evidence": True,
                 "evaluable": True,
                 "is_data_gap": False,
@@ -2055,12 +2165,20 @@ def _augment_followup_memberships(
             }
         )
     if not records:
-        return memberships.copy()
-    output = pd.concat([memberships, pd.DataFrame(records)], ignore_index=True)
+        return output
+    output = pd.concat([output, pd.DataFrame(records)], ignore_index=True)
     return output.sort_values(
         ["timeline_bucket", "incident_id", "membership_role", "field_id"],
         kind="mergesort",
     ).reset_index(drop=True)
+
+
+def _fresh_response_family(response_class: str) -> str | None:
+    if response_class in {"medium_decline", "severe_decline"}:
+        return "decline"
+    if response_class == "recovery":
+        return "recovery"
+    return None
 
 
 def _fallback_stage_summary(scaffold: pd.DataFrame, cells: pd.DataFrame) -> pd.DataFrame:

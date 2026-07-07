@@ -90,11 +90,13 @@ map-ready `STORY_MAP_RUN_DIR`. Use the durable runner and promotion/latency
 gates in the runbook; the intermediate `incidents_v3_*` analytics directory is
 not a drop-in viewer bundle.
 
-Incident V4 keeps that identity and corrects the monitoring clocks: weather is
-daily, Sentinel-2 is acquisition-grain and irregular, and weekly story states
-appear only after their knowledge time. It adds country-scale field coverage,
-daily pressure bands, usable/rejected S2 markers, crop stage, causal story
-drilldown, and a separate review-gated motif-learning workflow. Use
+Incident V4 keeps that identity hierarchy and corrects the monitoring clocks:
+weather is daily, Sentinel-2 is acquisition-grain and irregular, and weekly
+story states appear only after their knowledge time. When an old V3 spine is
+not supportable, the V4-native replay derives new IDs from those ledgers and
+retains old IDs only in an overlap crosswalk. V4 adds country-scale field
+coverage, daily pressure bands, usable/rejected S2 markers, crop stage, causal
+story drilldown, and a separate review-gated motif-learning workflow. Use
 [`server/INCIDENT_V4_VM_RUNBOOK.md`](server/INCIDENT_V4_VM_RUNBOOK.md) for the
 single durable VM sequence and
 [`server/CROP_INCIDENT_STORIES_V4.md`](server/CROP_INCIDENT_STORIES_V4.md) for

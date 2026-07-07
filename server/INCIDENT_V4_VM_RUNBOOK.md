@@ -2,8 +2,10 @@
 
 This is the no-shortcut path for the current VM. It prepares a rich daily
 source, keeps daily weather and irregular Sentinel-2 on separate evidence
-clocks, projects the immutable weekly V3 story spine onto a daily playhead,
-exports the map bundle, verifies it, and measures real latency.
+clocks, and exports a verified daily-playhead map bundle. The legacy path
+projects a supported immutable V3 story spine. When V4 reconciliation rejects
+that spine, the separate native replay path below rebuilds the story layer from
+the completed V4 ledgers; it never filters contradictions in the viewer.
 
 ## Recommended one-command launcher
 
@@ -46,6 +48,55 @@ retains `weather_available_at`, `spectral_available_at`, and
 `stage_available_at`. Its V3 incident release must also retain explicit,
 non-inferred checkpoint knowledge timestamps and complete membership
 attribution; strict V4 export fails closed when either is absent.
+
+## V4-native replay after a story-spine truth-gate failure
+
+Use this path when the V4 evidence release completed but viewer publication
+correctly rejected the old V3 story claims. Do not resume the failed
+`run_incident_v4.py` export and do not run `vm_story_pipeline.sh continue`.
+The evidence directory, geometry, and old V3 release are immutable inputs; the
+old IDs are used only for the overlap crosswalk.
+
+Add these values to the existing gitignored `.env.vm`:
+
+```bash
+V4_EVIDENCE_DIR=/mnt/KSA-Oasis/fields_health_v2/clusters/runs/weekly_monitor_v1/releases/incident_evidence_v4_20260707T132154Z
+V4_REPLAY_GEOMETRY_PARQUET=/mnt/KSA-Oasis/fields_health_v2/clusters/runs/weekly_monitor_v1/generations/2026-05-17_generation_7a715df05da10c3b3300/map_field_geometry.parquet
+V4_AUDIT_INCIDENT_DIR=/mnt/KSA-Oasis/fields_health_v2/clusters/runs/weekly_monitor_v1/releases/incidents_v3_20260707T132154Z
+V4_REPLAY_BASELINE_THROUGH=2025-12-31
+V4_REPLAY_PARTITIONS=64
+```
+
+The baseline date must be the reviewed frozen cutoff for this monitoring run;
+do not copy the example blindly if `.env.vm` uses another approved cutoff.
+Launch and monitor the isolated replay:
+
+```bash
+cd /mnt/KSA-Oasis/El-Mohammed/mango-comet
+server/vm_story_pipeline.sh replay-v4 .env.vm
+server/vm_story_pipeline.sh replay-v4-status .env.vm
+```
+
+The wrapper does not prepare evidence, resume the old job, start a server, run
+benchmarks, or train motifs. The runner writes a fresh
+`jobs/incident_story_replay_v4_<tag>` job, seven resumable checkpoints, a new
+`releases/incidents_v4_replay_<tag>` story release, an
+`old_to_new_incident_crosswalk.parquet`, and a native
+`releases/incident_viewer_v4_replay_<tag>` bundle. Resume only this new job:
+
+```bash
+export REPLAY_JOB=$(cat "$ROOT/logs/latest_incident_story_replay_v4_job.txt")
+"$PYTHON" server/run_incident_story_replay_v4.py resume \
+  --job-dir "$REPLAY_JOB"
+"$PYTHON" server/run_incident_story_replay_v4.py status \
+  --job-dir "$REPLAY_JOB"
+```
+
+Status `0` means the final native viewer passed its server smoke gate and its
+lifecycle reconciliation has zero contradictions and zero membership-counter
+mismatches. Inspect the replay, crosswalk, trajectories, and viewer before
+starting the serving/latency section. Do not reuse or retrain motif models until
+that trajectory review is accepted.
 
 ## 1. Pull, paths, and preflight
 

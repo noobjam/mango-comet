@@ -23,6 +23,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--display-grid-degrees", type=float, default=0.05)
     parser.add_argument("--freshness-fresh-days", type=int, default=7)
     parser.add_argument("--freshness-aging-days", type=int, default=14)
+    parser.add_argument(
+        "--native-replay",
+        action="store_true",
+        help=(
+            "Require a crop_incident_story_replay_v4 incident source and publish "
+            "native lifecycle replay semantics."
+        ),
+    )
     return parser
 
 
@@ -41,10 +49,10 @@ def main() -> None:
         display_grid_degrees=args.display_grid_degrees,
         freshness_fresh_days=args.freshness_fresh_days,
         freshness_aging_days=args.freshness_aging_days,
+        native_replay=args.native_replay,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
     main()
-

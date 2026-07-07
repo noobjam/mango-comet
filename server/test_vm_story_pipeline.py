@@ -45,6 +45,77 @@ class VmStoryPipelineTests(unittest.TestCase):
             script,
         )
 
+    def test_replay_v4_is_detached_minimal_and_isolated(self) -> None:
+        script = SCRIPT.read_text(encoding="utf-8")
+        replay_preflight = script.split("replay_v4_preflight() {", 1)[1].split(
+            "replay_v4_status_preflight() {", 1
+        )[0]
+        replay_launch = script.split("  replay-v4)", 1)[1].split("    ;;", 1)[0]
+        replay_path = replay_preflight + replay_launch
+
+        for name in (
+            "REPO",
+            "PYTHON",
+            "NODE",
+            "ROOT",
+            "V4_EVIDENCE_DIR",
+            "V4_REPLAY_GEOMETRY_PARQUET",
+            "V4_AUDIT_INCIDENT_DIR",
+            "V4_REPLAY_BASELINE_THROUGH",
+            "V4_REPLAY_PARTITIONS",
+            "DUCKDB_THREADS",
+            "DUCKDB_MEMORY_LIMIT",
+            "HEARTBEAT_SECONDS",
+        ):
+            self.assertIn(name, replay_path)
+        for argument in (
+            "--root",
+            "--evidence-dir",
+            "--geometry-parquet",
+            "--audit-incident-dir",
+            "--baseline-through",
+            "--python",
+            "--node",
+            "--threads",
+            "--replay-partitions",
+            "--memory-limit",
+            "--temp-dir",
+            "--heartbeat-seconds",
+            "--job-tag",
+        ):
+            self.assertIn(argument, replay_launch)
+        self.assertIn("nohup", replay_launch)
+        self.assertIn("run_incident_story_replay_v4.py run", replay_launch)
+        for forbidden in (
+            "ensure_v3_incident_dir",
+            "run_incident_v4.py",
+            "prepare_incident_source_v4.py",
+            "build-evidence-v4",
+            "continue_pipeline",
+            "start_server_and_benchmark",
+            "benchmark_incident_v4.py",
+            "run_motif_discovery",
+        ):
+            self.assertNotIn(forbidden, replay_path)
+
+    def test_replay_v4_status_uses_latest_replay_runner_pointer(self) -> None:
+        script = SCRIPT.read_text(encoding="utf-8")
+        replay_status = script.split("  replay-v4-status)", 1)[1].split(
+            "    ;;", 1
+        )[0]
+        self.assertIn("latest_incident_story_replay_v4_job.txt", replay_status)
+        self.assertIn("run_incident_story_replay_v4.py status", replay_status)
+        self.assertIn('--job-dir "$replay_job"', replay_status)
+        self.assertNotIn("\n    preflight\n", replay_status)
+        for forbidden in (
+            "continue_pipeline",
+            "run_incident_v4.py",
+            "start_server_and_benchmark",
+            "benchmark_incident_v4.py",
+            "run_motif_discovery",
+        ):
+            self.assertNotIn(forbidden, replay_status)
+
     def test_missing_env_fails_before_any_pipeline_action(self) -> None:
         result = subprocess.run(
             [str(SCRIPT), "status", "/definitely/missing/.env.vm"],
