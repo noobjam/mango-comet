@@ -15,7 +15,7 @@ import re
 from typing import Any
 
 
-POLICY_SCHEMA_VERSION = "incident-context-policy-v3/2"
+POLICY_SCHEMA_VERSION = "incident-context-policy-v3/3"
 CONTROLLED_STAGE_BUCKETS = (
     "emergence",
     "vegetative",
@@ -49,6 +49,13 @@ DEFAULT_INCIDENT_POLICY_V3_PATH = (
 
 @dataclass(frozen=True)
 class StageAlias:
+    raw_stage: str
+    stage_bucket: str
+
+
+@dataclass(frozen=True)
+class CropStageAlias:
+    raw_crop: str
     raw_stage: str
     stage_bucket: str
 
@@ -108,13 +115,23 @@ class IncidentPolicyV3:
     link_weights: tuple[tuple[str, float], ...]
     stage_buckets: tuple[str, ...]
     stage_aliases: tuple[StageAlias, ...]
+    crop_stage_aliases: tuple[CropStageAlias, ...]
     lane_state_priorities: tuple[LaneStatePriority, ...]
     source_path: Path
     source_sha256: str
 
-    def stage_bucket_for(self, raw_stage: Any) -> str:
-        """Return an exact controlled alias match, never a fuzzy inference."""
+    def stage_bucket_for(self, raw_stage: Any, crop_name: Any = None) -> str:
+        """Return an exact controlled alias match, never a fuzzy inference.
+
+        Crop-qualified aliases take precedence.  This keeps source-specific
+        labels such as maize ``silking`` from being applied to unrelated crops.
+        """
         normalized = normalize_stage_token(raw_stage)
+        if crop_name is not None:
+            crop = normalize_stage_token(crop_name)
+            for alias in self.crop_stage_aliases:
+                if alias.raw_crop == crop and alias.raw_stage == normalized:
+                    return alias.stage_bucket
         for alias in self.stage_aliases:
             if alias.raw_stage == normalized:
                 return alias.stage_bucket
@@ -269,20 +286,57 @@ def load_incident_policy_v3(
     aliases_raw = payload.get("stage_aliases")
     if not isinstance(aliases_raw, dict):
         raise ValueError("Incident V3 stage_aliases must be an object")
+    if set(aliases_raw) != set(stage_buckets):
+        raise ValueError(
+            "Incident V3 stage_aliases must define every frozen stage bucket exactly"
+        )
     aliases: list[StageAlias] = []
     seen_aliases: set[str] = set()
     for bucket, values in aliases_raw.items():
         normalized_bucket = _normalized_text(bucket, "stage alias bucket")
         if normalized_bucket not in stage_buckets:
             raise ValueError(f"Stage aliases reference unsupported bucket: {bucket}")
-        if not isinstance(values, list):
-            raise ValueError(f"Stage aliases for {bucket} must be a list")
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"Stage aliases for {bucket} must be a non-empty list")
+        if normalized_bucket not in {
+            _normalized_text(value, "stage alias") for value in values
+        }:
+            raise ValueError(
+                f"Incident V3 stage aliases must include canonical bucket {bucket}"
+            )
         for value in values:
             alias = _normalized_text(value, "stage alias")
             if alias in seen_aliases:
                 raise ValueError(f"Duplicate Incident V3 stage alias: {alias}")
             seen_aliases.add(alias)
             aliases.append(StageAlias(alias, normalized_bucket))
+
+    crop_aliases_raw = payload.get("crop_stage_aliases")
+    if not isinstance(crop_aliases_raw, list) or not crop_aliases_raw:
+        raise ValueError("Incident V3 crop_stage_aliases must be a non-empty list")
+    crop_aliases: list[CropStageAlias] = []
+    seen_crop_aliases: set[tuple[str, str]] = set()
+    for row in crop_aliases_raw:
+        if not isinstance(row, dict):
+            raise ValueError("Incident V3 crop stage alias rows must be objects")
+        crop = _normalized_text(row.get("crop_name"), "crop stage alias crop_name")
+        stage = _normalized_text(row.get("raw_stage"), "crop stage alias raw_stage")
+        bucket = _normalized_text(row.get("stage_bucket"), "crop stage alias stage_bucket")
+        if bucket not in stage_buckets:
+            raise ValueError(
+                f"Crop stage alias references unsupported bucket: {bucket}"
+            )
+        if stage in seen_aliases:
+            raise ValueError(
+                f"Incident V3 crop-qualified stage alias must not also be global: {stage}"
+            )
+        key = (crop, stage)
+        if key in seen_crop_aliases:
+            raise ValueError(
+                f"Duplicate Incident V3 crop stage alias: {crop}/{stage}"
+            )
+        seen_crop_aliases.add(key)
+        crop_aliases.append(CropStageAlias(crop, stage, bucket))
 
     priorities_raw = payload.get("lane_state_priority")
     if not isinstance(priorities_raw, list) or not priorities_raw:
@@ -368,6 +422,7 @@ def load_incident_policy_v3(
         link_weights=tuple(link_weights),
         stage_buckets=stage_buckets,
         stage_aliases=tuple(aliases),
+        crop_stage_aliases=tuple(crop_aliases),
         lane_state_priorities=tuple(priorities),
         source_path=path,
         source_sha256=hashlib.sha256(raw).hexdigest(),
@@ -441,6 +496,7 @@ __all__ = [
     "DEFAULT_INCIDENT_POLICY_V3_PATH",
     "CANONICAL_LANE_ORDER",
     "CONTROLLED_STAGE_BUCKETS",
+    "CropStageAlias",
     "IncidentPolicyV3",
     "LaneStatePriority",
     "LINK_WEIGHT_NAMES",

@@ -11,7 +11,7 @@ import re
 from typing import Any
 
 
-POLICY_SCHEMA_VERSION = "incident-source-policy-v4/1"
+POLICY_SCHEMA_VERSION = "incident-source-policy-v4/2"
 AVAILABILITY_MODES = ("strict", "reconstructed")
 HAZARD_FAMILIES = ("drought", "ponding_flooding", "heat", "damaging_wind")
 CONTROLLED_STAGE_BUCKETS = (
@@ -52,6 +52,7 @@ class IncidentPolicyV4:
     pressure_high: float
     stage_buckets: tuple[str, ...]
     stage_aliases: tuple[tuple[str, str], ...]
+    crop_stage_aliases: tuple[tuple[str, str, str], ...]
     source_path: Path
     source_sha256: str
 
@@ -64,8 +65,13 @@ class IncidentPolicyV4:
             )
         return normalized
 
-    def stage_bucket_for(self, value: Any) -> str:
+    def stage_bucket_for(self, value: Any, crop_name: Any = None) -> str:
         normalized = normalize_stage_token(value)
+        if crop_name is not None:
+            crop = normalize_stage_token(crop_name)
+            for raw_crop, raw_stage, bucket in self.crop_stage_aliases:
+                if raw_crop == crop and raw_stage == normalized:
+                    return bucket
         return dict(self.stage_aliases).get(normalized, "unknown")
 
 
@@ -155,6 +161,44 @@ def load_incident_policy_v4(
             seen.add(alias)
             aliases.append((alias, normalized_bucket))
 
+    crop_aliases_raw = payload.get("crop_stage_aliases")
+    if not isinstance(crop_aliases_raw, list) or not crop_aliases_raw:
+        raise ValueError("Incident V4 crop_stage_aliases must be a non-empty list")
+    crop_aliases: list[tuple[str, str, str]] = []
+    seen_crop_aliases: set[tuple[str, str]] = set()
+    for row in crop_aliases_raw:
+        if not isinstance(row, dict):
+            raise ValueError("Incident V4 crop stage alias rows must be objects")
+        crop_value = row.get("crop_name")
+        stage_value = row.get("raw_stage")
+        bucket_value = row.get("stage_bucket")
+        if any(
+            not isinstance(item, str) or not item.strip()
+            for item in (crop_value, stage_value, bucket_value)
+        ):
+            raise ValueError(
+                "Incident V4 crop stage aliases require crop_name, raw_stage, "
+                "and stage_bucket"
+            )
+        crop = normalize_stage_token(crop_value)
+        stage = normalize_stage_token(stage_value)
+        bucket = normalize_stage_token(bucket_value)
+        if bucket not in buckets:
+            raise ValueError(
+                f"Crop stage alias references unsupported bucket: {bucket}"
+            )
+        if stage in seen:
+            raise ValueError(
+                f"Incident V4 crop-qualified stage alias must not also be global: {stage}"
+            )
+        key = (crop, stage)
+        if key in seen_crop_aliases:
+            raise ValueError(
+                f"Duplicate Incident V4 crop stage alias: {crop}/{stage}"
+            )
+        seen_crop_aliases.add(key)
+        crop_aliases.append((crop, stage, bucket))
+
     values = {
         name: _number(spectral, name)
         for name in (
@@ -187,7 +231,8 @@ def load_incident_policy_v4(
         **values,
         pressure_low_medium=low_medium, pressure_medium_high=medium_high,
         pressure_high=high, stage_buckets=buckets,
-        stage_aliases=tuple(aliases), source_path=path,
+        stage_aliases=tuple(aliases), crop_stage_aliases=tuple(crop_aliases),
+        source_path=path,
         source_sha256=hashlib.sha256(raw).hexdigest(),
     )
 

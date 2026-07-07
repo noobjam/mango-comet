@@ -27,6 +27,14 @@ server/vm_story_pipeline.sh status .env.vm
 server/vm_story_pipeline.sh logs .env.vm
 ```
 
+If a run failed before publishing its V3 release, keep the failed job for its
+audit trail. After pulling a code fix, run `launch` again: the wrapper creates a
+fresh tagged job, rebuilds V3 atomically, and only continues into V4 after all
+centroid and crop-stage coverage gates pass. It never treats the partial failed
+directory as a compatible release. Reuse also requires the same source
+generation manifest, baseline cutoff, current policy SHA-256, and current V3
+implementation fingerprints; a stale successful release is rebuilt.
+
 Both `.env.vm` and the generated `server/.env` are ignored by git. The manual
 commands below remain the authoritative stage-by-stage fallback and audit
 reference.

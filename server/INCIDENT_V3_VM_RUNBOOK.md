@@ -14,6 +14,22 @@ Crop stage is changing evidence context, never identity. Thresholds are hashed
 but still uncalibrated; successful execution does not establish crop death,
 causation, propagation, or agronomic validity.
 
+Stage bucketing is exact and crop-qualified. The frozen policy checks
+`(crop_name, source stage)` aliases before a small set of canonical or genuinely
+generic aliases. Crop-specific labels cannot fall through a global alias for a
+different crop; unlisted labels remain `unknown`, and the 80% global / 70%
+supported-crop coverage gates still stop publication. The current Rwanda
+mappings follow the source metadata crosswalk for maize, rice, wheat, Irish
+potatoes, and generic, bush, and climbing beans.
+
+The context builder accepts a valid source `centroid_lon`/`centroid_lat` pair
+when present. Otherwise it derives the centroid from a Polygon/MultiPolygon in
+`geometry_geojson`, `geometry_text`, `geometry_wkt`, or text/binary `geometry`.
+The source geometry contract is WGS84 longitude/latitude; the adapter validates
+finite global coordinate bounds but cannot infer a missing CRS or axis-order
+declaration. Invalid geometry remains without a centroid; it is not imputed,
+and the unchanged 95% field and crop-instance-week gates stop publication.
+
 ## 1. Exact paths and preflight
 
 ```bash

@@ -308,7 +308,7 @@ def _write_crop_day(con: duckdb.DuckDBPyConnection, path: Path) -> None:
             field_id, crop_instance_id, observation_date,
             stage_available_at AS knowledge_time,
             crop_name, crop_season, crop_stage_raw, stage_family_raw,
-            COALESCE(a.stage_bucket, 'unknown') AS stage_bucket,
+            COALESCE(ca.stage_bucket, a.stage_bucket, 'unknown') AS stage_bucket,
             observation_date AS stage_effective_date,
             stage_available_at,
             COALESCE(NULLIF(stage_source, ''), 'generation_daily_causal_signals') AS stage_source,
@@ -323,6 +323,9 @@ def _write_crop_day(con: duckdb.DuckDBPyConnection, path: Path) -> None:
             av.mode AS availability_mode,
             p.policy_version, p.policy_sha256
         FROM source_v4 s
+        LEFT JOIN crop_stage_aliases_v4 ca
+          ON ca.raw_crop = COALESCE(NULLIF(TRIM(BOTH '_' FROM REGEXP_REPLACE(LOWER(COALESCE(crop_name, 'unknown')), '[^a-z0-9]+', '_', 'g')), ''), 'unknown')
+         AND ca.raw_stage = COALESCE(NULLIF(TRIM(BOTH '_' FROM REGEXP_REPLACE(LOWER(COALESCE(stage_family_raw, 'unknown')), '[^a-z0-9]+', '_', 'g')), ''), 'unknown')
         LEFT JOIN stage_aliases_v4 a ON a.raw_stage = COALESCE(NULLIF(TRIM(BOTH '_' FROM REGEXP_REPLACE(LOWER(COALESCE(stage_family_raw, 'unknown')), '[^a-z0-9]+', '_', 'g')), ''), 'unknown')
         CROSS JOIN incident_policy_v4 p
         CROSS JOIN availability_mode_v4 av
@@ -791,6 +794,20 @@ def _create_policy_tables(
     con.executemany("INSERT INTO hazard_families_v4 VALUES (?)", [(x,) for x in policy.hazard_families])
     con.execute("CREATE TEMP TABLE stage_aliases_v4(raw_stage VARCHAR PRIMARY KEY, stage_bucket VARCHAR)")
     con.executemany("INSERT INTO stage_aliases_v4 VALUES (?, ?)", list(policy.stage_aliases))
+    con.execute(
+        """
+        CREATE TEMP TABLE crop_stage_aliases_v4(
+          raw_crop VARCHAR,
+          raw_stage VARCHAR,
+          stage_bucket VARCHAR,
+          PRIMARY KEY (raw_crop, raw_stage)
+        )
+        """
+    )
+    con.executemany(
+        "INSERT INTO crop_stage_aliases_v4 VALUES (?, ?, ?)",
+        list(policy.crop_stage_aliases),
+    )
 
 
 def _register_parquet(

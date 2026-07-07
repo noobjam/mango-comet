@@ -171,15 +171,59 @@ resolve_compatible_v3_incident_dir() {
   INCIDENT_DIR=$(json_value "$V3_JOB/state.json" paths.incident_dir)
   [[ -f "$INCIDENT_DIR/manifest.json" ]] || return 1
   "$PYTHON" -c '
-import json,sys
-generation=json.load(open(sys.argv[1]))
-incident=json.load(open(sys.argv[2]))
+import hashlib,json,sys
+from pathlib import Path
+
+generation_path=Path(sys.argv[1])
+incident_path=Path(sys.argv[2])
+policy_path=Path(sys.argv[3])
+implementation_root=Path(sys.argv[4]).resolve()
+baseline_through=sys.argv[5]
+sys.path.insert(0, str(implementation_root.parent))
+from story_monitor.incident_workflow_v3 import V3_IMPLEMENTATION_INPUTS
+generation=json.load(open(generation_path))
+incident=json.load(open(incident_path))
 expected=str((generation.get("run") or {}).get("generation_id") or "")
 actual=str((incident.get("run") or {}).get("source_generation_id") or "")
 status=str((incident.get("run") or {}).get("status") or "")
 schema=str(incident.get("schema_version") or "")
-raise SystemExit(0 if expected and actual == expected and status == "complete" and schema == "crop-impact-incident-generation-v3/1" else 1)
-' "$GEN/manifest.json" "$INCIDENT_DIR/manifest.json"
+run=incident.get("run") or {}
+source=incident.get("source") or {}
+policy=incident.get("policy") or {}
+implementation=(incident.get("implementation") or {}).get("inputs") or {}
+expected_implementation={f"story_monitor/{name}" for name in V3_IMPLEMENTATION_INPUTS}
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+implementation_matches=set(implementation) == expected_implementation
+for logical_name, expected_fingerprint in implementation.items():
+    if not str(logical_name).startswith("story_monitor/"):
+        implementation_matches=False
+        break
+    candidate=(implementation_root / str(logical_name).removeprefix("story_monitor/")).resolve()
+    if implementation_root not in candidate.parents or not candidate.is_file():
+        implementation_matches=False
+        break
+    actual_fingerprint={"sha256":digest(candidate),"size_bytes":candidate.stat().st_size}
+    if actual_fingerprint != expected_fingerprint:
+        implementation_matches=False
+        break
+
+compatible=(
+    expected
+    and actual == expected
+    and status == "complete"
+    and schema == "crop-impact-incident-generation-v3/1"
+    and str(run.get("baseline_through") or "") == baseline_through
+    and str(source.get("generation_manifest_sha256") or "") == digest(generation_path)
+    and str(policy.get("sha256") or "") == digest(policy_path)
+    and implementation_matches
+)
+raise SystemExit(0 if compatible else 1)
+' "$GEN/manifest.json" "$INCIDENT_DIR/manifest.json" \
+    "$SCRIPT_DIR/story_monitor/policies/incident_policy_v3.json" \
+    "$SCRIPT_DIR/story_monitor" "$V3_BASELINE_THROUGH"
 }
 
 ensure_v3_incident_dir() {
@@ -509,6 +553,7 @@ case "$command" in
     require_value ROOT
     require_value PYTHON
     require_value GEN
+    require_value V3_BASELINE_THROUGH
     [[ -d "$ROOT" ]] || fail "ROOT does not exist: $ROOT"
     [[ -x "$PYTHON" ]] || fail "PYTHON is not executable: $PYTHON"
     [[ -f "$GEN/manifest.json" ]] || fail "generation manifest is missing"

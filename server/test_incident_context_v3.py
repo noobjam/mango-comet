@@ -6,9 +6,11 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import duckdb
 import pandas as pd
+from shapely.geometry import Polygon
 
 from story_monitor.incident_context_v3 import (
     _validate_outputs,
@@ -37,6 +39,40 @@ class IncidentPolicyV3Tests(unittest.TestCase):
             ),
         )
         self.assertEqual(policy.stage_bucket_for("Flowering"), "flowering")
+        self.assertEqual(
+            policy.stage_bucket_for("Silking", "Maize"), "flowering"
+        )
+        self.assertEqual(
+            policy.stage_bucket_for("Kenel Development", "Maize"),
+            "fruiting_or_grain_fill",
+        )
+        self.assertEqual(
+            policy.stage_bucket_for("Sprouting", "Irish Potatoes"), "emergence"
+        )
+        self.assertEqual(
+            policy.stage_bucket_for("Pod Development", "Bush Beans"),
+            "fruiting_or_grain_fill",
+        )
+        self.assertEqual(
+            policy.stage_bucket_for("Panicle Initiation", "Rice"), "flowering"
+        )
+        self.assertEqual(
+            policy.stage_bucket_for("fruiting_or_grain_fill"),
+            "fruiting_or_grain_fill",
+        )
+        self.assertEqual(
+            policy.stage_bucket_for("maturity_or_harvest"),
+            "maturity_or_harvest",
+        )
+        self.assertEqual(policy.stage_bucket_for("Silking", "beans"), "unknown")
+        self.assertEqual(
+            policy.stage_bucket_for("Tuber Bulking", "Maize"), "unknown"
+        )
+        self.assertEqual(policy.stage_bucket_for("Pod Fill", "Wheat"), "unknown")
+        self.assertEqual(policy.stage_bucket_for("Heading", "Beans"), "unknown")
+        self.assertEqual(
+            policy.stage_bucket_for("Tillering", "Irish Potatoes"), "unknown"
+        )
         self.assertEqual(policy.stage_bucket_for("invented sensitive stage"), "unknown")
         self.assertTrue(policy.same_hazard_link_required)
         self.assertEqual(policy.reference_latitude_strategy, "fixed_origin")
@@ -88,6 +124,46 @@ class IncidentPolicyV3Tests(unittest.TestCase):
             payload["tracker_starter_parameters"] = ["not", "an", "object"]
             path.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "must be an object"):
+                load_incident_policy_v3(path)
+
+    def test_policy_rejects_duplicate_crop_stage_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "policy.json"
+            payload = json.loads(DEFAULT_INCIDENT_POLICY_V3_PATH.read_text())
+            payload["crop_stage_aliases"].append(
+                dict(payload["crop_stage_aliases"][0])
+            )
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError, "Duplicate Incident V3 crop stage alias"
+            ):
+                load_incident_policy_v3(path)
+
+    def test_policy_rejects_missing_bucket_or_canonical_self_alias(self) -> None:
+        mutations = (
+            lambda payload: payload["stage_aliases"].pop("flowering"),
+            lambda payload: payload["stage_aliases"]["fruiting_or_grain_fill"].remove(
+                "fruiting_or_grain_fill"
+            ),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "policy.json"
+                payload = json.loads(DEFAULT_INCIDENT_POLICY_V3_PATH.read_text())
+                mutate(payload)
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    ValueError, "every frozen stage bucket|canonical bucket"
+                ):
+                    load_incident_policy_v3(path)
+
+    def test_policy_rejects_crop_specific_alias_in_global_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "policy.json"
+            payload = json.loads(DEFAULT_INCIDENT_POLICY_V3_PATH.read_text())
+            payload["stage_aliases"]["vegetative"].append("tillering")
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must not also be global"):
                 load_incident_policy_v3(path)
 
 
@@ -198,6 +274,53 @@ class IncidentContextV3Tests(unittest.TestCase):
                 build_incident_context_v3(generation, output, threads=1)
             self.assertFalse(output.exists())
 
+    def test_crop_qualified_stage_alias_does_not_leak_to_other_crops(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generation = root / "generation"
+            generation.mkdir()
+            _write_generation(generation)
+            signals_path = generation / "daily_causal_signals.parquet"
+            signals = pd.read_parquet(signals_path)
+            signals.loc[signals["field_id"] == "A", ["crop_stage", "stage_family"]] = [
+                "source::Silking", "Silking"
+            ]
+            signals.loc[signals["field_id"] == "B", ["crop_stage", "stage_family"]] = [
+                "source::Silking", "Silking"
+            ]
+            signals.to_parquet(signals_path, index=False)
+
+            output = root / "context"
+            build_incident_context_v3(
+                generation, output, policy=_test_policy(), threads=1
+            )
+            context = pd.read_parquet(output / "field_week_context.parquet")
+            by_field = context.set_index("field_id")
+            self.assertEqual(by_field.loc["A", "stage_bucket"], "flowering")
+            self.assertEqual(by_field.loc["B", "stage_bucket"], "unknown")
+
+    def test_canonical_bush_bean_stage_is_mapped_in_sql_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generation = root / "generation"
+            generation.mkdir()
+            _write_generation(generation)
+            signals_path = generation / "daily_causal_signals.parquet"
+            signals = pd.read_parquet(signals_path)
+            signals.loc[signals["field_id"] == "B", "crop_name"] = "Bush Beans"
+            signals.loc[signals["field_id"] == "B", ["crop_stage", "stage_family"]] = [
+                "source::Pod Development", "Pod Development"
+            ]
+            signals.to_parquet(signals_path, index=False)
+
+            output = root / "context"
+            build_incident_context_v3(
+                generation, output, policy=_test_policy(), threads=1
+            )
+            context = pd.read_parquet(output / "field_week_context.parquet")
+            field_b = context[context["field_id"] == "B"].iloc[0]
+            self.assertEqual(field_b["stage_bucket"], "fruiting_or_grain_fill")
+
     def test_weekly_fresh_response_survives_later_no_new_snapshot_row(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -257,22 +380,196 @@ class IncidentContextV3Tests(unittest.TestCase):
                 build_incident_context_v3(generation, output, threads=1)
             self.assertFalse(output.exists())
 
-    def test_supported_minority_crop_stage_gap_fails_even_when_global_gate_passes(self) -> None:
+    def test_derives_centroid_from_raw_wkt_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generation = root / "generation"
+            generation.mkdir()
+            _write_generation(generation)
+            pd.DataFrame(
+                [
+                    {
+                        "field_id": "A",
+                        "geometry_text": (
+                            "POLYGON ((30 -2, 30.2 -2, 30.2 -1.8, "
+                            "30 -1.8, 30 -2))"
+                        ),
+                        "district": "North",
+                    }
+                ]
+            ).to_parquet(generation / "map_field_geometry.parquet", index=False)
+
+            output = root / "context"
+            build_incident_context_v3(
+                generation, output, policy=_test_policy(), threads=1
+            )
+
+            context = pd.read_parquet(output / "field_week_context.parquet")
+            field_a = context[context["field_id"] == "A"].iloc[0]
+            self.assertAlmostEqual(float(field_a["centroid_lon"]), 30.1)
+            self.assertAlmostEqual(float(field_a["centroid_lat"]), -1.9)
+            self.assertTrue(field_a["centroid_available"])
+            self.assertEqual(field_a["geometry_join_status"], "centroid_available")
+
+    def test_invalid_raw_geometry_still_fails_centroid_coverage_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generation = root / "generation"
+            generation.mkdir()
+            _write_generation(generation)
+            pd.DataFrame(
+                [{"field_id": "A", "geometry_text": "not valid WKT"}]
+            ).to_parquet(generation / "map_field_geometry.parquet", index=False)
+
+            output = root / "context"
+            with self.assertRaisesRegex(ValueError, "centroid_fields=0/2"):
+                build_incident_context_v3(
+                    generation, output, policy=_test_policy(), threads=1
+                )
+            self.assertFalse(output.exists())
+
+    def test_direct_centroid_short_circuits_malformed_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generation = root / "generation"
+            generation.mkdir()
+            _write_generation(generation)
+            pd.DataFrame(
+                [
+                    {
+                        "field_id": "A",
+                        "centroid_lon": 30.1,
+                        "centroid_lat": -1.9,
+                        "geometry_geojson": "{}",
+                    }
+                ]
+            ).to_parquet(generation / "map_field_geometry.parquet", index=False)
+
+            output = root / "context"
+            with patch(
+                "story_monitor.incident_context_v3._geometry_centroid",
+                side_effect=AssertionError("geometry parser must not run"),
+            ):
+                build_incident_context_v3(
+                    generation, output, policy=_test_policy(), threads=1
+                )
+            context = pd.read_parquet(output / "field_week_context.parquet")
+            field_a = context[context["field_id"] == "A"].iloc[0]
+            self.assertAlmostEqual(float(field_a["centroid_lon"]), 30.1)
+            self.assertAlmostEqual(float(field_a["centroid_lat"]), -1.9)
+
+    def test_malformed_geojson_is_null_and_fails_coverage_not_parser(self) -> None:
+        for malformed in ("[]", "{}"):
+            with self.subTest(malformed=malformed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                generation = root / "generation"
+                generation.mkdir()
+                _write_generation(generation)
+                pd.DataFrame(
+                    [{"field_id": "A", "geometry_geojson": malformed}]
+                ).to_parquet(generation / "map_field_geometry.parquet", index=False)
+
+                output = root / "context"
+                with self.assertRaisesRegex(ValueError, "centroid_fields=0/2"):
+                    build_incident_context_v3(
+                        generation, output, policy=_test_policy(), threads=1
+                    )
+                self.assertFalse(output.exists())
+
+    def test_non_polygon_geometry_is_rejected(self) -> None:
+        for geometry_text in (
+            "POINT (30.1 -1.9)",
+            "LINESTRING (30 -2, 30.2 -1.8)",
+            "GEOMETRYCOLLECTION (POINT (30.1 -1.9))",
+        ):
+            with self.subTest(geometry=geometry_text), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                generation = root / "generation"
+                generation.mkdir()
+                _write_generation(generation)
+                pd.DataFrame(
+                    [{"field_id": "A", "geometry_text": geometry_text}]
+                ).to_parquet(generation / "map_field_geometry.parquet", index=False)
+
+                output = root / "context"
+                with self.assertRaisesRegex(ValueError, "centroid_fields=0/2"):
+                    build_incident_context_v3(
+                        generation, output, policy=_test_policy(), threads=1
+                    )
+                self.assertFalse(output.exists())
+
+    def test_invalid_geojson_falls_back_to_later_valid_wkt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generation = root / "generation"
+            generation.mkdir()
+            _write_generation(generation)
+            pd.DataFrame(
+                [
+                    {
+                        "field_id": "A",
+                        "geometry_geojson": "{}",
+                        "geometry_text": (
+                            "POLYGON ((30 -2, 30.2 -2, 30.2 -1.8, "
+                            "30 -1.8, 30 -2))"
+                        ),
+                    }
+                ]
+            ).to_parquet(generation / "map_field_geometry.parquet", index=False)
+
+            output = root / "context"
+            build_incident_context_v3(
+                generation, output, policy=_test_policy(), threads=1
+            )
+            context = pd.read_parquet(output / "field_week_context.parquet")
+            field_a = context[context["field_id"] == "A"].iloc[0]
+            self.assertAlmostEqual(float(field_a["centroid_lon"]), 30.1)
+            self.assertAlmostEqual(float(field_a["centroid_lat"]), -1.9)
+
+    def test_derives_centroid_from_generic_wkb_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generation = root / "generation"
+            generation.mkdir()
+            _write_generation(generation)
+            polygon = Polygon(
+                [(30, -2), (30.2, -2), (30.2, -1.8), (30, -1.8), (30, -2)]
+            )
+            pd.DataFrame(
+                [{"field_id": "A", "geometry": polygon.wkb}]
+            ).to_parquet(generation / "map_field_geometry.parquet", index=False)
+
+            output = root / "context"
+            build_incident_context_v3(
+                generation, output, policy=_test_policy(), threads=1
+            )
+            context = pd.read_parquet(output / "field_week_context.parquet")
+            field_a = context[context["field_id"] == "A"].iloc[0]
+            self.assertAlmostEqual(float(field_a["centroid_lon"]), 30.1)
+            self.assertAlmostEqual(float(field_a["centroid_lat"]), -1.9)
+
+    def test_supported_crop_stage_gate_normalizes_crop_name_variants(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             stage = Path(directory)
             week = "2025-01-06"
             rows = []
             for index in range(100):
-                beans = index >= 90
+                potatoes = index >= 90
+                crop_variants = (
+                    "Irish Potatoes", "irish-potatoes", "  IRISH   POTATOES  "
+                )
                 rows.append(
                     {
                         "timeline_bucket": week,
                         "field_id": f"field-{index}",
                         "crop_instance_id": f"crop-{index}",
-                        "crop_name": "beans" if beans else "maize",
-                        "stage_family_raw": "unmapped beans" if beans else "vegetative",
-                        "stage_family_normalized": "unmapped_beans" if beans else "vegetative",
-                        "stage_bucket": "unknown" if beans else "vegetative",
+                        "crop_name": (
+                            crop_variants[index % len(crop_variants)]
+                            if potatoes else "maize"
+                        ),
+                        "stage_family_raw": "unmapped potatoes" if potatoes else "vegetative",
+                        "stage_family_normalized": "unmapped_potatoes" if potatoes else "vegetative",
+                        "stage_bucket": "unknown" if potatoes else "vegetative",
                         "monitored": True,
                         "evaluable": True,
                         "geometry_present": True,
@@ -305,7 +602,7 @@ class IncidentContextV3Tests(unittest.TestCase):
             )
             with duckdb.connect(":memory:") as connection, self.assertRaisesRegex(
                 ValueError,
-                "known_stage_crop_instance_weeks=90/100.*beans",
+                "known_stage_crop_instance_weeks=90/100.*irish_potatoes",
             ):
                 _validate_outputs(connection, stage, policy)
 

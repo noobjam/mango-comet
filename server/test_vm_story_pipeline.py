@@ -1,10 +1,13 @@
 from pathlib import Path
+import hashlib
 import json
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+
+from story_monitor.incident_workflow_v3 import V3_IMPLEMENTATION_INPUTS
 
 
 SCRIPT = Path(__file__).with_name("vm_story_pipeline.sh")
@@ -78,9 +81,19 @@ class VmStoryPipelineTests(unittest.TestCase):
             logs = root / "logs"
             for path in (generation, incident, job, logs):
                 path.mkdir(parents=True, exist_ok=True)
-            (generation / "manifest.json").write_text(
+            generation_manifest = generation / "manifest.json"
+            generation_manifest.write_text(
                 json.dumps({"run": {"generation_id": "generation-fixture"}})
             )
+            policy_path = SCRIPT.parent / "story_monitor" / "policies" / "incident_policy_v3.json"
+            implementation_root = SCRIPT.parent / "story_monitor"
+            implementation_inputs = {}
+            for name in V3_IMPLEMENTATION_INPUTS:
+                implementation_path = implementation_root / name
+                implementation_inputs[f"story_monitor/{name}"] = {
+                    "sha256": hashlib.sha256(implementation_path.read_bytes()).hexdigest(),
+                    "size_bytes": implementation_path.stat().st_size,
+                }
             (incident / "manifest.json").write_text(
                 json.dumps(
                     {
@@ -88,6 +101,18 @@ class VmStoryPipelineTests(unittest.TestCase):
                         "run": {
                             "status": "complete",
                             "source_generation_id": "generation-fixture",
+                            "baseline_through": "2025-12-31",
+                        },
+                        "source": {
+                            "generation_manifest_sha256": hashlib.sha256(
+                                generation_manifest.read_bytes()
+                            ).hexdigest(),
+                        },
+                        "policy": {
+                            "sha256": hashlib.sha256(policy_path.read_bytes()).hexdigest(),
+                        },
+                        "implementation": {
+                            "inputs": implementation_inputs,
                         },
                     }
                 )
@@ -104,6 +129,7 @@ class VmStoryPipelineTests(unittest.TestCase):
                         f"ROOT={root}",
                         f"PYTHON={sys.executable}",
                         f"GEN={generation}",
+                        "V3_BASELINE_THROUGH=2025-12-31",
                     )
                 )
                 + "\n"
@@ -116,6 +142,23 @@ class VmStoryPipelineTests(unittest.TestCase):
             )
             self.assertEqual(compatible.returncode, 0, compatible.stderr)
             self.assertIn(f"INCIDENT_DIR={incident}", compatible.stdout)
+
+            incident_manifest = json.loads((incident / "manifest.json").read_text())
+            incident_manifest["policy"]["sha256"] = "0" * 64
+            (incident / "manifest.json").write_text(json.dumps(incident_manifest))
+            stale_policy = subprocess.run(
+                [str(SCRIPT), "check-v3", str(env_file)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(stale_policy.returncode, 2)
+            self.assertIn("no successful V3 release matches GEN", stale_policy.stderr)
+
+            incident_manifest["policy"]["sha256"] = hashlib.sha256(
+                policy_path.read_bytes()
+            ).hexdigest()
+            (incident / "manifest.json").write_text(json.dumps(incident_manifest))
 
             manifest = json.loads((generation / "manifest.json").read_text())
             manifest["run"]["generation_id"] = "different-generation"

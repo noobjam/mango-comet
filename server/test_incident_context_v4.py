@@ -112,6 +112,41 @@ class IncidentContextV4Tests(unittest.TestCase):
                     generation, evidence, released_at=RELEASED_AT, threads=1
                 )
 
+    def test_crop_qualified_stage_aliases_apply_without_wrong_crop_fallback(self) -> None:
+        cases = (
+            ("Bush Beans", "Pod Development", "fruiting_or_grain_fill"),
+            ("Maize", "Tuber Bulking", "unknown"),
+        )
+        for crop_name, stage, expected in cases:
+            with self.subTest(crop=crop_name, stage=stage), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                generation = root / "generation"
+                generation.mkdir()
+                _write_generation(generation)
+                signals_path = generation / "daily_causal_signals.parquet"
+                signals = pd.read_parquet(signals_path)
+                signals["crop_name"] = crop_name
+                signals["crop_stage"] = stage
+                signals["stage_family"] = stage
+                signals["crop_instance_id"] = (
+                    "field-1::" + crop_name.lower().replace(" ", "_") + "::2025-A"
+                )
+                signals.to_parquet(signals_path, index=False)
+                enriched = root / "enriched.parquet"
+                _write_enriched(enriched)
+                evidence = root / "evidence"
+
+                build_incident_context_v4(
+                    generation,
+                    evidence,
+                    released_at=RELEASED_AT,
+                    enriched_source_parquet=enriched,
+                    availability_mode="reconstructed",
+                    threads=1,
+                )
+                crop = pd.read_parquet(evidence / "crop_day_context_v4.parquet")
+                self.assertEqual(set(crop["stage_bucket"]), {expected})
+
     def test_strict_mode_uses_explicit_availability_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -426,8 +461,8 @@ def _write_generation(root: Path) -> None:
                 "observation_date": day,
                 "crop_name": "Maize",
                 "crop_season": "2025-A",
-                "crop_stage": "Flowering",
-                "stage_family": "Flowering",
+                "crop_stage": "Silking",
+                "stage_family": "Silking",
                 "crop_instance_id": "field-1::maize::2025-A",
                 "pressure_observed": True,
                 "risk_rank": 4,

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from datetime import date
 from pathlib import Path
@@ -15,6 +16,9 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 import duckdb
+from shapely import wkb as shapely_wkb
+from shapely import wkt as shapely_wkt
+from shapely.geometry import shape
 
 from .incident_policy_v3 import IncidentPolicyV3, load_incident_policy_v3
 
@@ -153,6 +157,23 @@ def _configured_connection(
             [(item.raw_stage, item.stage_bucket) for item in policy.stage_aliases],
         )
         connection.execute(
+            """
+            CREATE TEMP TABLE crop_stage_aliases(
+                raw_crop VARCHAR,
+                raw_stage VARCHAR,
+                stage_bucket VARCHAR,
+                PRIMARY KEY (raw_crop, raw_stage)
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO crop_stage_aliases VALUES (?, ?, ?)",
+            [
+                (item.raw_crop, item.raw_stage, item.stage_bucket)
+                for item in policy.crop_stage_aliases
+            ],
+        )
+        connection.execute(
             "CREATE TEMP TABLE lane_priorities(event_state VARCHAR PRIMARY KEY, priority INTEGER, is_open BOOLEAN)"
         )
         connection.executemany(
@@ -178,26 +199,176 @@ def _configured_connection(
 def _create_geometry_view(
     connection: duckdb.DuckDBPyConnection, columns: set[str]
 ) -> None:
-    def optional(name: str, sql_type: str) -> str:
+    def optional_value(name: str, sql_type: str) -> str:
         if name in columns:
-            return f'TRY_CAST("{name}" AS {sql_type}) AS {name}'
-        return f"CAST(NULL AS {sql_type}) AS {name}"
+            return f'TRY_CAST("{name}" AS {sql_type})'
+        return f"CAST(NULL AS {sql_type})"
 
+    def optional(name: str, sql_type: str) -> str:
+        return f"{optional_value(name, sql_type)} AS {name}"
+
+    direct_lon = optional_value("centroid_lon", "DOUBLE")
+    direct_lat = optional_value("centroid_lat", "DOUBLE")
+    direct_valid = (
+        "ISFINITE(direct_centroid_lon) "
+        "AND ISFINITE(direct_centroid_lat) "
+        "AND direct_centroid_lon BETWEEN -180 AND 180 "
+        "AND direct_centroid_lat BETWEEN -90 AND 90"
+    )
     connection.execute(
         f"""
-        CREATE TEMP VIEW geometry_source AS
+        CREATE TEMP TABLE geometry_source AS
+        WITH direct AS (
+            SELECT
+                TRIM(CAST(field_id AS VARCHAR)) AS field_id,
+                {direct_lon} AS direct_centroid_lon,
+                {direct_lat} AS direct_centroid_lat,
+                {optional('district', 'VARCHAR')},
+                {optional('sector', 'VARCHAR')},
+                {optional('cell', 'VARCHAR')},
+                {optional('village', 'VARCHAR')}
+            FROM geometry_source_raw
+        )
         SELECT
-            TRIM(CAST(field_id AS VARCHAR)) AS field_id,
-            {optional('centroid_lon', 'DOUBLE')},
-            {optional('centroid_lat', 'DOUBLE')},
-            {optional('district', 'VARCHAR')},
-            {optional('sector', 'VARCHAR')},
-            {optional('cell', 'VARCHAR')},
-            {optional('village', 'VARCHAR')},
+            field_id,
+            direct_centroid_lon AS centroid_lon,
+            direct_centroid_lat AS centroid_lat,
+            district, sector, cell, village,
             TRUE AS geometry_record_present
-        FROM geometry_source_raw
+        FROM direct
+        WHERE {direct_valid}
         """
     )
+
+    source_count = int(connection.execute(
+        "SELECT COUNT(*) FROM geometry_source_raw"
+    ).fetchone()[0])
+    direct_count = int(connection.execute(
+        "SELECT COUNT(*) FROM geometry_source"
+    ).fetchone()[0])
+    if direct_count == source_count:
+        return
+
+    connection.create_function(
+        "incident_geometry_centroid",
+        _geometry_centroid,
+        ["VARCHAR", "VARCHAR", "VARCHAR", "BLOB", "VARCHAR"],
+        duckdb.struct_type({"lon": "DOUBLE", "lat": "DOUBLE"}),
+        null_handling="special",
+    )
+    connection.execute(
+        f"""
+        INSERT INTO geometry_source
+        WITH unresolved AS (
+            SELECT
+                TRIM(CAST(field_id AS VARCHAR)) AS field_id,
+                {direct_lon} AS direct_centroid_lon,
+                {direct_lat} AS direct_centroid_lat,
+                {optional_value('geometry_geojson', 'VARCHAR')} AS geometry_geojson,
+                {optional_value('geometry_text', 'VARCHAR')} AS geometry_text,
+                {optional_value('geometry_wkt', 'VARCHAR')} AS geometry_wkt,
+                {optional_value('geometry', 'BLOB')} AS geometry_blob,
+                {optional_value('geometry', 'VARCHAR')} AS geometry_text_generic,
+                {optional('district', 'VARCHAR')},
+                {optional('sector', 'VARCHAR')},
+                {optional('cell', 'VARCHAR')},
+                {optional('village', 'VARCHAR')}
+            FROM geometry_source_raw
+        ), adapted AS (
+            SELECT
+                *,
+                incident_geometry_centroid(
+                    geometry_geojson,
+                    geometry_text,
+                    geometry_wkt,
+                    geometry_blob,
+                    geometry_text_generic
+                ) AS parsed_centroid
+            FROM unresolved
+            WHERE NOT COALESCE({direct_valid}, FALSE)
+        )
+        SELECT
+            field_id,
+            parsed_centroid.lon AS centroid_lon,
+            parsed_centroid.lat AS centroid_lat,
+            district, sector, cell, village,
+            TRUE AS geometry_record_present
+        FROM adapted
+        """
+    )
+
+
+def _geometry_centroid(
+    geometry_geojson: Any,
+    geometry_text: Any,
+    geometry_wkt: Any,
+    geometry_blob: Any,
+    geometry_text_generic: Any,
+) -> dict[str, float] | None:
+    """Try supported polygon encodings in deterministic provenance order."""
+    candidates = (
+        ("geojson", geometry_geojson),
+        ("wkt", geometry_text),
+        ("wkt", geometry_wkt),
+        ("wkb", geometry_blob),
+        ("generic", geometry_text_generic),
+    )
+    for encoding, value in candidates:
+        if value is None:
+            continue
+        try:
+            geometry = _parse_geometry(value, encoding)
+            result = _valid_polygon_centroid(geometry)
+        except Exception:
+            # Malformed source geometry is data-quality evidence.  Preserve the
+            # row with a NULL centroid so the unchanged coverage gate decides.
+            continue
+        if result is not None:
+            return result
+    return None
+
+
+def _parse_geometry(value: Any, encoding: str) -> Any:
+    if encoding == "wkb":
+        return shapely_wkb.loads(bytes(value))
+    text = str(value).strip()
+    if not text:
+        raise ValueError("empty geometry")
+    if encoding == "geojson":
+        return shape(json.loads(text))
+    if encoding == "wkt":
+        return shapely_wkt.loads(text)
+    if text[0] in "[{":
+        return shape(json.loads(text))
+    try:
+        return shapely_wkt.loads(text)
+    except Exception:
+        return shapely_wkb.loads(text, hex=True)
+
+
+def _valid_polygon_centroid(geometry: Any) -> dict[str, float] | None:
+    if (
+        geometry.geom_type not in {"Polygon", "MultiPolygon"}
+        or geometry.is_empty
+        or not geometry.is_valid
+    ):
+        return None
+    bounds = tuple(float(value) for value in geometry.bounds)
+    if (
+        len(bounds) != 4
+        or not all(math.isfinite(value) for value in bounds)
+        or not -180.0 <= bounds[0] <= bounds[2] <= 180.0
+        or not -90.0 <= bounds[1] <= bounds[3] <= 90.0
+    ):
+        return None
+    centroid = geometry.centroid
+    if centroid.is_empty:
+        return None
+    lon = float(centroid.x)
+    lat = float(centroid.y)
+    if not math.isfinite(lon) or not math.isfinite(lat):
+        return None
+    return {"lon": lon, "lat": lat}
 
 
 def _pick_geometry(generation_dir: Path) -> Path:
@@ -211,6 +382,13 @@ def _pick_geometry(generation_dir: Path) -> Path:
 _NORMALIZED_STAGE_SQL = """
 COALESCE(NULLIF(TRIM(BOTH '_' FROM REGEXP_REPLACE(
     LOWER(COALESCE(CAST(stage_family_raw AS VARCHAR), 'unknown')),
+    '[^a-z0-9]+', '_', 'g'
+)), ''), 'unknown')
+"""
+
+_NORMALIZED_CROP_SQL = """
+COALESCE(NULLIF(TRIM(BOTH '_' FROM REGEXP_REPLACE(
+    LOWER(COALESCE(CAST(crop_name AS VARCHAR), 'unknown')),
     '[^a-z0-9]+', '_', 'g'
 )), ''), 'unknown')
 """
@@ -264,7 +442,9 @@ WITH source AS (
     FROM source
     GROUP BY timeline_bucket, field_id, crop_instance_id
 ), named AS (
-    SELECT l.*, {_NORMALIZED_STAGE_SQL} AS stage_family_normalized
+    SELECT l.*,
+        {_NORMALIZED_STAGE_SQL} AS stage_family_normalized,
+        {_NORMALIZED_CROP_SQL} AS crop_name_normalized
     FROM latest l
 )
 SELECT
@@ -273,7 +453,7 @@ SELECT
     n.stage_raw,
     n.stage_family_raw,
     n.stage_family_normalized,
-    COALESCE(sa.stage_bucket, 'unknown') AS stage_bucket,
+    COALESCE(csa.stage_bucket, sa.stage_bucket, 'unknown') AS stage_bucket,
     n.observation_date AS stage_source_date,
     a.week_last_observation_date,
     a.observation_day_count,
@@ -317,6 +497,9 @@ SELECT
     p.policy_sha256
 FROM aggregate a
 JOIN named n USING (timeline_bucket, field_id, crop_instance_id)
+LEFT JOIN crop_stage_aliases csa
+  ON csa.raw_crop = n.crop_name_normalized
+ AND csa.raw_stage = n.stage_family_normalized
 LEFT JOIN stage_aliases sa ON sa.raw_stage = n.stage_family_normalized
 LEFT JOIN geometry_source g ON g.field_id = a.field_id
 CROSS JOIN incident_policy p
@@ -388,12 +571,14 @@ WITH snapshots AS (
      AND s.crop_instance_id = d.crop_instance_id
      AND s.snapshot_as_of_date >= d.stage_source_date
 ), named AS (
-    SELECT s.*, {_NORMALIZED_STAGE_SQL} AS stage_family_normalized
+    SELECT s.*,
+        {_NORMALIZED_STAGE_SQL} AS stage_family_normalized,
+        {_NORMALIZED_CROP_SQL} AS crop_name_normalized
     FROM causal_stage s
 ), enriched AS (
     SELECT
         s.*,
-        COALESCE(sa.stage_bucket, 'unknown') AS stage_bucket,
+        COALESCE(csa.stage_bucket, sa.stage_bucket, 'unknown') AS stage_bucket,
         DATE_DIFF('day', s.stage_source_date, s.snapshot_as_of_date) AS stage_age_days,
         CAST(e.event_start_date AS DATE) AS event_start_date,
         CAST(e.event_end_date AS DATE) AS event_end_date,
@@ -418,6 +603,9 @@ WITH snapshots AS (
         p.policy_version,
         p.policy_sha256
     FROM named s
+    LEFT JOIN crop_stage_aliases csa
+      ON csa.raw_crop = s.crop_name_normalized
+     AND csa.raw_stage = s.stage_family_normalized
     LEFT JOIN stage_aliases sa ON sa.raw_stage = s.stage_family_normalized
     LEFT JOIN events_source e ON CAST(e.event_id AS VARCHAR) = s.event_id
     LEFT JOIN lane_priorities lp ON lp.event_state = s.event_state
@@ -662,9 +850,9 @@ def _validate_outputs(
             "known_stage_coverage": float(row[3]),
         }
         for row in connection.execute(
-            """
+            f"""
             SELECT
-                LOWER(TRIM(CAST(crop_name AS VARCHAR))) AS crop_name,
+                {_NORMALIZED_CROP_SQL} AS crop_name,
                 COUNT(*) AS crop_instance_weeks,
                 COUNT_IF(stage_bucket <> 'unknown') AS known_stage_weeks,
                 COUNT_IF(stage_bucket <> 'unknown')::DOUBLE / COUNT(*)
@@ -687,19 +875,23 @@ def _validate_outputs(
     ]
     top_unmapped_stage_labels = [
         {
-            "stage_family_raw": str(row[0]),
-            "stage_family_normalized": str(row[1]),
-            "crop_instance_week_count": int(row[2]),
+            "crop_name_raw": str(row[0]),
+            "crop_name_normalized": str(row[1]),
+            "stage_family_raw": str(row[2]),
+            "stage_family_normalized": str(row[3]),
+            "crop_instance_week_count": int(row[4]),
         }
         for row in connection.execute(
-            """
+            f"""
             SELECT
+                COALESCE(CAST(crop_name AS VARCHAR), '<null>'),
+                {_NORMALIZED_CROP_SQL},
                 COALESCE(CAST(stage_family_raw AS VARCHAR), '<null>'),
                 COALESCE(CAST(stage_family_normalized AS VARCHAR), 'unknown'),
                 COUNT(*) AS crop_instance_weeks
             FROM read_parquet(?)
             WHERE monitored AND stage_bucket = 'unknown'
-            GROUP BY 1, 2
+            GROUP BY 1, 2, 3, 4
             ORDER BY crop_instance_weeks DESC, 1
             LIMIT 20
             """,
