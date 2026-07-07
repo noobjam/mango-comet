@@ -1,5 +1,14 @@
 # Current snapshot — 2026-07-07
 
+## Active handoff
+
+- Status: paused after real-VM V4 truth-gate failure.
+- Resume from: `server/V4_STORY_REPLAY_HANDOFF.md`.
+- Decision: build a V4-native story replay from the completed evidence ledgers;
+  do not resume the old viewer or rebuild evidence.
+- Implementation baseline: `646f68f`; four confirmed V3/V4 reconciliation fix
+  files remain intentionally uncommitted and are listed in the handoff.
+
 - Branch/baseline: `main` at `7e06b80`; V4/2 reconciliation, live motif scoring,
   and trajectory UX are locally verified and ready to commit.
 - Story authority: deterministic V3
