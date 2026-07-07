@@ -200,10 +200,17 @@ unresolved response in another.
 There is no `DEAD` outcome. Death requires independent survey, harvest/yield,
 or a separately validated outcome model.
 
-Unresolved episode ownership crosses an exact crop split/merge edge before the
-new week’s recovery evidence is applied. Each unresolved
-`(field, crop_instance, episode)` has one same-hazard story owner; ambiguity
-fails closed. A terminal story clears that registry before any recurrence.
+Unresolved episode ownership first crosses an explicit crop split/merge edge
+before the new week’s recovery evidence is applied. Impact-only evidence does
+not participate in physical exposure tracking, so an exact same-hazard
+`(field, crop_instance, episode)` may later appear under another component
+without a split/merge edge. In that case, one current row that would register
+the episode as unresolved atomically takes ownership from the stale carrier.
+This moves only the episode registry, recovery state, and follow-up routing; it
+does not merge or rename either crop-impact story. A plain `WATCH` row without
+fresh attributed decline cannot take ownership. Multiple direct current
+claimants remain an ambiguity and fail closed. A terminal story clears its
+registry before any recurrence.
 
 ## 7. Story clustering paradigm
 

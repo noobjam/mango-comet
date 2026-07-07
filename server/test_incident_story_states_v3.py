@@ -446,6 +446,265 @@ class IncidentStoryStatesV3Tests(unittest.TestCase):
         ]
         self.assertEqual(carried.iloc[0]["membership_role"], "unresolved")
 
+    def test_repeated_impact_episode_without_lineage_hands_off_to_current_owner(self) -> None:
+        """An exact current impact claim supersedes stale carried ownership."""
+        weeks = pd.date_range("2026-01-05", periods=3, freq="7D")
+        assignments = pd.DataFrame(
+            [
+                {
+                    "timeline_bucket": weeks[0],
+                    "hazard_family": "heat",
+                    "component_id": "component-old",
+                    "exposure_id": "exposure_old",
+                },
+                {
+                    "timeline_bucket": weeks[1],
+                    "hazard_family": "heat",
+                    "component_id": "component-new",
+                    "exposure_id": "exposure_new",
+                },
+            ]
+        )
+        exposure = assignments.assign(
+            cell_ids_json='["g:1:1"]',
+            center_lon=30.0,
+            center_lat=-2.0,
+            footprint_area_km2=25.0,
+        )
+        episode = {
+            "hazard_family": "heat",
+            "field_id": "field-1",
+            "crop_instance_id": "crop-1",
+            "episode_id": "episode-1",
+            "membership_role": "impact_lag",
+            "event_state": "CLOSED_RESPONSE_UNRESOLVED",
+            "response_class": "medium_decline",
+            "fresh_response_evidence": True,
+            "evaluable": True,
+            "is_data_gap": False,
+            "stage_bucket": "flowering",
+            "crop_name": "maize",
+            "grid_id": "g:1:1",
+        }
+        memberships = pd.DataFrame(
+            [
+                {
+                    "timeline_bucket": weeks[0],
+                    "component_id": "component-old",
+                    **episode,
+                },
+                {
+                    "timeline_bucket": weeks[1],
+                    "component_id": "component-new",
+                    **episode,
+                },
+            ]
+        )
+        cells = pd.DataFrame(
+            [
+                {
+                    "timeline_bucket": week,
+                    "hazard_family": "heat",
+                    "grid_x": 1,
+                    "grid_y": 1,
+                    "monitored_field_count": 10,
+                    "evaluable_field_count": 10,
+                    "passes_coverage_gate": True,
+                }
+                for week in weeks
+            ]
+        )
+        config = {
+            "policy_version": "test",
+            "minimum_evaluable_fields": 1,
+            "confirmation_observed_weeks": 2,
+        }
+        scaffold = build_crop_story_scaffold(
+            exposure, assignments, memberships, cells, config
+        )
+        incident_by_exposure = scaffold.catalog.set_index("exposure_id")[
+            "incident_id"
+        ].to_dict()
+        old_incident = incident_by_exposure["exposure_old"]
+        new_incident = incident_by_exposure["exposure_new"]
+        summary = pd.DataFrame(
+            [
+                {
+                    "timeline_bucket": row.timeline_bucket,
+                    "incident_id": row.incident_id,
+                    "stage_bucket": "flowering",
+                    "monitored_field_count": 1,
+                    "evaluable_field_count": 1,
+                    "monitored_crop_instance_count": 1,
+                    "evaluable_crop_instance_count": 1,
+                    "coverage_missing_cell_count": 0,
+                }
+                for row in scaffold.weekly_state.itertuples(index=False)
+            ]
+        )
+
+        result = finalize_crop_story_artifacts(
+            scaffold, summary, config, weekly_cells=cells
+        )
+
+        self.assertEqual(
+            set(result.catalog["incident_id"]), {old_incident, new_incident}
+        )
+        current_episode_owners = set(
+            result.memberships.loc[
+                result.memberships["timeline_bucket"].eq(weeks[1])
+                & result.memberships["episode_id"].eq("episode-1"),
+                "incident_id",
+            ]
+        )
+        self.assertEqual(current_episode_owners, {new_incident})
+        current_state = result.weekly_state[
+            result.weekly_state["timeline_bucket"].eq(weeks[1])
+        ].set_index("base_incident_id")
+        self.assertEqual(
+            current_state.loc[old_incident, "unresolved_carried_field_count"], 0
+        )
+        self.assertEqual(
+            current_state.loc[new_incident, "unresolved_carried_field_count"], 1
+        )
+
+        shuffled_scaffold = type(scaffold)(
+            catalog=scaffold.catalog.sample(frac=1, random_state=11),
+            weekly_state=scaffold.weekly_state.sample(frac=1, random_state=12),
+            memberships=scaffold.memberships.sample(frac=1, random_state=13),
+        )
+        shuffled = finalize_crop_story_artifacts(
+            shuffled_scaffold,
+            summary.sample(frac=1, random_state=14),
+            config,
+            weekly_cells=cells.sample(frac=1, random_state=15),
+        )
+        pd.testing.assert_frame_equal(result.weekly_state, shuffled.weekly_state)
+        pd.testing.assert_frame_equal(result.memberships, shuffled.memberships)
+
+        cutoff = weeks[1]
+        prefix_scaffold = type(scaffold)(
+            catalog=scaffold.catalog.copy(),
+            weekly_state=scaffold.weekly_state[
+                scaffold.weekly_state["timeline_bucket"].le(cutoff)
+            ].copy(),
+            memberships=scaffold.memberships[
+                scaffold.memberships["timeline_bucket"].le(cutoff)
+            ].copy(),
+        )
+        prefix = finalize_crop_story_artifacts(
+            prefix_scaffold,
+            summary[summary["timeline_bucket"].le(cutoff)].copy(),
+            config,
+            weekly_cells=cells[cells["timeline_bucket"].le(cutoff)].copy(),
+        )
+        expected_weekly = result.weekly_state[
+            result.weekly_state["timeline_bucket"].le(cutoff)
+        ].reset_index(drop=True)
+        weekly_columns = [
+            name
+            for name in prefix.weekly_state.columns
+            if not (
+                prefix.weekly_state[name].isna().all()
+                and expected_weekly[name].isna().all()
+            )
+        ]
+        pd.testing.assert_frame_equal(
+            prefix.weekly_state[weekly_columns],
+            expected_weekly[weekly_columns],
+            check_dtype=False,
+        )
+        expected_memberships = result.memberships[
+            result.memberships["timeline_bucket"].le(cutoff)
+        ].reset_index(drop=True)
+        membership_columns = [
+            name
+            for name in prefix.memberships.columns
+            if not (
+                prefix.memberships[name].isna().all()
+                and expected_memberships[name].isna().all()
+            )
+        ]
+        pd.testing.assert_frame_equal(
+            prefix.memberships[membership_columns],
+            expected_memberships[membership_columns],
+            check_dtype=False,
+        )
+
+        duplicate_followup = pd.DataFrame(
+            [
+                {
+                    "timeline_bucket": weeks[2],
+                    "incident_id": source,
+                    "field_id": "field-1",
+                    "crop_instance_id": "crop-1",
+                    "episode_id": "episode-1",
+                    "hazard_family": "heat",
+                    "event_state": "RECOVERING",
+                    "response_class": "recovery",
+                    "stage_bucket": "flowering",
+                    "knowledge_time": weeks[2],
+                    "fresh_decline_evidence": False,
+                    "fresh_recovery_evidence": True,
+                }
+                for source in (old_incident, new_incident)
+            ]
+        )
+        deduplicated = finalize_crop_story_artifacts(
+            scaffold,
+            summary,
+            config,
+            followup_evidence=duplicate_followup,
+            weekly_cells=cells,
+        )
+        recovered = deduplicated.memberships[
+            deduplicated.memberships["timeline_bucket"].eq(weeks[2])
+            & deduplicated.memberships["episode_id"].eq("episode-1")
+            & deduplicated.memberships["membership_role"].eq("recovered")
+        ]
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered.iloc[0]["incident_id"], new_incident)
+
+    def test_two_direct_current_claimants_for_one_unresolved_episode_fail(self) -> None:
+        fixture = _unresolved_ownership_fixture("duplicate_claim")
+        with self.assertRaisesRegex(
+            ValueError, "multiple direct current claimants"
+        ):
+            finalize_crop_story_artifacts(
+                fixture["scaffold"],
+                fixture["summary"],
+                fixture["config"],
+                weekly_cells=fixture["cells"],
+            )
+
+    def test_plain_watch_does_not_take_unresolved_episode_ownership(self) -> None:
+        fixture = _unresolved_ownership_fixture("watch")
+        result = finalize_crop_story_artifacts(
+            fixture["scaffold"],
+            fixture["summary"],
+            fixture["config"],
+            weekly_cells=fixture["cells"],
+        )
+        edge = result.weekly_state[
+            result.weekly_state["timeline_bucket"].eq(fixture["weeks"][1])
+        ].set_index("base_incident_id")
+        self.assertEqual(
+            edge.loc[fixture["old_incident"], "unresolved_carried_field_count"],
+            1,
+        )
+        self.assertEqual(
+            edge.loc[fixture["new_incident"], "unresolved_carried_field_count"],
+            0,
+        )
+        ownership = result.memberships[
+            result.memberships["membership_role"].isin(
+                {"impact_lag", "unresolved", "recovered"}
+            )
+            & result.memberships["timeline_bucket"].eq(fixture["weeks"][1])
+            & result.memberships["episode_id"].eq("episode-shared")
+        ]
+        self.assertEqual(set(ownership["incident_id"]), {fixture["old_incident"]})
+
     def test_unobservable_carried_impact_cell_freezes_lifecycle_coverage(self) -> None:
         weeks = pd.to_datetime(["2026-01-05", "2026-01-12"])
         assignments = pd.DataFrame(
@@ -767,6 +1026,39 @@ class IncidentStoryStatesV3Tests(unittest.TestCase):
         self.assertEqual(parent["incident_state"], "MERGED_INTO")
         self.assertFalse(bool(parent["data_censored_at_boundary"]))
 
+    def test_outgoing_merge_parent_cannot_reclaim_unresolved_episode(self) -> None:
+        fixture = _lineage_fixture("merge")
+        scaffold = fixture["scaffold"]
+        parent_id = fixture["parent_id"]
+        direct_claim = scaffold.memberships[
+            scaffold.memberships["incident_id"].eq(parent_id)
+            & scaffold.memberships["episode_id"].eq("episode-a")
+        ].iloc[[0]].copy()
+        direct_claim["timeline_bucket"] = fixture["weeks"][1]
+        direct_claim["component_id"] = "invalid-outgoing-parent-component"
+        direct_claim["membership_role"] = "impact_lag"
+        direct_claim["event_state"] = "CLOSED_RESPONSE_UNRESOLVED"
+        direct_claim["response_class"] = "medium_decline"
+        direct_claim["fresh_response_evidence"] = True
+        invalid_scaffold = type(scaffold)(
+            catalog=scaffold.catalog,
+            weekly_state=scaffold.weekly_state,
+            memberships=pd.concat(
+                [scaffold.memberships, direct_claim], ignore_index=True
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "Outgoing merge parent has a direct unresolved claim"
+        ):
+            finalize_crop_story_artifacts(
+                invalid_scaffold,
+                fixture["summary"],
+                fixture["config"],
+                incident_lineage=fixture["lineage"],
+                weekly_cells=fixture["cells"],
+            )
+
     def test_split_transfers_exact_episode_and_keeps_unmatched_with_parent(self) -> None:
         fixture = _lineage_fixture("split")
         result = finalize_crop_story_artifacts(
@@ -1041,6 +1333,168 @@ def _coverage_summary(
             for week in weeks
         ]
     )
+
+
+def _unresolved_ownership_fixture(mode: str) -> dict[str, object]:
+    weeks = pd.date_range("2026-01-05", periods=2, freq="7D")
+    old_assignment = {
+        "timeline_bucket": weeks[0],
+        "hazard_family": "heat",
+        "component_id": "component-old",
+        "exposure_id": "exposure_old",
+    }
+    shared = {
+        "hazard_family": "heat",
+        "field_id": "field-shared",
+        "crop_instance_id": "crop-shared",
+        "episode_id": "episode-shared",
+        "event_state": "RECOVERING",
+        "response_class": "medium_decline",
+        "evaluable": True,
+        "is_data_gap": False,
+        "stage_bucket": "flowering",
+        "crop_name": "maize",
+        "grid_id": "g:1:1",
+    }
+    records = [
+        {
+            **shared,
+            "timeline_bucket": weeks[0],
+            "component_id": "component-old",
+            "membership_role": "impact_lag",
+            "fresh_response_evidence": True,
+        }
+    ]
+    if mode == "duplicate_claim":
+        assignments = pd.DataFrame(
+            [
+                old_assignment,
+                {
+                    "timeline_bucket": weeks[1],
+                    "hazard_family": "heat",
+                    "component_id": "component-claim-a",
+                    "exposure_id": "exposure_claim_a",
+                },
+                {
+                    "timeline_bucket": weeks[1],
+                    "hazard_family": "heat",
+                    "component_id": "component-claim-b",
+                    "exposure_id": "exposure_claim_b",
+                },
+            ]
+        )
+        for component_id in ("component-claim-a", "component-claim-b"):
+            records.append(
+                {
+                    **shared,
+                    "timeline_bucket": weeks[1],
+                    "component_id": component_id,
+                    "membership_role": "impact_lag",
+                    "fresh_response_evidence": True,
+                }
+            )
+    elif mode == "watch":
+        assignments = pd.DataFrame(
+            [
+                old_assignment,
+                {
+                    "timeline_bucket": weeks[0],
+                    "hazard_family": "heat",
+                    "component_id": "component-new-0",
+                    "exposure_id": "exposure_new",
+                },
+                {
+                    "timeline_bucket": weeks[1],
+                    "hazard_family": "heat",
+                    "component_id": "component-new-1",
+                    "exposure_id": "exposure_new",
+                },
+            ]
+        )
+        records.extend(
+            [
+                {
+                    **shared,
+                    "timeline_bucket": weeks[0],
+                    "component_id": "component-new-0",
+                    "field_id": "field-new",
+                    "crop_instance_id": "crop-new",
+                    "episode_id": "episode-new",
+                    "membership_role": "pressure_core",
+                    "event_state": "ACTIVE",
+                    "response_class": "no_material_change",
+                    "fresh_response_evidence": False,
+                    "grid_id": "g:2:1",
+                },
+                {
+                    **shared,
+                    "timeline_bucket": weeks[1],
+                    "component_id": "component-new-1",
+                    "membership_role": "watch_frontier",
+                    "event_state": "WATCH",
+                    "response_class": "no_material_change",
+                    "fresh_response_evidence": False,
+                },
+            ]
+        )
+    else:
+        raise ValueError(f"Unsupported ownership fixture mode: {mode}")
+
+    exposure = assignments.assign(
+        cell_ids_json='["g:1:1"]',
+        center_lon=30.0,
+        center_lat=-2.0,
+        footprint_area_km2=25.0,
+    )
+    memberships = pd.DataFrame(records)
+    cells = pd.DataFrame(
+        [
+            {
+                "timeline_bucket": week,
+                "hazard_family": "heat",
+                "grid_x": x,
+                "grid_y": 1,
+                "monitored_field_count": 10,
+                "evaluable_field_count": 10,
+                "passes_coverage_gate": True,
+            }
+            for week in weeks
+            for x in (1, 2)
+        ]
+    )
+    config = {
+        "policy_version": "test",
+        "minimum_evaluable_fields": 1,
+        "confirmation_observed_weeks": 2,
+    }
+    scaffold = build_crop_story_scaffold(
+        exposure, assignments, memberships, cells, config
+    )
+    summary = pd.DataFrame(
+        [
+            {
+                "timeline_bucket": row.timeline_bucket,
+                "incident_id": row.incident_id,
+                "stage_bucket": "flowering",
+                "monitored_field_count": 2,
+                "evaluable_field_count": 2,
+                "monitored_crop_instance_count": 2,
+                "evaluable_crop_instance_count": 2,
+                "coverage_missing_cell_count": 0,
+            }
+            for row in scaffold.weekly_state.itertuples(index=False)
+        ]
+    )
+    ids = scaffold.catalog.set_index("exposure_id")["incident_id"].to_dict()
+    return {
+        "weeks": weeks,
+        "scaffold": scaffold,
+        "summary": summary,
+        "cells": cells,
+        "config": config,
+        "old_incident": ids["exposure_old"],
+        "new_incident": ids.get("exposure_new"),
+    }
 
 
 def _lineage_fixture(kind: str) -> dict[str, object]:

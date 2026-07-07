@@ -413,8 +413,9 @@ def finalize_crop_story_artifacts(
     """Advance all crop stories in causal week order.
 
     Week-major scheduling is essential here: unresolved crop-response episodes
-    may cross a split/merge edge.  Ownership moves before current-week evidence
-    is applied, so a recovery on the child can resolve prior parent evidence;
+    may cross a split/merge edge or receive an exact direct claim from another
+    current component.  Ownership moves before current-week evidence is
+    applied, so a recovery on the new owner can resolve prior evidence;
     terminal segments are cleared immediately and cannot leak into recurrence.
     """
     if scaffold.catalog.empty:
@@ -566,7 +567,23 @@ def finalize_crop_story_artifacts(
             redirects,
         )
 
-        owned_followup: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        # Impact-only memberships are intentionally excluded from physical
+        # exposure tracking.  Consequently, an exact crop-response episode can
+        # move to another current component without a split/merge edge.  A
+        # direct current unresolved claim is stronger than stale carried
+        # ownership, so hand the registry entry over atomically before either
+        # story consumes this week's response evidence.
+        _reconcile_direct_unresolved_claims(
+            week,
+            runtimes,
+            current_by_base,
+            redirects,
+            lineage_by_week.get(week, lineage.iloc[0:0]),
+        )
+
+        owned_followup_by_key: dict[
+            tuple[str, tuple[str, str, str]], dict[str, Any]
+        ] = {}
         for row in followup_by_week.get(week, followup.iloc[0:0]).to_dict("records"):
             source = str(row["incident_id"])
             evidence_key = _evidence_key(row)
@@ -579,8 +596,17 @@ def finalize_crop_story_artifacts(
             ):
                 continue
             remapped = {**row, "incident_id": owner}
-            owned_followup[owner].append(remapped)
-            owned_followup_records.append(remapped)
+            owner_key = (owner, evidence_key)
+            previous = owned_followup_by_key.get(owner_key)
+            if previous is not None:
+                _assert_equivalent_followup(previous, remapped)
+            else:
+                owned_followup_by_key[owner_key] = remapped
+
+        owned_followup: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for (owner, _), row in sorted(owned_followup_by_key.items()):
+            owned_followup[owner].append(row)
+            owned_followup_records.append(row)
 
         for base in bases_this_week:
             runtime = runtimes[base]
@@ -874,6 +900,7 @@ def finalize_crop_story_artifacts(
             ["timeline_bucket", "incident_id", "membership_role", "field_id"],
             kind="mergesort",
         ).reset_index(drop=True)
+        _assert_unique_membership_episode_owners(memberships)
     catalog = pd.DataFrame(catalog_records)
     if not catalog.empty and not memberships.empty:
         counts = memberships.groupby("incident_id", as_index=False, sort=False).agg(
@@ -1146,6 +1173,44 @@ def _normalize_followup(frame: pd.DataFrame | None) -> pd.DataFrame:
     return output
 
 
+def _assert_equivalent_followup(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> None:
+    """Canonicalize duplicate historical owners only when evidence agrees."""
+    columns = (
+        "timeline_bucket",
+        "field_id",
+        "crop_instance_id",
+        "episode_id",
+        "hazard_family",
+        "event_state",
+        "response_class",
+        "stage_bucket",
+        "knowledge_time",
+        "fresh_decline_evidence",
+        "fresh_recovery_evidence",
+    )
+    conflicts: list[str] = []
+    for name in columns:
+        left_value = left.get(name)
+        right_value = right.get(name)
+        if pd.isna(left_value) and pd.isna(right_value):
+            continue
+        if name in {"timeline_bucket", "knowledge_time"}:
+            equal = pd.Timestamp(left_value) == pd.Timestamp(right_value)
+        elif name in {"fresh_decline_evidence", "fresh_recovery_evidence"}:
+            equal = bool(left_value) == bool(right_value)
+        else:
+            equal = str(left_value) == str(right_value)
+        if not equal:
+            conflicts.append(name)
+    if conflicts:
+        raise ValueError(
+            "Duplicate remapped follow-up evidence conflicts in: "
+            + ", ".join(conflicts)
+        )
+
+
 def _normalize_lineage(frame: pd.DataFrame | None) -> pd.DataFrame:
     columns = [
         "timeline_bucket", "parent_incident_id", "child_incident_id",
@@ -1238,6 +1303,105 @@ def _merge_target(lineage: pd.DataFrame, week: pd.Timestamp) -> str | None:
     return str(rows.iloc[0]["child_incident_id"])
 
 
+def _row_claims_unresolved_ownership(row: Mapping[str, Any]) -> bool:
+    """Return whether a current row directly owns unresolved crop response."""
+    response = str(row.get("response_class") or "").lower()
+    fresh = bool(row.get("fresh_response_evidence"))
+    return bool(
+        str(row.get("membership_role") or "") == "impact_lag"
+        or str(row.get("event_state") or "").upper()
+        == "CLOSED_RESPONSE_UNRESOLVED"
+        or (fresh and response in {"medium_decline", "severe_decline"})
+    )
+
+
+def _unresolved_owner_lookup(
+    runtimes: Mapping[str, Mapping[str, Any]],
+) -> dict[tuple[str, tuple[str, str, str]], str]:
+    _assert_unique_unresolved_owners(runtimes)
+    owners: dict[tuple[str, tuple[str, str, str]], str] = {}
+    for base, runtime in runtimes.items():
+        if runtime.get("incident_id") is None:
+            continue
+        hazard = str(runtime.get("hazard") or "")
+        for evidence_key in runtime.get("unresolved", {}):
+            owners[(hazard, evidence_key)] = base
+    return owners
+
+
+def _reconcile_direct_unresolved_claims(
+    week: pd.Timestamp,
+    runtimes: dict[str, dict[str, Any]],
+    current_by_base: Mapping[str, pd.DataFrame],
+    redirects: dict[tuple[str, tuple[str, str, str]], str],
+    lineage_edges: pd.DataFrame,
+) -> None:
+    """Move stale carried ownership to the one admitted current claimant."""
+    owners = _unresolved_owner_lookup(runtimes)
+    outgoing_merge_parents: set[str] = set()
+    if not lineage_edges.empty:
+        outgoing_merge_parents = set(
+            lineage_edges.loc[
+                lineage_edges["lineage_type"].astype(str).str.lower().eq("merge"),
+                "parent_incident_id",
+            ].astype(str)
+        )
+    claimants: dict[
+        tuple[str, tuple[str, str, str]], set[str]
+    ] = defaultdict(set)
+    for base in sorted(current_by_base):
+        runtime = runtimes.get(base)
+        if runtime is None or runtime.get("incident_id") is None:
+            continue
+        hazard = str(runtime.get("hazard") or "")
+        for row in current_by_base[base].to_dict("records"):
+            if _row_claims_unresolved_ownership(row):
+                claimants[(hazard, _evidence_key(row))].add(base)
+
+    for owner_key in sorted(claimants):
+        direct = sorted(claimants[owner_key])
+        if len(direct) > 1:
+            hazard, evidence_key = owner_key
+            raise ValueError(
+                "Unresolved episode has multiple direct current claimants: "
+                f"week={pd.Timestamp(week).date()}, hazard={hazard}, "
+                f"evidence={evidence_key}, claimants={','.join(direct)}"
+            )
+        current_owner = direct[0]
+        if current_owner in outgoing_merge_parents:
+            hazard, evidence_key = owner_key
+            raise ValueError(
+                "Outgoing merge parent has a direct unresolved claim: "
+                f"week={pd.Timestamp(week).date()}, hazard={hazard}, "
+                f"evidence={evidence_key}, claimant={current_owner}"
+            )
+        previous_owner = owners.get(owner_key)
+        if previous_owner is None or previous_owner == current_owner:
+            continue
+
+        evidence_key = owner_key[1]
+        previous_runtime = runtimes[previous_owner]
+        current_runtime = runtimes[current_owner]
+        if evidence_key in current_runtime["unresolved"]:
+            raise ValueError(
+                "Direct unresolved claimant already owns a duplicate registry entry: "
+                f"week={pd.Timestamp(week).date()}, evidence={evidence_key}, "
+                f"owners={previous_owner},{current_owner}"
+            )
+        evidence = previous_runtime["unresolved"].pop(evidence_key)
+        previous_runtime["recovered"].discard(evidence_key)
+        previous_runtime["seed_keys"].discard(evidence_key)
+        current_runtime["unresolved"][evidence_key] = evidence
+        current_runtime["recovered"].discard(evidence_key)
+        current_runtime["seed_keys"].add(evidence_key)
+        for origin_key, owner in list(redirects.items()):
+            if origin_key[1] == evidence_key and owner == previous_owner:
+                redirects[origin_key] = current_owner
+        redirects[(previous_owner, evidence_key)] = current_owner
+
+    _assert_unique_unresolved_owners(runtimes)
+
+
 def _apply_impact_registry(
     unresolved: dict[tuple[str, str, str], dict[str, Any]],
     recovered: set[tuple[str, str, str]],
@@ -1250,11 +1414,7 @@ def _apply_impact_registry(
         evidence_key = _evidence_key(row)
         response = str(row.get("response_class") or "").lower()
         fresh = bool(row.get("fresh_response_evidence"))
-        is_unresolved = (
-            str(row.get("membership_role") or "") == "impact_lag"
-            or str(row.get("event_state") or "").upper() == "CLOSED_RESPONSE_UNRESOLVED"
-            or (fresh and response in {"medium_decline", "severe_decline"})
-        )
+        is_unresolved = _row_claims_unresolved_ownership(row)
         if is_unresolved:
             unresolved[evidence_key] = row
         if fresh and response in {"medium_decline", "severe_decline"}:
@@ -1414,6 +1574,41 @@ def _assert_unique_unresolved_owners(
                     f"owners={previous},{base}"
                 )
             owners[owner_key] = base
+
+
+def _assert_unique_membership_episode_owners(memberships: pd.DataFrame) -> None:
+    """Fail if one ownership-bearing episode is published under two stories."""
+    ownership_rows = memberships[
+        memberships.apply(
+            lambda row: (
+                _row_claims_unresolved_ownership(row)
+                or str(row.get("membership_role") or "")
+                in {"unresolved", "recovered"}
+            ),
+            axis=1,
+        )
+    ].copy()
+    if ownership_rows.empty:
+        return
+    key = [
+        "timeline_bucket",
+        "hazard_family",
+        "field_id",
+        "crop_instance_id",
+        "episode_id",
+    ]
+    conflicts = (
+        ownership_rows.groupby(key, dropna=False, sort=True)["incident_id"]
+        .agg(lambda values: tuple(sorted(set(str(value) for value in values))))
+    )
+    conflicts = conflicts[conflicts.map(len) > 1]
+    if conflicts.empty:
+        return
+    evidence, owners = conflicts.index[0], conflicts.iloc[0]
+    raise ValueError(
+        "Incident membership has multiple unresolved episode owners: "
+        f"evidence={evidence}, owners={','.join(owners)}"
+    )
 
 
 def _segment_start_evidence(current: pd.DataFrame) -> bool:
