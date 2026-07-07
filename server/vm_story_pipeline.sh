@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REQUIRED_COMMIT=59b2dd82956062d7db712b51e880011bd93dd9ee
+REQUIRED_COMMIT=4f56ac81e9fcc289b554ec58fcbfd1fee0946651
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DEFAULT_REPO=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
