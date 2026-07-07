@@ -161,7 +161,11 @@ def diagnose(job_dir: Path, *, example_limit: int = 50) -> dict[str, Any]:
             """
             SELECT classification, COUNT(*) AS field_claim_count,
               COUNT(DISTINCT incident_id || '|' || CAST(story_week AS VARCHAR))
-                AS checkpoint_count
+                AS checkpoint_count,
+              SUM(same_decline_family_count) AS matching_decline_count,
+              SUM(different_severity_count) AS different_severity_count,
+              SUM(decline_known_by_v3_claim_count) AS known_by_claim_clock_count,
+              SUM(delayed_knowledge_decline_count) AS delayed_knowledge_count
             FROM classified_claims
             GROUP BY classification
             ORDER BY field_claim_count DESC, classification
@@ -250,6 +254,7 @@ def main() -> None:
     parser.add_argument("--job-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--example-limit", type=int, default=50)
+    parser.add_argument("--print-json", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.example_limit <= 1000:
         parser.error("--example-limit must be between 1 and 1000")
@@ -257,8 +262,39 @@ def main() -> None:
     output = args.output or args.job_dir / "lifecycle_reconciliation_diagnostic.json"
     output = output.expanduser().resolve()
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(json.dumps(result, indent=2, sort_keys=True))
-    print(f"Diagnostic written to {output}")
+    if args.print_json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"DECLINE_FIELD_CLAIMS={result['decline_field_claim_count']}")
+        for row in result["classification_summary"]:
+            print(
+                "CLASSIFICATION "
+                f"name={row['classification']} "
+                f"field_claims={row['field_claim_count']} "
+                f"checkpoints={row['checkpoint_count']} "
+                f"matching_declines={row['matching_decline_count']} "
+                f"different_severity={row['different_severity_count']} "
+                f"known_by_claim_clock={row['known_by_claim_clock_count']} "
+                f"delayed_knowledge={row['delayed_knowledge_count']}"
+            )
+        mismatches = result["weekly_membership_count_mismatches"]
+        print(f"WEEKLY_MEMBERSHIP_COUNT_MISMATCHES={len(mismatches)}")
+        for row in mismatches[:10]:
+            print(
+                "COUNT_MISMATCH "
+                f"incident={row['incident_id']} week={str(row['story_week'])[:10]} "
+                f"weekly={row['weekly_decline_fields']} "
+                f"membership={row['member_decline_fields']}"
+            )
+        reconciliation = result.get("evidence_acquisition_reconciliation") or {}
+        print(
+            "ACQUISITION_RECONCILIATION "
+            f"candidates={reconciliation.get('candidate_acquisition_count')} "
+            f"published={reconciliation.get('published_acquisition_count')} "
+            "excluded_without_causal_crop="
+            f"{reconciliation.get('excluded_without_causal_crop_count')}"
+        )
+    print(f"DIAGNOSTIC_JSON={output}")
 
 
 if __name__ == "__main__":
