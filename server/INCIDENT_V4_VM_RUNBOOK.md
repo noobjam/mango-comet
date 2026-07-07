@@ -107,8 +107,10 @@ are recorded instead of disappearing behind a silent DuckDB command.
 as a partial attempt ledger while building evidence. External attempts are
 merged by field/source date with acquisitions derived from the complete
 2025–2026 source; they never replace 2025 history. This retains unmatched
-rejected attempts and deduplicates overlaps. The enriched-source sidecar mode
-must exactly match `--availability-mode`, and enriched field/day keys must
+rejected attempts and deduplicates overlaps. Attempts before the first causal
+crop assignment remain visible in manifest reconciliation counts but are not
+future-assigned into the crop-qualified S2 ledger. The enriched-source sidecar
+mode must exactly match `--availability-mode`, and enriched field/day keys must
 exactly reconcile with the selected generation.
 
 ```bash

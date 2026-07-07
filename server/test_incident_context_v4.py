@@ -327,6 +327,127 @@ class IncidentContextV4Tests(unittest.TestCase):
             self.assertEqual(overlap["acquisition_origin"], "external_and_derived")
             self.assertTrue(overlap["spectral_usable"])
 
+    def test_acquisition_before_first_crop_context_is_audited_not_future_assigned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generation = root / "generation"
+            generation.mkdir()
+            _write_generation(generation)
+            enriched = root / "enriched.parquet"
+            frame = _enriched_frame()
+            frame.loc[0, "sentinel_observation_date"] = "2024-12-25"
+            frame.loc[0, "spectral_echo_days"] = 7
+            frame.loc[0, "spectral_available_at"] = "2025-01-01 00:00:00"
+            frame.to_parquet(enriched, index=False)
+            _write_enriched_manifest(enriched, "reconstructed")
+            attempts = root / "attempts.parquet"
+            pd.DataFrame(
+                [
+                    {
+                        "field_id": "field-1",
+                        "prediction_observation_date": "2024-12-20",
+                        "valid_pixel_fraction": 0.0,
+                        "s2_good_observation": False,
+                    }
+                ]
+            ).to_parquet(attempts, index=False)
+
+            evidence = root / "evidence"
+            result = build_incident_context_v4(
+                generation,
+                evidence,
+                released_at=RELEASED_AT,
+                enriched_source_parquet=enriched,
+                acquisition_parquet=attempts,
+                availability_mode="reconstructed",
+                threads=1,
+            )
+
+            self.assertEqual(result["spectral_acquisition_count"], 3)
+            acquisitions = pd.read_parquet(
+                evidence / "field_s2_acquisition_v4.parquet"
+            )
+            self.assertNotIn(
+                "2024-12-25",
+                set(acquisitions["spectral_source_date"].astype(str)),
+            )
+            manifest = json.loads((evidence / "manifest.json").read_text())
+            reconciliation = manifest["reconciliation"]["s2_acquisitions"]
+            self.assertEqual(reconciliation["candidate_acquisition_count"], 5)
+            self.assertEqual(
+                reconciliation["excluded_without_causal_crop_count"], 2
+            )
+            self.assertEqual(
+                reconciliation[
+                    "excluded_derived_only_without_causal_crop_count"
+                ],
+                1,
+            )
+            self.assertEqual(
+                reconciliation[
+                    "excluded_external_only_without_causal_crop_count"
+                ],
+                1,
+            )
+            self.assertEqual(reconciliation["published_acquisition_count"], 3)
+
+    def test_reconstructed_external_availability_before_source_date_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generation = root / "generation"
+            generation.mkdir()
+            _write_generation(generation)
+            enriched = root / "enriched.parquet"
+            _write_enriched(enriched)
+            attempts = root / "attempts.parquet"
+            pd.DataFrame(
+                [
+                    {
+                        "field_id": "field-1",
+                        "sentinel_observation_date": "2024-12-20",
+                        "first_seen_observation_date": "2024-12-19",
+                    }
+                ]
+            ).to_parquet(attempts, index=False)
+
+            evidence = root / "must-not-exist"
+            with self.assertRaisesRegex(ValueError, "invalid causal candidates"):
+                build_incident_context_v4(
+                    generation,
+                    evidence,
+                    released_at=RELEASED_AT,
+                    enriched_source_parquet=enriched,
+                    acquisition_parquet=attempts,
+                    availability_mode="reconstructed",
+                    threads=1,
+                )
+            self.assertFalse(evidence.exists())
+
+    def test_existing_crop_context_with_null_crop_instance_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generation = root / "generation"
+            generation.mkdir()
+            _write_generation(generation)
+            signals = generation / "daily_causal_signals.parquet"
+            frame = pd.read_parquet(signals)
+            frame.loc[0, "crop_instance_id"] = None
+            frame.to_parquet(signals, index=False)
+            enriched = root / "enriched.parquet"
+            _write_enriched(enriched)
+
+            evidence = root / "must-not-exist"
+            with self.assertRaisesRegex(ValueError, "invalid causal candidates"):
+                build_incident_context_v4(
+                    generation,
+                    evidence,
+                    released_at=RELEASED_AT,
+                    enriched_source_parquet=enriched,
+                    availability_mode="reconstructed",
+                    threads=1,
+                )
+            self.assertFalse(evidence.exists())
+
     def test_future_echo_mismatch_and_missing_strict_time_fail_atomically(self) -> None:
         mutations = (
             (

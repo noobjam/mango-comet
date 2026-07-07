@@ -563,6 +563,8 @@ def _create_acquisition_base(
             ELSE 'usable' END AS acquisition_status
         FROM acquisition_candidates_v4
         WHERE spectral_source_date IS NOT NULL
+          AND crop_assignment_effective_date IS NOT NULL
+          AND crop_instance_id IS NOT NULL
         """
     )
 
@@ -677,24 +679,37 @@ def _validate_source_causality(con: duckdb.DuckDBPyConnection, mode: str) -> Non
 
 
 def _validate_acquisition_causality(con: duckdb.DuckDBPyConnection, mode: str) -> None:
-    invalid = int(con.execute(
+    invalid_candidates = int(con.execute(
+        """
+        SELECT COUNT(*) FROM acquisition_candidates_v4
+        WHERE spectral_source_date IS NOT NULL
+          AND (spectral_available_at IS NULL OR knowledge_time IS NULL
+           OR (crop_assignment_effective_date IS NOT NULL
+             AND crop_instance_id IS NULL)
+           OR spectral_available_at < CAST(spectral_source_date AS TIMESTAMP)
+           OR crop_assignment_effective_date > spectral_source_date
+           OR knowledge_time < spectral_available_at
+           OR knowledge_time < crop_assignment_available_at)
+        """
+    ).fetchone()[0])
+    invalid_published = int(con.execute(
         """
         SELECT COUNT(*) FROM acquisition_base_v4
         WHERE crop_instance_id IS NULL OR spectral_available_at IS NULL
            OR knowledge_time IS NULL
-           OR spectral_available_at < CAST(spectral_source_date AS TIMESTAMP)
-           OR crop_assignment_effective_date > spectral_source_date
-           OR knowledge_time < spectral_available_at
-           OR knowledge_time < crop_assignment_available_at
         """
     ).fetchone()[0])
-    if invalid:
+    if invalid_candidates or invalid_published:
         label = "strict" if mode == "strict" else "reconstructed"
-        raise ValueError(f"{label} acquisition source has {invalid} invalid causal rows")
+        raise ValueError(
+            f"{label} acquisition source has "
+            f"{invalid_candidates} invalid causal candidates and "
+            f"{invalid_published} invalid published rows"
+        )
 
 
 def _acquisition_reconciliation(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
-    row = con.execute(
+    published = con.execute(
         """
         SELECT
           COUNT(*) FILTER (WHERE acquisition_origin = 'derived_daily_source'),
@@ -704,11 +719,55 @@ def _acquisition_reconciliation(con: duckdb.DuckDBPyConnection) -> dict[str, int
         FROM acquisition_base_v4
         """
     ).fetchone()
+    candidates = con.execute(
+        """
+        SELECT COUNT(*),
+          COUNT(*) FILTER (WHERE crop_assignment_effective_date IS NULL),
+          COUNT(*) FILTER (
+            WHERE crop_assignment_effective_date IS NULL
+              AND acquisition_origin = 'derived_daily_source'
+          ),
+          COUNT(*) FILTER (
+            WHERE crop_assignment_effective_date IS NULL
+              AND acquisition_origin = 'external_attempt'
+          ),
+          COUNT(*) FILTER (
+            WHERE crop_assignment_effective_date IS NULL
+              AND acquisition_origin = 'external_and_derived'
+          )
+        FROM acquisition_candidates_v4
+        WHERE spectral_source_date IS NOT NULL
+        """
+    ).fetchone()
+    candidate_count = int(candidates[0] or 0)
+    excluded_count = int(candidates[1] or 0)
+    published_count = int(published[3] or 0)
+    excluded_origin_count = sum(int(value or 0) for value in candidates[2:5])
+    published_origin_count = sum(int(value or 0) for value in published[0:3])
+    if (
+        candidate_count != published_count + excluded_count
+        or excluded_count != excluded_origin_count
+        or published_count != published_origin_count
+    ):
+        raise ValueError(
+            "Incident V4 acquisition reconciliation failed: "
+            f"candidates={candidate_count}, published={published_count}, "
+            f"excluded_without_causal_crop={excluded_count}, "
+            f"published_origins={published_origin_count}, "
+            f"excluded_origins={excluded_origin_count}"
+        )
     return {
-        "derived_only_count": int(row[0] or 0),
-        "external_only_count": int(row[1] or 0),
-        "external_and_derived_count": int(row[2] or 0),
-        "published_acquisition_count": int(row[3] or 0),
+        "candidate_acquisition_count": candidate_count,
+        "excluded_without_causal_crop_count": excluded_count,
+        "excluded_derived_only_without_causal_crop_count": int(candidates[2] or 0),
+        "excluded_external_only_without_causal_crop_count": int(candidates[3] or 0),
+        "excluded_external_and_derived_without_causal_crop_count": int(
+            candidates[4] or 0
+        ),
+        "derived_only_count": int(published[0] or 0),
+        "external_only_count": int(published[1] or 0),
+        "external_and_derived_count": int(published[2] or 0),
+        "published_acquisition_count": published_count,
     }
 
 

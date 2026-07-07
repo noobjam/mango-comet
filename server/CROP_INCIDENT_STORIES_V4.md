@@ -128,6 +128,12 @@ rejection reason, and provenance. A source date is unique within a crop
 instance. A repeated/corrected source date is rejected until the explicit
 revision/supersession contract described below exists.
 
+An acquisition whose source date precedes the field's first causally known crop
+assignment is not attached to that future crop. It is excluded from this
+crop-qualified ledger and counted by origin under
+`reconciliation.s2_acquisitions.excluded_without_causal_crop_count` in the
+evidence manifest.
+
 ## Availability modes
 
 `strict` mode requires retained source availability timestamps and is eligible
