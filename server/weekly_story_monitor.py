@@ -165,6 +165,14 @@ def build_parser() -> argparse.ArgumentParser:
     incidents_v3.add_argument("--threads", type=_positive_int, default=16)
     incidents_v3.add_argument("--memory-limit")
     incidents_v3.add_argument("--temp-dir", type=Path)
+    incidents_v3.add_argument(
+        "--finalizer-failure-capsule",
+        type=Path,
+        help=(
+            "Opt-in directory written atomically only when the stage-9 story "
+            "finalizer fails; successful builds create nothing there."
+        ),
+    )
     release_mode = incidents_v3.add_mutually_exclusive_group(required=True)
     release_mode.add_argument(
         "--previous-incident-dir",
@@ -179,6 +187,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Explicitly declare that no prior Incident V3 release exists.",
     )
+
+    replay_incidents_v3 = subparsers.add_parser(
+        "replay-incidents-v3-finalizer",
+        help=(
+            "Verify a stage-9 failure capsule and replay its captured story "
+            "finalizer call once without publishing artifacts."
+        ),
+    )
+    replay_incidents_v3.add_argument("--capsule-dir", type=Path, required=True)
 
     train_incident_archetypes_v3 = subparsers.add_parser(
         "train-incident-archetypes-v3",
@@ -373,6 +390,12 @@ def main() -> None:
             args.output_dir,
             stability_runs=args.stability_runs,
         )
+    elif args.command == "replay-incidents-v3-finalizer":
+        from story_monitor.incident_workflow_v3 import (
+            replay_finalizer_failure_capsule,
+        )
+
+        payload = replay_finalizer_failure_capsule(args.capsule_dir)
     elif args.command == "train-incident-archetypes-v3":
         from story_monitor.incident_archetype_discovery_v3 import (
             IncidentArchetypeDiscoveryConfig,
@@ -437,6 +460,7 @@ def main() -> None:
             threads=args.threads,
             memory_limit=args.memory_limit,
             temp_dir=args.temp_dir,
+            finalizer_failure_capsule=args.finalizer_failure_capsule,
             previous_incident_dir=args.previous_incident_dir,
             first_release=args.first_release,
         )

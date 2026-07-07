@@ -479,6 +479,7 @@ def finalize_crop_story_artifacts(
             "unresolved": {},
             "recovered": set(),
             "seed_keys": set(),
+            "seed_weeks": {},
             "story_rows": [],
         }
 
@@ -550,14 +551,21 @@ def finalize_crop_story_artifacts(
                         "unresolved": {},
                         "recovered": set(),
                         "seed_keys": set(),
+                        "seed_weeks": {},
                         "story_rows": [],
                     }
                 )
                 catalog_records.append(segment_item)
             if runtime["incident_id"] is not None:
-                runtime["seed_keys"].update(
-                    _evidence_key(row) for row in current.to_dict("records")
-                )
+                for row in current.to_dict("records"):
+                    evidence_key = _evidence_key(row)
+                    runtime["seed_keys"].add(evidence_key)
+                    runtime["seed_weeks"][evidence_key] = max(
+                        pd.Timestamp(
+                            runtime["seed_weeks"].get(evidence_key, week)
+                        ).normalize(),
+                        week,
+                    )
 
         _transfer_lineage_registries_for_week(
             week,
@@ -589,7 +597,29 @@ def finalize_crop_story_artifacts(
         )
         unresolved_owners = _unresolved_owner_lookup(runtimes)
         recovered_owners = _recovered_owner_lookup(runtimes)
-        seed_owners = _active_seed_owner_lookup(runtimes)
+        seed_owners = _causal_seed_owner_lookup(runtimes)
+        live_owners = {
+            base
+            for base in bases_this_week
+            if runtimes[base].get("incident_id") is not None
+        }
+
+        registry_current_records: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        actionable: dict[
+            tuple[str, tuple[str, str, str]],
+            list[tuple[str, str, dict[str, Any]]],
+        ] = defaultdict(list)
+        for base in bases_this_week:
+            for row in current_by_base[base].to_dict("records"):
+                if _row_reports_fresh_recovery(row):
+                    evidence_key = _evidence_key(row)
+                    owner_key = (
+                        str(row.get("hazard_family") or ""), evidence_key
+                    )
+                    actionable[owner_key].append(("current", base, row))
+                else:
+                    registry_current_records[base].append(row)
+
         for row in followup_by_week.get(week, followup.iloc[0:0]).to_dict("records"):
             if not bool(row.get("fresh_decline_evidence")) and not bool(
                 row.get("fresh_recovery_evidence")
@@ -598,43 +628,63 @@ def finalize_crop_story_artifacts(
             source = str(row["incident_id"])
             evidence_key = _evidence_key(row)
             owner_key = (str(row.get("hazard_family") or ""), evidence_key)
-            owner = (
-                direct_owners.get(owner_key)
-                or unresolved_owners.get(owner_key)
-                or recovered_owners.get(owner_key)
-                or redirects.get((source, evidence_key))
+            actionable[owner_key].append(("followup", source, row))
+
+        for owner_key, rows in sorted(actionable.items()):
+            sources = {source for _, source, _ in rows}
+            owner = _resolve_episode_owner(
+                week,
+                sources,
+                owner_key,
+                direct_owners,
+                unresolved_owners,
+                recovered_owners,
+                redirects,
+                seed_owners,
+                live_owners,
             )
             if owner is None:
-                candidates = sorted(seed_owners.get(owner_key, set()))
-                if len(candidates) > 1:
-                    raise ValueError(
-                        "Follow-up evidence has ambiguous active story seeds: "
-                        f"week={week.date()}, hazard={owner_key[0]}, "
-                        f"evidence={evidence_key}, owners={','.join(candidates)}"
-                    )
-                owner = candidates[0] if candidates else None
-            if owner is None:
                 continue
-            if owner != source:
-                # Persist the causal owner through a recovery observation.  A
-                # recovery removes the key from ``unresolved`` below, so a
-                # later relapse must still return to this story rather than
-                # the historical source that happened to seed the follow-up.
-                redirects[(source, evidence_key)] = owner
             runtime = runtimes.get(owner)
-            if (
-                runtime is None
-                or runtime["incident_id"] is None
-                or evidence_key not in runtime["seed_keys"]
-            ):
-                continue
-            remapped = {**row, "incident_id": owner}
-            owner_key = (owner, evidence_key)
-            previous = owned_followup_by_key.get(owner_key)
-            if previous is not None:
-                _assert_equivalent_followup(previous, remapped)
-            else:
-                owned_followup_by_key[owner_key] = remapped
+            if runtime is None or owner not in live_owners:
+                raise ValueError(
+                    "Evidence owner has no active causal story row: "
+                    f"week={week.date()}, owner={owner}, evidence={owner_key[1]}"
+                )
+            _establish_episode_seed_owner(
+                owner_key, owner, week, runtimes, redirects
+            )
+            evidence_key = owner_key[1]
+            for kind, source, row in rows:
+                if owner != source:
+                    redirects[(source, evidence_key)] = owner
+                if kind == "current":
+                    if owner == source:
+                        registry_current_records[owner].append(row)
+                    else:
+                        remapped = _current_recovery_as_followup(row, owner)
+                        followup_key = (owner, evidence_key)
+                        previous = owned_followup_by_key.get(followup_key)
+                        if previous is not None:
+                            _assert_equivalent_followup(previous, remapped)
+                        else:
+                            owned_followup_by_key[followup_key] = remapped
+                    continue
+                remapped = {**row, "incident_id": owner}
+                followup_key = (owner, evidence_key)
+                previous = owned_followup_by_key.get(followup_key)
+                if previous is not None:
+                    _assert_equivalent_followup(previous, remapped)
+                else:
+                    owned_followup_by_key[followup_key] = remapped
+
+        registry_current_by_base = {
+            base: pd.DataFrame(
+                registry_current_records.get(base, []),
+                columns=scaffold.memberships.columns,
+            )
+            for base in bases_this_week
+        }
 
         owned_followup: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for (owner, _), row in sorted(owned_followup_by_key.items()):
@@ -648,7 +698,7 @@ def finalize_crop_story_artifacts(
             if incident_id is None or segment_item is None:
                 continue
             base_row = story_rows_by_key[(base, week)]
-            current_members = current_by_base[base]
+            current_members = registry_current_by_base[base]
             current_followup = pd.DataFrame(
                 owned_followup.get(base, []), columns=followup.columns
             )
@@ -866,6 +916,7 @@ def finalize_crop_story_artifacts(
                         "unresolved": {},
                         "recovered": set(),
                         "seed_keys": set(),
+                        "seed_weeks": {},
                         "story_rows": [],
                     }
                 )
@@ -1207,6 +1258,28 @@ def _normalize_followup(frame: pd.DataFrame | None) -> pd.DataFrame:
     return output
 
 
+def _current_recovery_as_followup(
+    row: Mapping[str, Any], owner: str
+) -> dict[str, Any]:
+    """Represent routed recovery separately from its physical context row."""
+    return {
+        "timeline_bucket": pd.Timestamp(row["timeline_bucket"]).normalize(),
+        "incident_id": owner,
+        "field_id": str(row.get("field_id") or "unknown_field"),
+        "crop_instance_id": str(
+            row.get("crop_instance_id") or "unknown_crop_instance"
+        ),
+        "episode_id": str(row.get("episode_id") or "unknown_episode"),
+        "hazard_family": str(row.get("hazard_family") or ""),
+        "event_state": str(row.get("event_state") or "RECOVERING"),
+        "response_class": "recovery",
+        "stage_bucket": str(row.get("stage_bucket") or "unknown"),
+        "knowledge_time": row.get("knowledge_time"),
+        "fresh_decline_evidence": False,
+        "fresh_recovery_evidence": True,
+    }
+
+
 def _assert_equivalent_followup(
     left: Mapping[str, Any], right: Mapping[str, Any]
 ) -> None:
@@ -1349,6 +1422,12 @@ def _row_claims_unresolved_ownership(row: Mapping[str, Any]) -> bool:
     )
 
 
+def _row_reports_fresh_recovery(row: Mapping[str, Any]) -> bool:
+    return bool(row.get("fresh_response_evidence")) and str(
+        row.get("response_class") or ""
+    ).lower() == "recovery"
+
+
 def _unresolved_owner_lookup(
     runtimes: Mapping[str, Mapping[str, Any]],
 ) -> dict[tuple[str, tuple[str, str, str]], str]:
@@ -1405,17 +1484,114 @@ def _recovered_owner_sets(
     return owners
 
 
-def _active_seed_owner_lookup(
+def _causal_seed_owner_lookup(
     runtimes: Mapping[str, Mapping[str, Any]],
-) -> dict[tuple[str, tuple[str, str, str]], set[str]]:
-    owners: dict[tuple[str, tuple[str, str, str]], set[str]] = defaultdict(set)
+) -> dict[
+    tuple[str, tuple[str, str, str]], dict[str, pd.Timestamp | None]
+]:
+    owners: dict[
+        tuple[str, tuple[str, str, str]], dict[str, pd.Timestamp | None]
+    ] = defaultdict(dict)
     for base, runtime in runtimes.items():
         if runtime.get("incident_id") is None:
             continue
         hazard = str(runtime.get("hazard") or "")
         for evidence_key in runtime.get("seed_keys", set()):
-            owners[(hazard, evidence_key)].add(base)
+            raw_week = runtime.get("seed_weeks", {}).get(evidence_key)
+            owners[(hazard, evidence_key)][base] = (
+                None
+                if raw_week is None or pd.isna(raw_week)
+                else pd.Timestamp(raw_week).normalize()
+            )
     return owners
+
+
+def _resolve_episode_owner(
+    week: pd.Timestamp,
+    sources: set[str],
+    owner_key: tuple[str, tuple[str, str, str]],
+    direct_owners: Mapping[tuple[str, tuple[str, str, str]], str],
+    unresolved_owners: Mapping[tuple[str, tuple[str, str, str]], str],
+    recovered_owners: Mapping[tuple[str, tuple[str, str, str]], str],
+    redirects: Mapping[tuple[str, tuple[str, str, str]], str],
+    seed_owners: Mapping[
+        tuple[str, tuple[str, str, str]], Mapping[str, pd.Timestamp | None]
+    ],
+    live_owners: set[str],
+) -> str | None:
+    owner = (
+        direct_owners.get(owner_key)
+        or unresolved_owners.get(owner_key)
+        or recovered_owners.get(owner_key)
+    )
+    if owner is not None:
+        return owner
+    redirect_targets = {
+        target
+        for source in sources
+        for target in [redirects.get((source, owner_key[1]))]
+        if target is not None and target in live_owners
+    }
+    if len(redirect_targets) > 1:
+        raise ValueError(
+            "Evidence has conflicting live ownership redirects: "
+            f"week={pd.Timestamp(week).date()}, hazard={owner_key[0]}, "
+            f"evidence={owner_key[1]}, owners={','.join(sorted(redirect_targets))}"
+        )
+    if redirect_targets:
+        return next(iter(redirect_targets))
+    candidates = seed_owners.get(owner_key, {})
+    if not candidates:
+        return None
+    if len(candidates) > 1 and any(value is None for value in candidates.values()):
+        raise ValueError(
+            "Evidence has active story seeds without causal recency: "
+            f"week={pd.Timestamp(week).date()}, hazard={owner_key[0]}, "
+            f"evidence={owner_key[1]}, owners={','.join(sorted(candidates))}"
+        )
+    known = {
+        base: seed_week
+        for base, seed_week in candidates.items()
+        if seed_week is not None
+    }
+    if known:
+        latest = max(known.values())
+        winners = sorted(base for base, seed_week in known.items() if seed_week == latest)
+    else:
+        winners = sorted(candidates)
+        latest = None
+    if len(winners) != 1:
+        raise ValueError(
+            "Evidence has ambiguous latest causal story seeds: "
+            f"week={pd.Timestamp(week).date()}, hazard={owner_key[0]}, "
+            f"evidence={owner_key[1]}, seed_week={latest}, "
+            f"owners={','.join(winners)}"
+        )
+    return winners[0]
+
+
+def _establish_episode_seed_owner(
+    owner_key: tuple[str, tuple[str, str, str]],
+    owner: str,
+    week: pd.Timestamp,
+    runtimes: dict[str, dict[str, Any]],
+    redirects: dict[tuple[str, tuple[str, str, str]], str],
+) -> None:
+    hazard, evidence_key = owner_key
+    for base, runtime in runtimes.items():
+        if runtime.get("incident_id") is None:
+            continue
+        if str(runtime.get("hazard") or "") != hazard:
+            continue
+        if base != owner and evidence_key in runtime.get("seed_keys", set()):
+            runtime["seed_keys"].discard(evidence_key)
+            runtime.setdefault("seed_weeks", {}).pop(evidence_key, None)
+            redirects[(base, evidence_key)] = owner
+    owner_runtime = runtimes[owner]
+    owner_runtime["seed_keys"].add(evidence_key)
+    owner_runtime.setdefault("seed_weeks", {})[evidence_key] = pd.Timestamp(
+        week
+    ).normalize()
 
 
 def _direct_claim_owner_lookup(
@@ -1489,10 +1665,14 @@ def _reconcile_direct_unresolved_claims(
             previous_runtime = runtimes[previous_owner]
             evidence = previous_runtime["unresolved"].pop(evidence_key)
             previous_runtime["seed_keys"].discard(evidence_key)
+            previous_runtime.setdefault("seed_weeks", {}).pop(evidence_key, None)
             current_runtime["unresolved"][evidence_key] = evidence
         for stale_owner in stale_owners:
             runtimes[stale_owner]["recovered"].discard(evidence_key)
             runtimes[stale_owner]["seed_keys"].discard(evidence_key)
+            runtimes[stale_owner].setdefault("seed_weeks", {}).pop(
+                evidence_key, None
+            )
         current_runtime["recovered"].discard(evidence_key)
         current_runtime["seed_keys"].add(evidence_key)
         for origin_key, owner in list(redirects.items()):
@@ -1500,6 +1680,9 @@ def _reconcile_direct_unresolved_claims(
                 redirects[origin_key] = current_owner
         for stale_owner in stale_owners:
             redirects[(stale_owner, evidence_key)] = current_owner
+        _establish_episode_seed_owner(
+            owner_key, current_owner, week, runtimes, redirects
+        )
 
     _assert_unique_unresolved_owners(runtimes)
     _recovered_owner_lookup(runtimes)
@@ -1620,9 +1803,11 @@ def _transfer_lineage_registries_for_week(
             parent_runtime["unresolved"].pop(evidence_key, None)
             parent_runtime["recovered"].discard(evidence_key)
             parent_runtime["seed_keys"].discard(evidence_key)
+            parent_runtime["seed_weeks"].pop(evidence_key, None)
             child_runtime["unresolved"][evidence_key] = dict(evidence)
             child_runtime["recovered"].discard(evidence_key)
             child_runtime["seed_keys"].add(evidence_key)
+            child_runtime["seed_weeks"][evidence_key] = week
             for origin_key, owner in list(redirects.items()):
                 if origin_key[1] == evidence_key and owner == parent:
                     redirects[origin_key] = child

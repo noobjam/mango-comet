@@ -247,6 +247,7 @@ ensure_v3_incident_dir() {
     --memory-limit "$DUCKDB_MEMORY_LIMIT" \
     --temp-dir "$ROOT/duckdb_tmp" \
     --heartbeat-seconds "$HEARTBEAT_SECONDS" \
+    --capture-stage9-replay \
     --job-tag "$PIPELINE_TAG"
   [[ "$(tr -d '\r\n' < "$v3_job/status")" == 0 ]] || \
     fail "V3 runner did not succeed: $v3_job"

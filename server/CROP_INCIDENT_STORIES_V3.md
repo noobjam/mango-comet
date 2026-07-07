@@ -212,9 +212,13 @@ fresh attributed decline cannot take ownership. Multiple direct current
 claimants remain an ambiguity and fail closed. A terminal story clears its
 registry before any recurrence. Exact follow-up evidence is routed in causal
 ownership order: a unique current direct claim, then an active unresolved
-owner, then an active recovered owner, then an existing redirect, and finally
-a unique active seed. Ambiguous seed-only ownership fails closed; follow-up
-source order never chooses the owner.
+owner, then an active recovered owner, then a unique live redirect, and finally
+the active story with the uniquely most-recent exact seed week. Equal latest
+seed weeks fail closed; source or row order never chooses the owner. Fresh
+recovery attached to a current pressure or `WATCH` context is resolved through
+the same ownership order before any registry mutates. Its original row remains
+physical context while the recovered ownership row is attributed to the
+resolved story.
 
 ## 7. Story clustering paradigm
 

@@ -4,7 +4,11 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -73,12 +77,25 @@ class IncidentWorkflowV3Tests(unittest.TestCase):
                 "build-incidents-v3", "--generation-dir", "/tmp/source",
                 "--output-dir", "/tmp/v3", "--baseline-through", "2025-12-31",
                 "--threads", "32", "--previous-incident-dir", "/tmp/previous",
+                "--finalizer-failure-capsule", "/tmp/job/stage9-capsule",
             ]
         )
         self.assertEqual(parsed.command, "build-incidents-v3")
         self.assertEqual(parsed.threads, 32)
         self.assertEqual(parsed.baseline_through.isoformat(), "2025-12-31")
         self.assertEqual(parsed.previous_incident_dir, Path("/tmp/previous"))
+        self.assertEqual(
+            parsed.finalizer_failure_capsule, Path("/tmp/job/stage9-capsule")
+        )
+        replay = build_parser().parse_args(
+            [
+                "replay-incidents-v3-finalizer",
+                "--capsule-dir",
+                "/tmp/job/stage9-capsule",
+            ]
+        )
+        self.assertEqual(replay.command, "replay-incidents-v3-finalizer")
+        self.assertEqual(replay.capsule_dir, Path("/tmp/job/stage9-capsule"))
 
     def test_atomic_end_to_end_build(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -94,11 +111,14 @@ class IncidentWorkflowV3Tests(unittest.TestCase):
                 minimum_known_stage_coverage=0.5,
             )
             output = root / "incident-v3"
+            success_capsule = root / "job" / "stage9-finalizer-capsule"
             result = build_incident_generation_v3(
                 generation, output, baseline_through="2024-01-14",
                 policy=policy, threads=1, first_release=True,
+                finalizer_failure_capsule=success_capsule,
             )
             self.assertEqual(result["status"], "complete")
+            self.assertFalse(success_capsule.exists())
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertEqual(manifest["run"]["status"], "complete")
             self.assertEqual(
@@ -208,6 +228,107 @@ class IncidentWorkflowV3Tests(unittest.TestCase):
                     policy=policy, threads=1, first_release=True,
                 )
 
+    def test_finalizer_failure_capsule_replays_and_rejects_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generation = _write_workflow_generation(root)
+            output = root / "incident-v3"
+            capsule = root / "job" / "stage9-finalizer-capsule"
+            policy = replace(
+                load_incident_policy_v3(),
+                minimum_evaluable_fields=1,
+                minimum_active_fields=1,
+                severe_override_min_fields=1,
+                minimum_source_field_centroid_coverage=0.5,
+                minimum_source_crop_instance_week_centroid_coverage=0.5,
+                minimum_known_stage_coverage=0.5,
+            )
+            with patch.object(
+                workflow_v3,
+                "finalize_crop_story_artifacts",
+                side_effect=ValueError("forced finalizer failure"),
+            ):
+                with self.assertRaisesRegex(ValueError, "forced finalizer failure"):
+                    build_incident_generation_v3(
+                        generation,
+                        output,
+                        baseline_through="2024-01-14",
+                        policy=policy,
+                        threads=1,
+                        first_release=True,
+                        finalizer_failure_capsule=capsule,
+                    )
+
+            self.assertFalse(output.exists())
+            self.assertTrue((capsule / "manifest.json").is_file())
+            self.assertNotIn(
+                str(root), (capsule / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(list(capsule.parent.glob(".stage9-finalizer-capsule.partial-*")))
+            capsule_hashes = {
+                path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in capsule.iterdir()
+            }
+            (
+                captured_manifest,
+                captured_scaffold,
+                captured_summary,
+                captured_policy,
+                captured_followup,
+                captured_lineage,
+                captured_cells,
+            ) = workflow_v3._read_finalizer_failure_capsule(capsule)
+            with self.assertRaisesRegex(FileExistsError, "already exists"):
+                workflow_v3._write_finalizer_failure_capsule(
+                    capsule,
+                    iteration=int(captured_manifest["captured_iteration"]) + 1,
+                    scaffold=captured_scaffold,
+                    stage_summary=captured_summary,
+                    policy=captured_policy,
+                    followup_evidence=captured_followup,
+                    incident_lineage=captured_lineage,
+                    weekly_cells=captured_cells,
+                )
+            finalizer = workflow_v3.finalize_crop_story_artifacts
+            with patch.object(
+                workflow_v3,
+                "finalize_crop_story_artifacts",
+                wraps=finalizer,
+            ) as replay_finalizer:
+                replayed = workflow_v3.replay_finalizer_failure_capsule(capsule)
+            replay_finalizer.assert_called_once()
+            self.assertEqual(replayed["status"], "replayed")
+            self.assertFalse(replayed["publication_written"])
+            self.assertGreater(replayed["result_rows"]["weekly_state"], 0)
+            cli = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(workflow_v3.__file__).resolve().parent.parent / "weekly_story_monitor.py"),
+                    "replay-incidents-v3-finalizer",
+                    "--capsule-dir",
+                    str(capsule),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(cli.returncode, 0, cli.stderr)
+            self.assertEqual(json.loads(cli.stdout)["status"], "replayed")
+            self.assertEqual(
+                capsule_hashes,
+                {
+                    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in capsule.iterdir()
+                },
+            )
+
+            tampered = root / "tampered-capsule"
+            shutil.copytree(capsule, tampered)
+            with (tampered / "stage_summary.parquet").open("ab") as handle:
+                handle.write(b"tamper")
+            with self.assertRaisesRegex(ValueError, "size mismatch|hash mismatch"):
+                workflow_v3.replay_finalizer_failure_capsule(tampered)
+
     def test_generation_identity_changes_for_each_provenance_dimension(self) -> None:
         inputs = {
             "baseline_through": "2025-12-31",
@@ -256,6 +377,117 @@ class IncidentWorkflowV3Tests(unittest.TestCase):
                 {"input": {"size_bytes": 1, "sha256": "0" * 64}}
             ),
         )
+
+    def test_failure_capsule_cannot_overlap_immutable_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generation = root / "source"
+            previous = root / "previous"
+            generation.mkdir()
+            previous.mkdir()
+            output = root / "release"
+            cases = (
+                (generation / "capsule", True, None),
+                (output / "capsule", True, None),
+                (previous / "capsule", False, previous),
+                (root, True, None),
+            )
+            for capsule, first_release, prior in cases:
+                with self.subTest(capsule=capsule):
+                    with self.assertRaisesRegex(ValueError, "must not overlap"):
+                        build_incident_generation_v3(
+                            generation,
+                            output,
+                            baseline_through="2024-01-14",
+                            finalizer_failure_capsule=capsule,
+                            first_release=first_release,
+                            previous_incident_dir=prior,
+                        )
+
+            linked_source = root / "linked-source"
+            linked_source.symlink_to(generation, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "must not overlap"):
+                build_incident_generation_v3(
+                    generation,
+                    output,
+                    baseline_through="2024-01-14",
+                    finalizer_failure_capsule=linked_source / "capsule",
+                    first_release=True,
+                )
+
+    def test_failure_capsule_resource_limits_clean_partial_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frame = pd.DataFrame({"value": ["fixture"]})
+            scaffold = workflow_v3.CropStoryScaffold(frame, frame, frame)
+            arguments = {
+                "iteration": 1,
+                "scaffold": scaffold,
+                "stage_summary": frame,
+                "policy": load_incident_policy_v3(),
+                "followup_evidence": frame,
+                "incident_lineage": frame,
+                "weekly_cells": frame,
+            }
+
+            memory_target = root / "memory-capsule"
+            with patch.object(
+                workflow_v3, "FINALIZER_FAILURE_CAPSULE_MAX_INPUT_MEMORY_BYTES", 1
+            ):
+                with self.assertRaisesRegex(ValueError, "memory estimate"):
+                    workflow_v3._write_finalizer_failure_capsule(
+                        memory_target, **arguments
+                    )
+            self.assertFalse(memory_target.exists())
+
+            disk_target = root / "disk-capsule"
+            with patch.object(
+                workflow_v3.shutil,
+                "disk_usage",
+                return_value=SimpleNamespace(free=0),
+            ):
+                with self.assertRaisesRegex(OSError, "Insufficient free space"):
+                    workflow_v3._write_finalizer_failure_capsule(
+                        disk_target, **arguments
+                    )
+            self.assertFalse(disk_target.exists())
+
+            size_target = root / "size-capsule"
+            with (
+                patch.object(
+                    workflow_v3, "FINALIZER_FAILURE_CAPSULE_MAX_SERIALIZED_BYTES", 1
+                ),
+                patch.object(
+                    workflow_v3,
+                    "FINALIZER_FAILURE_CAPSULE_FREE_SPACE_RESERVE_BYTES",
+                    0,
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "serialized limit"):
+                    workflow_v3._write_finalizer_failure_capsule(
+                        size_target, **arguments
+                    )
+            self.assertFalse(size_target.exists())
+
+            roundtrip_target = root / "roundtrip-capsule"
+            with (
+                patch.object(
+                    workflow_v3,
+                    "FINALIZER_FAILURE_CAPSULE_FREE_SPACE_RESERVE_BYTES",
+                    0,
+                ),
+                patch.object(
+                    workflow_v3.pd,
+                    "read_parquet",
+                    return_value=pd.DataFrame({"changed": [1]}),
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "round-trip changed"):
+                    workflow_v3._write_finalizer_failure_capsule(
+                        roundtrip_target, **arguments
+                    )
+            self.assertFalse(roundtrip_target.exists())
+            self.assertFalse(list(root.glob(".*capsule.partial-*")))
 
     def test_source_mutation_aborts_before_atomic_publication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

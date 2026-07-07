@@ -9,7 +9,7 @@ import logging
 import os
 from pathlib import Path
 import shutil
-from tempfile import TemporaryDirectory
+from tempfile import mkdtemp, TemporaryDirectory
 from typing import Any
 
 import pandas as pd
@@ -35,8 +35,15 @@ from .incident_lineage_v3 import (
     build_incident_lineage_v3,
     remap_incident_lineage_segments,
 )
-from .incident_policy_v3 import IncidentPolicyV3, load_incident_policy_v3
+from .incident_policy_v3 import (
+    CropStageAlias,
+    IncidentPolicyV3,
+    LaneStatePriority,
+    StageAlias,
+    load_incident_policy_v3,
+)
 from .incident_story_states_v3 import (
+    CropStoryScaffold,
     build_crop_story_scaffold,
     build_incident_followup_evidence,
     finalize_crop_story_artifacts,
@@ -53,7 +60,24 @@ from .incident_validation_v3 import (
 
 
 SCHEMA_VERSION = "crop-impact-incident-generation-v3/1"
+FINALIZER_FAILURE_CAPSULE_SCHEMA_VERSION = "incident-v3-finalizer-failure-capsule/1"
+FINALIZER_FAILURE_CAPSULE_MAX_SERIALIZED_BYTES = 16 * 1024**3
+FINALIZER_FAILURE_CAPSULE_MAX_INPUT_MEMORY_BYTES = 32 * 1024**3
+FINALIZER_FAILURE_CAPSULE_FREE_SPACE_RESERVE_BYTES = 8 * 1024**3
 LOGGER = logging.getLogger("incident_workflow_v3")
+_FINALIZER_FRAME_FILES = {
+    "scaffold_catalog": "scaffold_catalog.parquet",
+    "scaffold_weekly_state": "scaffold_weekly_state.parquet",
+    "scaffold_memberships": "scaffold_memberships.parquet",
+    "stage_summary": "stage_summary.parquet",
+    "followup_evidence": "followup_evidence.parquet",
+    "incident_lineage": "incident_lineage.parquet",
+    "weekly_cells": "weekly_cells.parquet",
+}
+_FINALIZER_POLICY_FILES = {
+    "policy_source": "policy_source.json",
+    "policy_effective": "policy_effective.json",
+}
 V3_IMPLEMENTATION_INPUTS = (
     "incident_archetypes_v3.py",
     "incident_cells_v3.py",
@@ -69,6 +93,340 @@ V3_IMPLEMENTATION_INPUTS = (
 )
 
 
+def _write_private_json(path: Path, payload: Any) -> None:
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    path.chmod(0o600)
+
+
+def _capsule_artifact(path: Path, *, frame: pd.DataFrame | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "file": path.name,
+        "size_bytes": path.stat().st_size,
+        "sha256": file_sha256(path),
+    }
+    if frame is not None:
+        index_hashes = pd.util.hash_pandas_object(
+            frame.index, index=True, categorize=True
+        )
+        result.update(
+            {
+                "kind": "parquet",
+                "row_count": len(frame),
+                "columns": [str(column) for column in frame.columns],
+                "dtypes": [str(dtype) for dtype in frame.dtypes],
+                "index_names": [
+                    None if name is None else str(name) for name in frame.index.names
+                ],
+                "index_sha256": hashlib.sha256(
+                    index_hashes.to_numpy(dtype="uint64", copy=False).tobytes()
+                ).hexdigest(),
+            }
+        )
+    else:
+        result["kind"] = "json"
+    return result
+
+
+def _effective_policy_payload(policy: IncidentPolicyV3) -> dict[str, Any]:
+    payload = asdict(policy)
+    payload.pop("source_path", None)
+    return payload
+
+
+def _resolved_capsule_target(path: Path) -> Path:
+    """Resolve existing parent symlinks without following a leaf symlink."""
+    expanded = path.expanduser().absolute()
+    if expanded.is_symlink():
+        raise ValueError("Finalizer failure capsule path must not be a symlink")
+    return expanded.parent.resolve() / expanded.name
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return bool(
+        left == right
+        or left.is_relative_to(right)
+        or right.is_relative_to(left)
+    )
+
+
+def _frame_memory_bytes(frames: dict[str, pd.DataFrame]) -> int:
+    return sum(
+        int(frame.memory_usage(index=True, deep=True).sum())
+        for frame in frames.values()
+    )
+
+
+def _directory_file_bytes(path: Path) -> int:
+    return sum(entry.stat().st_size for entry in path.iterdir() if entry.is_file())
+
+
+def _validate_frame_round_trip(
+    original: pd.DataFrame, replayed: pd.DataFrame, filename: str
+) -> None:
+    try:
+        pd.testing.assert_frame_equal(
+            original,
+            replayed,
+            check_exact=True,
+            check_index_type=False,
+            check_column_type=False,
+            check_freq=False,
+        )
+    except AssertionError as exc:
+        raise ValueError(
+            f"Finalizer failure capsule Parquet round-trip changed {filename}"
+        ) from exc
+
+
+def _write_finalizer_failure_capsule(
+    capsule_dir: Path,
+    *,
+    iteration: int,
+    scaffold: CropStoryScaffold,
+    stage_summary: pd.DataFrame,
+    policy: IncidentPolicyV3,
+    followup_evidence: pd.DataFrame,
+    incident_lineage: pd.DataFrame,
+    weekly_cells: pd.DataFrame,
+) -> Path:
+    """Atomically preserve one failing finalizer call outside the release."""
+    target = _resolved_capsule_target(capsule_dir)
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"Finalizer failure capsule already exists: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    frames = {
+        "scaffold_catalog": scaffold.catalog,
+        "scaffold_weekly_state": scaffold.weekly_state,
+        "scaffold_memberships": scaffold.memberships,
+        "stage_summary": stage_summary,
+        "followup_evidence": followup_evidence,
+        "incident_lineage": incident_lineage,
+        "weekly_cells": weekly_cells,
+    }
+    input_memory_bytes = _frame_memory_bytes(frames)
+    if input_memory_bytes > FINALIZER_FAILURE_CAPSULE_MAX_INPUT_MEMORY_BYTES:
+        raise ValueError(
+            "Finalizer failure capsule input memory estimate exceeds the fixed limit"
+        )
+    free_bytes = shutil.disk_usage(target.parent).free
+    required_free_bytes = (
+        FINALIZER_FAILURE_CAPSULE_MAX_SERIALIZED_BYTES
+        + FINALIZER_FAILURE_CAPSULE_FREE_SPACE_RESERVE_BYTES
+    )
+    if free_bytes < required_free_bytes:
+        raise OSError(
+            "Insufficient free space for finalizer failure capsule and reserve"
+        )
+
+    temporary = Path(mkdtemp(prefix=f".{target.name}.partial-", dir=str(target.parent)))
+    temporary.chmod(0o700)
+    installed = False
+    try:
+        artifacts: dict[str, dict[str, Any]] = {}
+        for logical_name, filename in _FINALIZER_FRAME_FILES.items():
+            frame = frames[logical_name]
+            path = temporary / filename
+            frame.to_parquet(path, index=True, compression="zstd")
+            path.chmod(0o600)
+            _validate_frame_round_trip(frame, pd.read_parquet(path), filename)
+            artifacts[logical_name] = _capsule_artifact(path, frame=frame)
+            if _directory_file_bytes(temporary) > FINALIZER_FAILURE_CAPSULE_MAX_SERIALIZED_BYTES:
+                raise ValueError(
+                    "Finalizer failure capsule exceeds the fixed serialized limit"
+                )
+
+        policy_source = policy.source_path.expanduser().resolve()
+        if file_sha256(policy_source) != policy.source_sha256:
+            raise RuntimeError("Incident policy source changed before capsule capture")
+        copied_policy = temporary / _FINALIZER_POLICY_FILES["policy_source"]
+        shutil.copyfile(policy_source, copied_policy)
+        copied_policy.chmod(0o600)
+        artifacts["policy_source"] = _capsule_artifact(copied_policy)
+
+        effective_path = temporary / _FINALIZER_POLICY_FILES["policy_effective"]
+        _write_private_json(effective_path, _effective_policy_payload(policy))
+        artifacts["policy_effective"] = _capsule_artifact(effective_path)
+        if _directory_file_bytes(temporary) > FINALIZER_FAILURE_CAPSULE_MAX_SERIALIZED_BYTES:
+            raise ValueError(
+                "Finalizer failure capsule exceeds the fixed serialized limit"
+            )
+
+        manifest: dict[str, Any] = {
+            "schema_version": FINALIZER_FAILURE_CAPSULE_SCHEMA_VERSION,
+            "status": "ready",
+            "captured_iteration": int(iteration),
+            "input_memory_estimate_bytes": input_memory_bytes,
+            "max_serialized_bytes": FINALIZER_FAILURE_CAPSULE_MAX_SERIALIZED_BYTES,
+            "policy_effective_sha256": _effective_policy_sha256(policy),
+            "artifacts": artifacts,
+            "purpose": "read_only_single_call_finalizer_replay",
+        }
+        manifest["capsule_id"] = _canonical_sha256(manifest)
+        _write_private_json(temporary / "manifest.json", manifest)
+        if _directory_file_bytes(temporary) > FINALIZER_FAILURE_CAPSULE_MAX_SERIALIZED_BYTES:
+            raise ValueError(
+                "Finalizer failure capsule exceeds the fixed serialized limit"
+            )
+        os.rename(temporary, target)
+        installed = True
+        target.chmod(0o700)
+        return target
+    finally:
+        if not installed and temporary.exists():
+            shutil.rmtree(temporary, ignore_errors=True)
+
+
+def _read_finalizer_failure_capsule(
+    capsule_dir: Path,
+) -> tuple[dict[str, Any], CropStoryScaffold, pd.DataFrame, IncidentPolicyV3,
+           pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    requested = capsule_dir.expanduser().absolute()
+    if requested.is_symlink() or not requested.is_dir():
+        raise ValueError(f"Finalizer failure capsule is not a regular directory: {requested}")
+    manifest_path = requested / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("Finalizer failure capsule is missing manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Finalizer failure capsule manifest is invalid") from exc
+    if manifest.get("schema_version") != FINALIZER_FAILURE_CAPSULE_SCHEMA_VERSION:
+        raise ValueError("Unsupported finalizer failure capsule schema")
+    if manifest.get("status") != "ready":
+        raise ValueError("Finalizer failure capsule is not ready")
+    capsule_id = str(manifest.get("capsule_id") or "")
+    unsigned = dict(manifest)
+    unsigned.pop("capsule_id", None)
+    if capsule_id != _canonical_sha256(unsigned):
+        raise ValueError("Finalizer failure capsule manifest hash mismatch")
+
+    expected_names = {
+        **_FINALIZER_FRAME_FILES,
+        **_FINALIZER_POLICY_FILES,
+    }
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != set(expected_names):
+        raise ValueError("Finalizer failure capsule artifact set is invalid")
+    expected_files = {"manifest.json", *expected_names.values()}
+    actual_files = {entry.name for entry in requested.iterdir()}
+    if actual_files != expected_files:
+        raise ValueError("Finalizer failure capsule directory contents are invalid")
+
+    for logical_name, filename in expected_names.items():
+        metadata = artifacts[logical_name]
+        if not isinstance(metadata, dict) or metadata.get("file") != filename:
+            raise ValueError(f"Finalizer failure capsule metadata is invalid: {logical_name}")
+        path = requested / filename
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"Finalizer failure capsule artifact is invalid: {filename}")
+        if int(metadata.get("size_bytes", -1)) != path.stat().st_size:
+            raise ValueError(f"Finalizer failure capsule size mismatch: {filename}")
+        if str(metadata.get("sha256") or "") != file_sha256(path):
+            raise ValueError(f"Finalizer failure capsule hash mismatch: {filename}")
+
+    frames: dict[str, pd.DataFrame] = {}
+    for logical_name, filename in _FINALIZER_FRAME_FILES.items():
+        frame = pd.read_parquet(requested / filename)
+        metadata = artifacts[logical_name]
+        if len(frame) != int(metadata.get("row_count", -1)):
+            raise ValueError(f"Finalizer failure capsule row count mismatch: {filename}")
+        if [str(column) for column in frame.columns] != metadata.get("columns"):
+            raise ValueError(f"Finalizer failure capsule columns mismatch: {filename}")
+        if [str(dtype) for dtype in frame.dtypes] != metadata.get("dtypes"):
+            raise ValueError(f"Finalizer failure capsule dtypes mismatch: {filename}")
+        if [None if name is None else str(name) for name in frame.index.names] != metadata.get(
+            "index_names"
+        ):
+            raise ValueError(f"Finalizer failure capsule index names mismatch: {filename}")
+        index_hashes = pd.util.hash_pandas_object(
+            frame.index, index=True, categorize=True
+        )
+        index_sha256 = hashlib.sha256(
+            index_hashes.to_numpy(dtype="uint64", copy=False).tobytes()
+        ).hexdigest()
+        if index_sha256 != metadata.get("index_sha256"):
+            raise ValueError(f"Finalizer failure capsule index hash mismatch: {filename}")
+        frames[logical_name] = frame
+
+    policy_source = requested / _FINALIZER_POLICY_FILES["policy_source"]
+    effective_payload = json.loads(
+        (requested / _FINALIZER_POLICY_FILES["policy_effective"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    effective_payload["link_weights"] = tuple(
+        (str(name), float(value))
+        for name, value in effective_payload["link_weights"]
+    )
+    effective_payload["stage_buckets"] = tuple(effective_payload["stage_buckets"])
+    effective_payload["stage_aliases"] = tuple(
+        StageAlias(**row) for row in effective_payload["stage_aliases"]
+    )
+    effective_payload["crop_stage_aliases"] = tuple(
+        CropStageAlias(**row) for row in effective_payload["crop_stage_aliases"]
+    )
+    effective_payload["lane_state_priorities"] = tuple(
+        LaneStatePriority(**row) for row in effective_payload["lane_state_priorities"]
+    )
+    effective_payload["source_path"] = policy_source
+    policy = IncidentPolicyV3(**effective_payload)
+    if file_sha256(policy_source) != policy.source_sha256:
+        raise ValueError("Finalizer failure capsule policy source hash mismatch")
+    if _effective_policy_sha256(policy) != manifest.get("policy_effective_sha256"):
+        raise ValueError("Finalizer failure capsule effective policy hash mismatch")
+
+    scaffold = CropStoryScaffold(
+        frames["scaffold_catalog"],
+        frames["scaffold_weekly_state"],
+        frames["scaffold_memberships"],
+    )
+    return (
+        manifest,
+        scaffold,
+        frames["stage_summary"],
+        policy,
+        frames["followup_evidence"],
+        frames["incident_lineage"],
+        frames["weekly_cells"],
+    )
+
+
+def replay_finalizer_failure_capsule(capsule_dir: Path) -> dict[str, Any]:
+    """Verify a failure capsule and invoke the captured finalizer exactly once."""
+    (
+        manifest,
+        scaffold,
+        stage_summary,
+        policy,
+        followup,
+        lineage,
+        cells,
+    ) = _read_finalizer_failure_capsule(capsule_dir)
+    result = finalize_crop_story_artifacts(
+        scaffold,
+        stage_summary,
+        policy,
+        followup_evidence=followup,
+        incident_lineage=lineage,
+        weekly_cells=cells,
+    )
+    return {
+        "status": "replayed",
+        "schema_version": FINALIZER_FAILURE_CAPSULE_SCHEMA_VERSION,
+        "capsule_id": manifest["capsule_id"],
+        "captured_iteration": int(manifest["captured_iteration"]),
+        "result_rows": {
+            "catalog": len(result.catalog),
+            "weekly_state": len(result.weekly_state),
+            "memberships": len(result.memberships),
+            "windows": len(result.windows),
+        },
+        "publication_written": False,
+    }
+
+
 def build_incident_generation_v3(
     generation_dir: Path,
     output_dir: Path,
@@ -78,12 +436,18 @@ def build_incident_generation_v3(
     threads: int = 16,
     memory_limit: str | None = None,
     temp_dir: Path | None = None,
+    finalizer_failure_capsule: Path | None = None,
     previous_incident_dir: Path | None = None,
     first_release: bool = False,
 ) -> dict[str, Any]:
     """Build all V3 tracking artifacts and publish them in one atomic rename."""
     generation_dir = generation_dir.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
+    finalizer_failure_capsule = (
+        _resolved_capsule_target(finalizer_failure_capsule)
+        if finalizer_failure_capsule is not None
+        else None
+    )
     previous_incident_dir = (
         previous_incident_dir.expanduser().resolve()
         if previous_incident_dir is not None
@@ -112,6 +476,17 @@ def build_incident_generation_v3(
             raise ValueError("Incident V3 output must not be inside the previous release")
         if previous_incident_dir.is_relative_to(output_dir):
             raise ValueError("Incident V3 output must not contain the previous release")
+    immutable_directories = [generation_dir, output_dir]
+    if previous_incident_dir is not None:
+        immutable_directories.append(previous_incident_dir)
+    if finalizer_failure_capsule is not None and any(
+        _paths_overlap(finalizer_failure_capsule, immutable)
+        for immutable in immutable_directories
+    ):
+        raise ValueError(
+            "Finalizer failure capsule must not overlap immutable source, output, "
+            "or previous-release directories"
+        )
     provenance = _capture_build_provenance(generation_dir, policy)
     source_manifest = validate_source_generation(generation_dir)
     _verify_source_manifest_provenance(provenance)
@@ -213,14 +588,39 @@ def build_incident_generation_v3(
         previous_signature: str | None = None
         story_result = None
         for iteration in range(1, 9):
-            story_result = finalize_crop_story_artifacts(
-                story_scaffold,
-                stage_summary,
-                policy,
-                followup_evidence=followup,
-                incident_lineage=lineage_result.lineage,
-                weekly_cells=cells,
-            )
+            try:
+                story_result = finalize_crop_story_artifacts(
+                    story_scaffold,
+                    stage_summary,
+                    policy,
+                    followup_evidence=followup,
+                    incident_lineage=lineage_result.lineage,
+                    weekly_cells=cells,
+                )
+            except Exception:
+                if finalizer_failure_capsule is not None:
+                    try:
+                        _write_finalizer_failure_capsule(
+                            finalizer_failure_capsule,
+                            iteration=iteration,
+                            scaffold=story_scaffold,
+                            stage_summary=stage_summary,
+                            policy=policy,
+                            followup_evidence=followup,
+                            incident_lineage=lineage_result.lineage,
+                            weekly_cells=cells,
+                        )
+                        LOGGER.error(
+                            "Stage-9 finalizer failure capsule written to %s",
+                            finalizer_failure_capsule,
+                        )
+                    except Exception:
+                        # Diagnostics must never replace the scientific failure
+                        # that stopped publication.
+                        LOGGER.exception(
+                            "Could not write stage-9 finalizer failure capsule"
+                        )
+                raise
             next_stage_summary = (
                 build_incident_stage_summary(
                     context_path,

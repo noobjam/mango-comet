@@ -83,6 +83,7 @@ nohup "$PYTHON" server/run_incident_v3.py run \
   --memory-limit 96GB \
   --temp-dir "$ROOT/duckdb_tmp" \
   --heartbeat-seconds 30 \
+  --capture-stage9-replay \
   --job-tag "$JOB_TAG" \
   >"$LAUNCH_LOG" 2>&1 </dev/null &
 
@@ -131,6 +132,29 @@ echo "$!" | tee "$JOB_DIR/resume.pid"
 
 Never delete a partial release or reuse a job tag to conceal a failure. Read the
 stage-specific `*.stderr.log` recorded under `JOB_DIR`.
+
+When `--capture-stage9-replay` is enabled and the stage-9 story finalizer fails,
+the runner preserves its exact failing call in
+`JOB_DIR/stage9-finalizer-capsule`. A job that never fails creates no capsule.
+The first capsule in a job is immutable: a later resume never overwrites it, so
+start a fresh job if a different failure must be captured. After pulling a
+candidate code fix, verify and replay that call once without rebuilding stages
+1-8 or publishing anything:
+
+Capture fails closed above a 32 GiB input-memory estimate or 16 GiB serialized
+size, and requires an additional 8 GiB free-space reserve. A limit breach
+removes the partial capsule and never replaces the original build exception.
+
+```bash
+test -f "$JOB_DIR/stage9-finalizer-capsule/manifest.json"
+"$PYTHON" server/weekly_story_monitor.py \
+  replay-incidents-v3-finalizer \
+  --capsule-dir "$JOB_DIR/stage9-finalizer-capsule"
+```
+
+Replay verifies every captured Parquet/JSON hash before loading data. A replay
+success is only a focused regression check; run the normal immutable pipeline
+again before treating any release as built.
 
 ## 4. Resolve and audit successful outputs
 
@@ -216,6 +240,7 @@ nohup "$PYTHON" server/run_incident_v3.py run \
   --memory-limit 96GB \
   --temp-dir "$ROOT/duckdb_tmp" \
   --heartbeat-seconds 30 \
+  --capture-stage9-replay \
   --job-tag "$JOB_TAG" \
   >"$LAUNCH_LOG" 2>&1 </dev/null &
 ```

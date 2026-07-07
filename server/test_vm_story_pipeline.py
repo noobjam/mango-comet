@@ -25,6 +25,7 @@ class VmStoryPipelineTests(unittest.TestCase):
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         self.assertIn("launch starts one detached, logged pipeline", help_result.stdout)
         self.assertIn("mandatory review gate", help_result.stdout)
+        self.assertIn("--capture-stage9-replay", SCRIPT.read_text(encoding="utf-8"))
 
     def test_missing_env_fails_before_any_pipeline_action(self) -> None:
         result = subprocess.run(

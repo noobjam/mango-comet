@@ -26,16 +26,22 @@ class IncidentV3RunnerTests(unittest.TestCase):
                 "run", "--generation-dir", "/tmp/source",
                 "--baseline-through", "2025-12-31", "--job-tag", "tag",
                 "--previous-incident-dir", "/tmp/previous",
+                "--capture-stage9-replay",
             ]
         )
         self.assertEqual(args.command, "run")
         self.assertEqual(args.baseline_through, "2025-12-31")
         self.assertEqual(args.previous_incident_dir, Path("/tmp/previous"))
+        self.assertTrue(args.capture_stage9_replay)
         self.assertIn("server.test_story_map_server", FOCUSED_TESTS)
         paths = _paths(Path("/tmp/root"), "tag")
         self.assertEqual(paths["job_dir"], "/tmp/root/jobs/incident_v3_tag")
         self.assertEqual(
             paths["viewer_dir"], "/tmp/root/releases/incident_viewer_v3_tag"
+        )
+        self.assertEqual(
+            paths["finalizer_failure_capsule"],
+            "/tmp/root/jobs/incident_v3_tag/stage9-finalizer-capsule",
         )
 
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

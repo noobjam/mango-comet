@@ -113,6 +113,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--heartbeat-seconds", type=_positive, default=30)
     run.add_argument("--job-tag", type=_job_tag)
     run.add_argument("--skip-tests", action="store_true")
+    run.add_argument(
+        "--capture-stage9-replay",
+        action="store_true",
+        help=(
+            "On the first stage-9 finalizer failure, atomically preserve one "
+            "bounded read-only replay capsule in the job directory."
+        ),
+    )
 
     resume = commands.add_parser("resume", help="Resume missing stages of one job.")
     resume.add_argument("--job-dir", type=Path, required=True)
@@ -136,6 +144,7 @@ def _paths(root: Path, tag: str) -> dict[str, str]:
         "ui_syntax_stderr": str(job / "ui-syntax.stderr.log"),
         "build_json": str(job / "build.json"),
         "build_stderr": str(job / "build.stderr.log"),
+        "finalizer_failure_capsule": str(job / "stage9-finalizer-capsule"),
         "export_json": str(job / "export.json"),
         "export_stderr": str(job / "export.stderr.log"),
         "smoke_stdout": str(job / "smoke.stdout.log"),
@@ -321,6 +330,10 @@ def _require_append_gate(
 def _execute(state: dict[str, Any], logger: logging.Logger) -> int:
     config = state["config"]
     paths = state["paths"]
+    paths.setdefault(
+        "finalizer_failure_capsule",
+        str(Path(paths["job_dir"]) / "stage9-finalizer-capsule"),
+    )
     python = str(config["python"])
     try:
         if config["skip_tests"]:
@@ -364,6 +377,13 @@ def _execute(state: dict[str, Any], logger: logging.Logger) -> int:
                     "--memory-limit", config["memory_limit"],
                     "--temp-dir", config["temp_dir"],
                 ]
+            if config.get("capture_stage9_replay", False):
+                build_command.extend(
+                    [
+                        "--finalizer-failure-capsule",
+                        paths["finalizer_failure_capsule"],
+                    ]
+                )
             if config.get("previous_incident_dir"):
                 build_command.extend(
                     ["--previous-incident-dir", config["previous_incident_dir"]]
@@ -525,6 +545,7 @@ def _new_state(args: argparse.Namespace) -> dict[str, Any]:
             "threads": args.threads, "memory_limit": args.memory_limit,
             "temp_dir": str(temp), "heartbeat_seconds": args.heartbeat_seconds,
             "skip_tests": args.skip_tests,
+            "capture_stage9_replay": bool(args.capture_stage9_replay),
         },
         "paths": paths,
         "stages": {},
