@@ -258,8 +258,11 @@ def _write_incident(
     pd.DataFrame(cells).to_parquet(root / "weekly_exposure_cells.parquet", index=False)
     second_cells = '["g:1:0","g:99:0"]' if unknown_cell else '["g:1:0","g:3:0"]'
     weekly_rows = [
-        _weekly("2025-01-06", '["g:0:0","g:1:0"]', "ACTIVE", 2, 1, 0),
-        _weekly("2025-01-13", second_cells, "RECOVERING", 0, 0, 1),
+        _weekly("2025-01-06", '["g:0:0","g:1:0"]', "ACTIVE", 1, 0, 0),
+        _weekly(
+            "2025-01-13", second_cells, "RECOVERING", 0, 0, 0,
+            impact=1,
+        ),
     ]
     if membership_free_week:
         weekly_rows.append(
@@ -277,9 +280,9 @@ def _write_incident(
     )
     pd.DataFrame(
         [
-            _membership("2025-01-06", "field-1", "crop-1", "event-1", "pressure_core", "ACTIVE", "vegetative", "g:0:0", True),
+            _membership("2025-01-06", "field-1", "crop-1", "event-1", "pressure_core", "ACTIVE", "vegetative", "g:0:0", False),
             _membership("2025-01-06", "field-2", "crop-2", "event-2", "watch_frontier", "WATCH", "flowering", "g:1:0", False),
-            _membership("2025-01-13", "field-1", "crop-1", "event-1", "impact_lag", "RECOVERING", "vegetative", "g:1:0", True),
+            _membership("2025-01-13", "field-1", "crop-1", "event-1", "impact_lag", "RECOVERING", "vegetative", "g:1:0", False),
         ]
     ).to_parquet(root / "incident_membership.parquet", index=False)
     pd.DataFrame(
@@ -430,28 +433,30 @@ def _source_day(
 
 def _weekly(
     week: str, cells: str, state: str, core: int, decline: int, recovery: int,
+    *, impact: int | None = None,
 ) -> dict[str, object]:
+    impact_count = recovery if impact is None else impact
     return {
         "timeline_bucket": week, "incident_id": "incident-1",
         "exposure_id": "exposure-1", "crop_name": "maize",
         "hazard_family": "heat", "component_id": "component-1",
         "incident_state": state, "pressure_core_field_count": core,
         "severe_field_count": 0, "watch_frontier_field_count": 1 if core else 0,
-        "impact_lag_field_count": 1 if recovery else 0,
+        "impact_lag_field_count": impact_count,
         "fresh_decline_field_count": decline,
         "fresh_recovery_field_count": recovery,
         "stage_distribution": '{"flowering":0.5,"vegetative":0.5}',
         "coverage_adequate": True, "footprint_cell_ids_json": cells,
         "knowledge_time": week, "knowledge_time_inferred": False,
         "pressure_cell_ids_json": cells if core else "[]",
-        "impact_cell_ids_json": cells if recovery else "[]",
+        "impact_cell_ids_json": cells if impact_count else "[]",
         "watch_cell_ids_json": cells if core else "[]",
         "footprint_carried_forward": False, "footprint_area_km2": 50.0,
         "right_censored": True, "monitored_count": 2, "evaluable_count": 2,
         "pressure_core_count": core, "severe_count": 0,
-        "impact_lag_count": recovery,
+        "impact_lag_count": impact_count,
         "global_crop_week_unmappable_instance_count": 0,
-        "active_count": core, "affected_count": max(core, recovery),
+        "active_count": core, "affected_count": max(core, impact_count),
     }
 
 
@@ -465,7 +470,11 @@ def _membership(
         "crop_name_normalized": "maize", "hazard_family": "heat",
         "field_id": field_id, "crop_instance_id": crop_instance,
         "episode_id": event, "membership_role": role, "event_state": state,
-        "response_class": "recovery" if state == "RECOVERING" else "stable",
+        "response_class": (
+            "recovery" if fresh and state == "RECOVERING"
+            else "medium_decline" if fresh
+            else "no_new_event_response"
+        ),
         "fresh_response_evidence": fresh, "evaluable": True,
         "is_data_gap": False, "stage_bucket": stage, "grid_id": grid,
         "knowledge_time": week,

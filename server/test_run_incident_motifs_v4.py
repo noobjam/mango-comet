@@ -25,6 +25,7 @@ class IncidentMotifV4CliTests(unittest.TestCase):
         self.assertEqual(args.engine, "gpu")
         self.assertEqual(args.viewer_dir, Path("/tmp/viewer"))
         self.assertEqual(_prefix_config(args).s2_acquisition_horizons, (0, 1, 2, 4))
+        self.assertEqual(_prefix_config(args).minimum_weather_observed_days, 7)
 
     def test_discovery_requires_viewer_directory(self) -> None:
         with self.assertRaises(SystemExit):
@@ -96,6 +97,33 @@ class IncidentMotifV4CliTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(code, 21)
+
+    def test_score_live_forwards_immutable_as_of_release_inputs(self) -> None:
+        with patch(
+            "run_incident_motifs_v4.score_live_prefix_release_v4",
+            return_value={"status": "complete"},
+        ) as score:
+            code = main(
+                [
+                    "score-live",
+                    "--incident-dir", "/tmp/incidents",
+                    "--evidence-dir", "/tmp/evidence",
+                    "--viewer-dir", "/tmp/viewer",
+                    "--prefix-model-dir", "/tmp/model",
+                    "--output-dir", "/tmp/live",
+                    "--as-of", "2026-07-07T12:00:00Z",
+                    "--threads", "8",
+                    "--memory-limit", "32GB",
+                    "--heartbeat-seconds", "1",
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(score.call_args.args[0], Path("/tmp/incidents"))
+        self.assertEqual(score.call_args.kwargs["threads"], 8)
+        self.assertEqual(
+            score.call_args.kwargs["as_of"].isoformat(),
+            "2026-07-07T12:00:00+00:00",
+        )
 
 
 if __name__ == "__main__":

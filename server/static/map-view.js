@@ -166,11 +166,12 @@ export class MapView {
   }
 
   setSelectedIncident(incidentId) {
-    this.selectedIncidentId = String(incidentId || "");
-    if (!this.selectedIncidentId) {
+    const nextIncidentId = String(incidentId || "");
+    if (nextIncidentId !== this.selectedIncidentId) {
       this.selectedIncidentHistory = EMPTY;
       this.selectedIncidentCurrentFootprint = null;
     }
+    this.selectedIncidentId = nextIncidentId;
     this.render();
   }
 
@@ -313,17 +314,51 @@ export class MapView {
         lineWidthUnits: "pixels",
       }));
     }
+    if (this.selectedIncidentHistory.features?.length) {
+      layers.push(new deck.GeoJsonLayer({
+        id: "incident-selected-exact-history",
+        data: this.selectedIncidentHistory,
+        pickable: false,
+        filled: true,
+        stroked: true,
+        lineWidthUnits: "pixels",
+        extensions: dashExtension,
+        getFillColor: (feature) => colorFor(
+          feature.properties,
+          "family",
+          footprintHistoryVisualModel(feature.properties).fillAlpha,
+        ),
+        getLineColor: (feature) => colorFor(
+          feature.properties,
+          "family",
+          footprintHistoryVisualModel(feature.properties).lineAlpha,
+        ),
+        getLineWidth: (feature) => footprintHistoryVisualModel(
+          feature.properties,
+        ).lineWidth,
+        getDashArray: (feature) => footprintHistoryVisualModel(
+          feature.properties,
+        ).dash,
+        dashJustified: true,
+      }));
+    }
     layers.push(new deck.GeoJsonLayer({
       id: "incident-exact-complete-footprints",
       data: this.footprints,
       pickable: true,
+      // Keep transparent polygon interiors in the picking buffer at field zoom.
+      // Exact field polygons remain visually primary and receive normal clicks.
       filled: true,
       stroked: true,
       lineWidthUnits: "pixels",
       extensions: dashExtension,
       getFillColor: (feature) => {
         const visual = footprintVisualModel(feature.properties);
-        return colorFor(feature.properties, "family", visual.fillAlpha);
+        return colorFor(
+          feature.properties,
+          "family",
+          model.fields.visible ? 0 : visual.fillAlpha,
+        );
       },
       getLineColor: (feature) => String(feature.properties?.incident_id) === this.selectedIncidentId
         ? [255, 255, 255, 255]
@@ -348,29 +383,6 @@ export class MapView {
         this.incidentDeckHitFeatures(info),
       ),
     }));
-    if (this.selectedIncidentHistory.features?.length) {
-      layers.push(new deck.GeoJsonLayer({
-        id: "incident-selected-exact-history",
-        data: this.selectedIncidentHistory,
-        pickable: false,
-        filled: false,
-        stroked: true,
-        lineWidthUnits: "pixels",
-        extensions: dashExtension,
-        getLineColor: (feature) => colorFor(
-          feature.properties,
-          "family",
-          footprintHistoryVisualModel(feature.properties).lineAlpha,
-        ),
-        getLineWidth: (feature) => footprintHistoryVisualModel(
-          feature.properties,
-        ).lineWidth,
-        getDashArray: (feature) => footprintHistoryVisualModel(
-          feature.properties,
-        ).dash,
-        dashJustified: true,
-      }));
-    }
     const selectedFootprints = this.selectedIncidentFootprints();
     for (const [role, fill, line] of [
       ["watch", [242, 193, 78, 22], [242, 193, 78, 180]],
@@ -429,7 +441,16 @@ export class MapView {
         info.object?.properties || null,
         { x: info.x, y: info.y },
       ),
-      onClick: (info) => this.onSelect?.(info.object?.properties || null),
+      onClick: (info) => {
+        if (this.incidentMode && info.srcEvent?.shiftKey) {
+          const incidents = this.incidentDeckHitFeatures(info);
+          if (incidents.length) {
+            this.selectCoincidentIncident(incidents[0].properties, incidents);
+            return;
+          }
+        }
+        this.onSelect?.(info.object?.properties || null);
+      },
     });
   }
 
@@ -476,6 +497,7 @@ export class MapView {
     for (const band of ["recent", "middle", "old"]) {
       this.map.setLayoutProperty(`incident-history-${band}-line`, "visibility", "none");
     }
+    this.map.setLayoutProperty("incident-history-fill", "visibility", "none");
     for (const role of ["watch", "impact", "pressure"]) {
       this.map.setLayoutProperty(`incident-${role}-fill`, "visibility", "none");
     }
@@ -529,6 +551,7 @@ export class MapView {
       "incident-footprints-quiet-line",
       "incident-footprints-carried-line",
       "incident-footprints-selected-line",
+      "incident-history-fill",
       "incident-history-recent-line",
       "incident-history-middle-line",
       "incident-history-old-line",
@@ -567,11 +590,23 @@ export class MapView {
   }
 
   ensureFallbackLayers() {
+    if (!this.map.getLayer("incident-history-fill")) this.map.addLayer({
+      id: "incident-history-fill",
+      type: "fill",
+      source: "incident-selected-history-fallback",
+      paint: {
+        "fill-color": ["get", "__history_color"],
+        "fill-opacity": ["get", "__history_fill_opacity"],
+      },
+    });
     if (!this.map.getLayer("incident-footprints-fill")) this.map.addLayer({
       id: "incident-footprints-fill", type: "fill", source: "incident-footprints-fallback",
       paint: {
         "fill-color": ["get", "__footprint_color"],
-        "fill-opacity": ["get", "__footprint_opacity"],
+        "fill-opacity": this.incidentMode
+          ? ["interpolate", ["linear"], ["zoom"], 10.75,
+              ["get", "__footprint_opacity"], 11, 0]
+          : ["get", "__footprint_opacity"],
       },
     });
     for (const [id, style, dash] of [
@@ -666,7 +701,18 @@ export class MapView {
       this.map.getCanvas().style.cursor = "";
       this.onHover?.(null, null);
     });
-    this.map.on("click", "story-current-fill", (event) => this.onSelect?.(event.features?.[0]?.properties || null));
+    this.map.on("click", "story-current-fill", (event) => {
+      if (this.incidentMode && event.originalEvent?.shiftKey) {
+        const incidents = this.map.queryRenderedFeatures?.(event.point, {
+          layers: ["incident-footprints-fill"],
+        }) || [];
+        if (incidents.length) {
+          this.selectCoincidentIncident(incidents[0].properties, incidents);
+          return;
+        }
+      }
+      this.onSelect?.(event.features?.[0]?.properties || null);
+    });
     this.map.on("mousemove", "incident-footprints-fill", (event) => {
       if (this.fieldFeatureAt(event.point)) return;
       this.map.getCanvas().style.cursor = "pointer";
@@ -815,6 +861,7 @@ function footprintHistoryFallbackCollection(collection = EMPTY) {
           ...properties,
           history_id: `${properties.incident_id || "incident"}:${properties.timeline_bucket || "week"}`,
           __history_color: colorHexFor(properties, "family"),
+          __history_fill_opacity: visual.fillAlpha / 255,
           __history_opacity: visual.lineAlpha / 255,
           __history_width: visual.lineWidth,
         },

@@ -145,3 +145,25 @@ diagnostic reconstructed-availability mode. Operational replay requires source
 availability timestamps. Learned motifs are reviewed, completed-story
 descriptors with weather- and acquisition-matched prefix prototypes; they never
 control incident identity or lifecycle.
+
+## ADR-011: V4/2 reconciles positive claims and aligns evidence trajectories
+
+Status: accepted, 2026-07-07.
+
+V4/2 keeps V3 as lifecycle authority. Every published checkpoint has a
+fail-closed reconciliation row proving that its positive pressure, decline,
+and recovery claims are supported by V4 evidence known by the checkpoint.
+Component absence, coverage registries, and lifecycle policy are not replayed,
+so V4 does not claim to recompute story start/end.
+
+The viewer presents a linked map plus aligned linear-time detail: one lane per
+hazard with explicit missing/low/partial pressure, Sentinel-2 source and known
+times with configured freshness aging, a continuous crop-stage band, and one
+row per incident lifecycle. Selected map history uses exact age-faded polygons;
+no path or propagation geometry is allowed. Rendering is bounded and any API
+truncation remains visible.
+
+Live motif scoring is an immutable diagnostic delta over confirmed,
+non-terminal incident IDs. It cannot change identity/lifecycle, excludes
+candidate checkpoints, retains causal daily-weather ownership between weekly
+updates, and remains blocked from map publication.

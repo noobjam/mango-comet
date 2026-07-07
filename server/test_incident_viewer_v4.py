@@ -20,7 +20,8 @@ from story_map_server import (
     make_handler,
 )
 from story_monitor.incident_viewer_v4 import (
-    _validate_outputs,
+    LIFECYCLE_RECONCILIATION_SCHEMA_VERSION,
+    _write_daily_grid,
     export_incident_viewer_v4,
     validate_viewer_directory,
 )
@@ -53,6 +54,23 @@ class IncidentViewerV4Tests(unittest.TestCase):
 
             self.assertEqual(result["mode"], "crop_incident_v4_dual_clock")
             self.assertEqual(validate_viewer_directory(output)["status"], "valid")
+            lifecycle = pd.read_parquet(
+                output / "lifecycle_reconciliation_v4.parquet"
+            )
+            self.assertEqual(
+                set(lifecycle["schema_version"]),
+                {LIFECYCLE_RECONCILIATION_SCHEMA_VERSION},
+            )
+            self.assertTrue(lifecycle["positive_claim_reconciliation_complete"].all())
+            self.assertFalse(lifecycle["lifecycle_state_recomputed"].any())
+            self.assertFalse(lifecycle["lifecycle_causal_claim_supported"].any())
+            quiet = lifecycle[
+                lifecycle["story_week"].astype(str).eq("2025-01-13")
+            ].iloc[0]
+            self.assertEqual(
+                quiet["quiet_evidence_status"],
+                "observed_quiet_for_attributed_members",
+            )
             pressure_observations = pd.read_parquet(
                 output / "pressure_observations_v4.parquet"
             )
@@ -717,7 +735,141 @@ class IncidentViewerV4Tests(unittest.TestCase):
                     )
                 self.assertFalse(output.exists())
 
-    def test_empty_optional_modalities_and_story_outputs_are_schema_valid(self) -> None:
+    def test_lifecycle_reconciliation_rejects_response_contradiction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            incident = root / "incident"
+            evidence = root / "evidence"
+            output = root / "viewer-v4"
+            _write_source(source)
+            _write_incident(incident, source)
+            _write_evidence(evidence)
+
+            weekly_path = incident / "incident_weekly_state.parquet"
+            weekly = pd.read_parquet(weekly_path)
+            second_week = weekly["timeline_bucket"].astype(str).eq("2025-01-13")
+            weekly.loc[second_week, "fresh_recovery_field_count"] = 1
+            weekly.to_parquet(weekly_path, index=False)
+            membership_path = incident / "incident_membership.parquet"
+            membership = pd.read_parquet(membership_path)
+            recovery_member = membership["timeline_bucket"].astype(str).eq("2025-01-13")
+            membership.loc[recovery_member, "fresh_response_evidence"] = True
+            membership.loc[recovery_member, "response_class"] = "recovery"
+            membership.to_parquet(membership_path, index=False)
+            _refresh_artifact_hashes(incident, weekly_path, membership_path)
+
+            s2_path = evidence / "field_s2_acquisition_v4.parquet"
+            s2 = pd.read_parquet(s2_path)
+            candidate = s2["acquisition_id"].eq("s2-2025-01-23-field-1")
+            s2.loc[candidate, "spectral_source_date"] = "2025-01-13"
+            s2.loc[candidate, "knowledge_time"] = "2025-01-13"
+            s2.loc[candidate, "response_class"] = "severe_decline"
+            s2.to_parquet(s2_path, index=False)
+            _refresh_evidence_artifacts(evidence)
+
+            with self.assertRaisesRegex(
+                ValueError, "unsupported_fresh_recovery_claim"
+            ):
+                export_incident_viewer_v4(
+                    incident, evidence, source, output, threads=1,
+                    min_valid_geometry_coverage=1.0,
+                    min_frame_geometry_coverage=1.0,
+                )
+            self.assertFalse(output.exists())
+
+    def test_lifecycle_reconciliation_distinguishes_quiet_from_missing_weather(self) -> None:
+        for missing_weather, expected in (
+            (False, "observed_quiet_for_attributed_members"),
+            (True, "missing_weather"),
+        ):
+            with self.subTest(missing_weather=missing_weather), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "source"
+                incident = root / "incident"
+                evidence = root / "evidence"
+                output = root / "viewer-v4"
+                _write_source(source)
+                _write_incident(incident, source)
+                _write_evidence(evidence)
+                if missing_weather:
+                    pressure_path = evidence / "field_day_pressure_v4.parquet"
+                    pressure = pd.read_parquet(pressure_path)
+                    dates = pd.to_datetime(pressure["observation_date"])
+                    missing = (
+                        pressure["field_id"].eq("field-1")
+                        & pressure["hazard_family"].eq("heat")
+                        & dates.between("2025-01-13", "2025-01-19")
+                    )
+                    pressure.loc[missing, "pressure_observed"] = False
+                    pressure.loc[missing, "pressure_active"] = False
+                    pressure.to_parquet(pressure_path, index=False)
+                    _refresh_evidence_artifacts(evidence)
+
+                export_incident_viewer_v4(
+                    incident, evidence, source, output, threads=1,
+                    min_valid_geometry_coverage=1.0,
+                    min_frame_geometry_coverage=1.0,
+                )
+                lifecycle = pd.read_parquet(
+                    output / "lifecycle_reconciliation_v4.parquet"
+                )
+                second = lifecycle[
+                    lifecycle["story_week"].astype(str).eq("2025-01-13")
+                ].iloc[0]
+                self.assertEqual(second["quiet_evidence_status"], expected)
+                self.assertFalse(second["component_absence_replayed"])
+
+    def test_daily_grid_uses_modal_current_stage_not_latest_s2_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, duckdb.connect(":memory:") as con:
+            day = pd.Timestamp("2025-01-06")
+            rows = []
+            geometry = []
+            for index in range(4):
+                majority = index < 3
+                field_id = f"field-{index}"
+                rows.append(
+                    {
+                        "calendar_date": day,
+                        "field_id": field_id,
+                        "crop_instance_id": f"crop-{index}",
+                        "monitored": True,
+                        "evaluable": True,
+                        "crop_context_observed": True,
+                        "stage_source_date": day,
+                        "crop_observation_date": day,
+                        "s2_knowledge_date": (
+                            pd.Timestamp("2025-01-01") if majority
+                            else pd.Timestamp("2025-01-06")
+                        ),
+                        "hazard_family": "heat",
+                        "crop_name": "maize" if majority else "beans",
+                        "stage_bucket": "vegetative" if majority else "flowering",
+                        "pressure_observed": True,
+                        "risk_rank": 1,
+                        "crop_impact_active": False,
+                        "response_class": "no_material_change",
+                        "spectral_source_date": pd.Timestamp("2025-01-01"),
+                        "evidence_freshness": "fresh",
+                    }
+                )
+                geometry.append(
+                    {"field_id": field_id, "centroid_lon": 30.1, "centroid_lat": -1.9}
+                )
+            con.register("field_day_state_input", pd.DataFrame(rows))
+            con.register("geometry_input", pd.DataFrame(geometry))
+            con.execute(
+                "CREATE VIEW field_day_state_v4 AS SELECT * FROM field_day_state_input"
+            )
+            con.execute("CREATE VIEW geometry_v4 AS SELECT * FROM geometry_input")
+            output = Path(directory) / "grid.parquet"
+            _write_daily_grid(con, output, cell_degrees=1.0)
+            grid = pd.read_parquet(output)
+            self.assertEqual(len(grid), 1)
+            self.assertEqual(grid.iloc[0]["dominant_crop_name"], "maize")
+            self.assertEqual(grid.iloc[0]["dominant_stage_bucket"], "vegetative")
+
+    def test_missing_required_positive_story_evidence_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source"
@@ -735,31 +887,19 @@ class IncidentViewerV4Tests(unittest.TestCase):
                 pd.read_parquet(path).iloc[0:0].to_parquet(path, index=False)
             _refresh_evidence_artifacts(evidence)
 
-            result = export_incident_viewer_v4(
-                incident,
-                evidence,
-                source,
-                output,
-                threads=1,
-                min_valid_geometry_coverage=1.0,
-                min_frame_geometry_coverage=1.0,
-            )
-
-            self.assertEqual(result["pressure_grid_row_count"], 0)
-            self.assertEqual(result["s2_attempt_count"], 0)
-            self.assertEqual(result["s2_update_count"], 0)
-            self.assertGreater(result["daily_count"], 0)
-            self.assertGreater(result["field_day_state_count"], 0)
-
-            for filename in (
-                "story_checkpoints_v4.parquet",
-                "story_footprints_v4.parquet",
+            with self.assertRaisesRegex(
+                ValueError, "unsupported_pressure_core_claim"
             ):
-                path = output / filename
-                pd.read_parquet(path).iloc[0:0].to_parquet(path, index=False)
-            with duckdb.connect(":memory:") as connection:
-                validation = _validate_outputs(connection, output)
-            self.assertEqual(validation["story_checkpoint_count"], 0)
+                export_incident_viewer_v4(
+                    incident,
+                    evidence,
+                    source,
+                    output,
+                    threads=1,
+                    min_valid_geometry_coverage=1.0,
+                    min_frame_geometry_coverage=1.0,
+                )
+            self.assertFalse(output.exists())
 
 
 def _write_evidence(root: Path) -> None:
@@ -772,6 +912,9 @@ def _write_evidence(root: Path) -> None:
             ("field-1", "crop-1", "maize", "flowering"),
             ("field-2", "crop-2", "beans", "vegetative"),
         ):
+            active_pressure = (
+                field == "field-1" and day < date(2025, 1, 13)
+            )
             crop_rows.append(
                 {
                     "observation_date": day,
@@ -793,11 +936,11 @@ def _write_evidence(root: Path) -> None:
                     "field_id": field,
                     "crop_instance_id": crop_instance,
                     "hazard_family": "heat",
-                    "pressure_score": 0.8 if field == "field-1" else 0.2,
-                    "pressure_rank": 3 if field == "field-1" else 1,
-                    "pressure_band": "MED-HIGH" if field == "field-1" else "LOW",
+                    "pressure_score": 0.8 if active_pressure else 0.2,
+                    "pressure_rank": 3 if active_pressure else 1,
+                    "pressure_band": "MED-HIGH" if active_pressure else "LOW",
                     "pressure_observed": True,
-                    "pressure_active": field == "field-1",
+                    "pressure_active": active_pressure,
                 }
             )
         if day == date(2025, 1, 6):

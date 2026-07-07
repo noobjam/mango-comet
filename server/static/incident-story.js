@@ -130,9 +130,13 @@ export function incidentFootprintHistory(
 
 export function footprintHistoryVisualModel(properties = {}) {
   const band = String(properties.age_band || "old");
-  if (band === "recent") return { lineAlpha: 205, lineWidth: 2.1, dash: [7, 3] };
-  if (band === "middle") return { lineAlpha: 145, lineWidth: 1.5, dash: [4, 4] };
-  return { lineAlpha: 85, lineWidth: 1.0, dash: [2, 5] };
+  if (band === "recent") {
+    return { fillAlpha: 54, lineAlpha: 205, lineWidth: 2.1, dash: [7, 3] };
+  }
+  if (band === "middle") {
+    return { fillAlpha: 28, lineAlpha: 145, lineWidth: 1.5, dash: [4, 4] };
+  }
+  return { fillAlpha: 12, lineAlpha: 85, lineWidth: 1.0, dash: [2, 5] };
 }
 
 function footprintFeature(row, fallbackIncidentId) {

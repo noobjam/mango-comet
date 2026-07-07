@@ -24,6 +24,7 @@ from .incident_motifs_v4 import (
     MODEL_FEATURE_COLUMNS,
     MODEL_SCHEMA_VERSION,
     PREFIX_SCHEMA_VERSION,
+    TENTATIVE_ASSIGNMENT_STATES,
     MotifDiscoveryConfig,
     PrefixCalibrationConfig,
     PrefixMotifModel,
@@ -31,6 +32,8 @@ from .incident_motifs_v4 import (
     build_causal_prefix_features,
     build_completed_story_features,
     build_eligibility_ledger,
+    build_incident_ownership_boundaries,
+    build_live_scoring_ledger,
     build_review_overlay_template,
     discover_completed_motifs,
     evaluate_prefix_replay,
@@ -50,6 +53,10 @@ SOURCE_NAMES = {
     "lineage": "incident_lineage.parquet",
 }
 VIEWER_STORY_CHECKPOINT_NAME = VIEWER_OUTPUT_FILES["story_checkpoints"]
+TENTATIVE_ASSIGNMENT_SQL = "(" + ",".join(
+    "'" + value.replace("'", "''") + "'"
+    for value in sorted(TENTATIVE_ASSIGNMENT_STATES)
+) + ")"
 
 
 def materialize_causal_incident_evidence_v4(
@@ -59,6 +66,9 @@ def materialize_causal_incident_evidence_v4(
     incident_daily_output_path: Path,
     incident_s2_output_path: Path,
     *,
+    incident_windows_path: Path | None = None,
+    incident_lineage_path: Path | None = None,
+    incident_checkpoints_path: Path | None = None,
     threads: int = 16,
     memory_limit: str | None = "8GB",
     temp_dir: Path | None = None,
@@ -77,12 +87,49 @@ def materialize_causal_incident_evidence_v4(
     s2_path = field_s2_path.expanduser().resolve()
     daily_output = incident_daily_output_path.expanduser().resolve()
     s2_output = incident_s2_output_path.expanduser().resolve()
-    _require_files(
-        {
+    required_sources = {
             "incident_membership": membership_path,
             "field_pressure": pressure_path,
             "field_s2": s2_path,
         }
+    if (incident_windows_path is None) != (incident_lineage_path is None):
+        raise ValueError("incident windows and lineage must be supplied together")
+    windows_path = (
+        incident_windows_path.expanduser().resolve()
+        if incident_windows_path is not None
+        else None
+    )
+    lineage_path = (
+        incident_lineage_path.expanduser().resolve()
+        if incident_lineage_path is not None
+        else None
+    )
+    if windows_path is not None and lineage_path is not None:
+        required_sources.update(
+            {"incident_windows": windows_path, "incident_lineage": lineage_path}
+        )
+    checkpoints_path = (
+        incident_checkpoints_path.expanduser().resolve()
+        if incident_checkpoints_path is not None
+        else None
+    )
+    if checkpoints_path is not None and windows_path is None:
+        raise ValueError("incident checkpoints require windows and lineage boundaries")
+    if checkpoints_path is not None:
+        required_sources["incident_checkpoints"] = checkpoints_path
+    _require_files(required_sources)
+    ownership_boundaries = (
+        build_incident_ownership_boundaries(
+            pd.read_parquet(windows_path),
+            pd.read_parquet(lineage_path),
+            incident_checkpoints=(
+                pd.read_parquet(checkpoints_path)
+                if checkpoints_path is not None
+                else None
+            ),
+        )
+        if windows_path is not None and lineage_path is not None
+        else pd.DataFrame()
     )
     if int(threads) < 1:
         raise ValueError("DuckDB evidence adapter threads must be positive")
@@ -123,6 +170,7 @@ def materialize_causal_incident_evidence_v4(
                     threads=int(threads),
                     memory_limit=memory_limit,
                     temp_dir=Path(spill_temporary),
+                    ownership_boundaries=ownership_boundaries,
                 )
         else:
             spill = temp_dir.expanduser().resolve()
@@ -136,6 +184,7 @@ def materialize_causal_incident_evidence_v4(
                 threads=int(threads),
                 memory_limit=memory_limit,
                 temp_dir=spill,
+                ownership_boundaries=ownership_boundaries,
             )
         _write_json_exclusive(
             transaction_marker,
@@ -170,6 +219,7 @@ def _duckdb_materialize_incident_evidence(
     threads: int,
     memory_limit: str | None,
     temp_dir: Path,
+    ownership_boundaries: pd.DataFrame,
 ) -> dict[str, Any]:
     connection = duckdb.connect(":memory:")
     try:
@@ -180,6 +230,31 @@ def _duckdb_materialize_incident_evidence(
         if memory_limit:
             connection.execute("SET memory_limit=?", [str(memory_limit)])
         connection.execute("SET temp_directory=?", [str(temp_dir)])
+        if ownership_boundaries.empty:
+            connection.execute(
+                """
+                CREATE TEMP TABLE ownership_boundaries_v4 (
+                    incident_id VARCHAR,
+                    ownership_boundary_effective_at TIMESTAMP,
+                    ownership_boundary_available_at TIMESTAMP
+                )
+                """
+            )
+        else:
+            connection.register(
+                "ownership_boundaries_input_v4", ownership_boundaries
+            )
+            connection.execute(
+                """
+                CREATE TEMP TABLE ownership_boundaries_v4 AS
+                SELECT CAST(incident_id AS VARCHAR) AS incident_id,
+                    CAST(ownership_boundary_effective_at AS TIMESTAMP)
+                        AS ownership_boundary_effective_at,
+                    CAST(ownership_boundary_available_at AS TIMESTAMP)
+                        AS ownership_boundary_available_at
+                FROM ownership_boundaries_input_v4
+                """
+            )
         membership_columns = _parquet_columns(connection, membership_path)
         _require_column_names(
             membership_columns,
@@ -258,6 +333,20 @@ def _duckdb_materialize_incident_evidence(
         )
         if conflicting_membership:
             raise ValueError("incident membership has conflicting knowledge times")
+        ambiguous_membership = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT membership_week, field_id, crop_instance_id,
+                        hazard_family, membership_available_at
+                    FROM membership_raw_v4 GROUP BY ALL
+                    HAVING COUNT(DISTINCT incident_id) > 1
+                )
+                """
+            ).fetchone()[0]
+        )
+        if ambiguous_membership:
+            raise ValueError("incident membership has ambiguous ownership snapshots")
         connection.execute(
             """
             CREATE TEMP TABLE membership_v4 AS
@@ -328,6 +417,71 @@ def _duckdb_materialize_incident_evidence(
         connection.execute(
             """
             CREATE TEMP TABLE pressure_joined_v4 AS
+            WITH availability_owner AS (
+                SELECT
+                    p.timeline_date,
+                    p.pressure_available_at,
+                    m.*
+                FROM pressure_raw_v4 p
+                ASOF JOIN membership_v4 m
+                  ON p.field_id = m.field_id
+                 AND p.crop_instance_id = m.crop_instance_id
+                 AND p.hazard_family = m.hazard_family
+                 AND p.pressure_available_at >= m.membership_available_at
+            ), known_ownership AS (
+                SELECT * FROM availability_owner
+                WHERE membership_week <= timeline_date
+                UNION ALL BY NAME
+                SELECT
+                    selected.timeline_date,
+                    selected.pressure_available_at,
+                    candidate.*
+                FROM availability_owner selected
+                JOIN LATERAL (
+                    SELECT candidate.*
+                    FROM membership_v4 candidate
+                    WHERE candidate.field_id = selected.field_id
+                      AND candidate.crop_instance_id = selected.crop_instance_id
+                      AND candidate.hazard_family = selected.hazard_family
+                      AND candidate.membership_week <= selected.timeline_date
+                      AND candidate.membership_available_at
+                            <= selected.pressure_available_at
+                    ORDER BY candidate.membership_available_at DESC,
+                        candidate.membership_week DESC,
+                        candidate.incident_id ASC
+                    LIMIT 1
+                ) candidate ON TRUE
+                WHERE selected.membership_week > selected.timeline_date
+            ), same_week_fallback AS (
+                SELECT p.timeline_date, p.pressure_available_at, m.*
+                FROM pressure_raw_v4 p
+                JOIN membership_v4 m
+                  ON p.field_id = m.field_id
+                 AND p.crop_instance_id = m.crop_instance_id
+                 AND p.hazard_family = m.hazard_family
+                 AND DATE_TRUNC('week', p.timeline_date) = m.membership_week
+                ANTI JOIN known_ownership k
+                  ON p.field_id = k.field_id
+                 AND p.crop_instance_id = k.crop_instance_id
+                 AND p.hazard_family = k.hazard_family
+                 AND p.timeline_date = k.timeline_date
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY p.field_id, p.crop_instance_id,
+                        p.hazard_family, p.timeline_date
+                    ORDER BY m.membership_available_at, m.incident_id
+                ) = 1
+            ), ownership AS (
+                SELECT * FROM known_ownership
+                UNION ALL BY NAME SELECT * FROM same_week_fallback
+            ), bounded_ownership AS (
+                SELECT o.* FROM ownership o
+                LEFT JOIN ownership_boundaries_v4 b USING (incident_id)
+                WHERE b.incident_id IS NULL
+                   OR o.timeline_date < b.ownership_boundary_effective_at
+                   OR GREATEST(o.pressure_available_at,
+                        o.membership_available_at)
+                        < b.ownership_boundary_available_at
+            )
             SELECT
                 m.incident_id,
                 p.field_id,
@@ -345,18 +499,19 @@ def _duckdb_materialize_incident_evidence(
                     AS weather_pressure_active,
                 p.pressure_observed AND p.pressure_rank >= 4
                     AS weather_severe,
-                m.membership_role IN ('impact_lag', 'unresolved', 'unresolved_review',
-                    'recovering', 'recovered')
+                m.membership_role IN ('impact_lag', 'unresolved',
+                    'unresolved_review', 'recovering', 'recovered')
                     OR m.fresh_response_evidence AS affected,
                 m.fresh_response_evidence
                     AND m.response_class = 'severe_decline' AS severe,
                 m.stage_bucket
             FROM pressure_raw_v4 p
-            JOIN membership_v4 m
-              ON DATE_TRUNC('week', p.timeline_date) = m.membership_week
-             AND p.field_id = m.field_id
+            JOIN bounded_ownership m
+              ON p.field_id = m.field_id
              AND p.crop_instance_id = m.crop_instance_id
              AND p.hazard_family = m.hazard_family
+             AND p.timeline_date = m.timeline_date
+             AND p.pressure_available_at = m.pressure_available_at
             """
         )
         invalid_pressure = int(
@@ -660,7 +815,7 @@ def _duckdb_materialize_incident_evidence(
             "engine": "duckdb",
             "schema_version": "incident-evidence-path-adapter-v4/1",
             "raw_field_ledgers_loaded_into_pandas": False,
-            "raw_scan_strategy": "single_membership_join_scan_per_field_ledger",
+            "raw_scan_strategy": "asof_fast_path_with_effective_week_fallback",
             "pandas_materialization_boundary": "incident_aggregates_and_owned_acquisitions",
             "threads": threads,
             "memory_limit": str(memory_limit) if memory_limit else None,
@@ -668,6 +823,8 @@ def _duckdb_materialize_incident_evidence(
             "incident_daily_row_count": daily_rows,
             "incident_s2_row_count": s2_rows,
             "pressure_materialization_grain": "incident_id_x_timeline_date",
+            "pressure_ownership_policy": "latest_causally_known_with_boundary_stop",
+            "ownership_boundary_count": int(len(ownership_boundaries)),
             "s2_materialization_grain": "incident_owned_distinct_acquisition",
             "map_publication_supported": False,
         }
@@ -695,6 +852,7 @@ def _materialize_learning_features_v4(
     threads: int,
     memory_limit: str | None,
     temp_dir: Path | None,
+    terminal_only: bool = False,
 ) -> None:
     """Build causal terminal/prefix vectors with bounded DuckDB state.
 
@@ -746,14 +904,35 @@ def _materialize_learning_features_v4(
         s2_maturity = _maturity_case_sql(
             "s2_usable_acquisition_count", prefix_config.s2_acquisition_horizons
         )
+        cutoff_sources = (
+            "SELECT incident_id, terminal_available_at AS cutoff FROM eligible_v4"
+            if terminal_only
+            else f"""
+            SELECT incident_id, CAST(feature_available_at AS TIMESTAMP) AS cutoff
+                FROM daily_rows_v4
+            UNION SELECT e.incident_id, CAST(w.story_known_time AS TIMESTAMP)
+                FROM read_parquet({story_checkpoints}) w JOIN eligible_v4 e
+                  ON CAST(w.incident_id AS VARCHAR) = e.incident_id
+            UNION SELECT incident_id, CAST(feature_available_at AS TIMESTAMP)
+                FROM read_parquet({s2}) s JOIN eligible_v4 USING (incident_id)
+            UNION SELECT incident_id, terminal_available_at FROM eligible_v4
+            """
+        )
+        feature_base_filter = (
+            "WHERE d.first_timeline_date IS NOT NULL" if not terminal_only else ""
+        )
         feature_select = """
-            CAST(DATE_DIFF('day', first_timeline_date, last_timeline_date) + 1 AS DOUBLE)
+            CAST(DATE_DIFF('day',
+                COALESCE(first_timeline_date, CAST(cutoff AS DATE)),
+                COALESCE(last_timeline_date, CAST(cutoff AS DATE))) + 1 AS DOUBLE)
                 AS duration_days,
             CAST(COALESCE(checkpoint_count, 0) AS DOUBLE) AS checkpoint_count,
             CAST(COALESCE(weather_observed_count, 0) AS DOUBLE)
                 AS weather_observed_day_count,
             CAST(COALESCE(weather_observed_count, 0) /
-                GREATEST(DATE_DIFF('day', first_timeline_date, last_timeline_date) + 1, 1)
+                GREATEST(DATE_DIFF('day',
+                    COALESCE(first_timeline_date, CAST(cutoff AS DATE)),
+                    COALESCE(last_timeline_date, CAST(cutoff AS DATE))) + 1, 1)
                 AS DOUBLE) AS weather_coverage_fraction,
             CAST(COALESCE(pressure_active_count, 0) /
                 GREATEST(daily_count, 1) AS DOUBLE) AS pressure_day_fraction,
@@ -986,14 +1165,7 @@ def _materialize_learning_features_v4(
 
         CREATE TEMP TABLE cutoffs_v4 AS
         SELECT incident_id, cutoff FROM (
-            SELECT incident_id, CAST(feature_available_at AS TIMESTAMP) AS cutoff
-                FROM daily_rows_v4
-            UNION SELECT e.incident_id, CAST(w.story_known_time AS TIMESTAMP)
-                FROM read_parquet({story_checkpoints}) w JOIN eligible_v4 e
-                  ON CAST(w.incident_id AS VARCHAR) = e.incident_id
-            UNION SELECT incident_id, CAST(feature_available_at AS TIMESTAMP)
-                FROM read_parquet({s2}) s JOIN eligible_v4 USING (incident_id)
-            UNION SELECT incident_id, terminal_available_at FROM eligible_v4
+            {cutoff_sources}
         ) c JOIN eligible_v4 e USING (incident_id)
         WHERE cutoff BETWEEN e.first_available_at AND e.terminal_available_at;
 
@@ -1025,7 +1197,7 @@ def _materialize_learning_features_v4(
           ON c.incident_id = o.incident_id AND c.cutoff >= o.available_at
         ASOF LEFT JOIN s2_instance_running_v4 i
           ON c.incident_id = i.incident_id AND c.cutoff >= i.available_at
-        WHERE d.first_timeline_date IS NOT NULL;
+        {feature_base_filter};
 
         COPY (
             SELECT '{PREFIX_SCHEMA_VERSION}' AS feature_schema_version,
@@ -1404,6 +1576,9 @@ def build_diagnostic_motif_release_v4(
             sources["membership"], daily_pressure_path, s2_acquisition_path,
             joined_daily_path, joined_s2_path, threads=threads,
             memory_limit=memory_limit, temp_dir=temp_dir,
+            incident_windows_path=sources["windows"],
+            incident_lineage_path=sources["lineage"],
+            incident_checkpoints_path=sources["story_checkpoints"],
         )
         _materialize_learning_features_v4(
             sources["story_checkpoints"], joined_daily_path, joined_s2_path,
@@ -1580,6 +1755,13 @@ def _fit_prefix_from_parquet_v4(
                 "config": asdict(config),
                 "center_fit_split": "train",
                 "radius_margin_fit_split": "calibration",
+                "open_set_negative_fit_split": "calibration",
+                "novel_negative_policy": (
+                    "joint_stratum_final_assignment_false_accept_cap"
+                ),
+                "assignment_readiness_policy": (
+                    "minimum_weather_then_explicit_evidence_support"
+                ),
                 "stage_distance_weight": 0.0,
                 "prototype_count": len(combined),
                 "publication_status": "blocked_pending_rolling_evaluation",
@@ -1704,6 +1886,362 @@ def fit_reviewed_prefix_release_v4(
     }
 
 
+def score_live_prefix_release_v4(
+    incident_dir: Path,
+    evidence_dir: Path,
+    viewer_dir: Path,
+    prefix_model_dir: Path,
+    output_dir: Path,
+    *,
+    as_of: Any,
+    threads: int = 16,
+    memory_limit: str | None = "8GB",
+    temp_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Score one immutable as-of delta for incidents active at that knowledge time."""
+
+    incident_dir = incident_dir.expanduser().resolve()
+    evidence_dir = evidence_dir.expanduser().resolve()
+    viewer_dir = viewer_dir.expanduser().resolve()
+    prefix_model_dir = prefix_model_dir.expanduser().resolve()
+    output_dir = output_dir.expanduser().resolve()
+    cutoff = _utc_timestamp(as_of)
+    _validate_new_output(
+        output_dir,
+        protected=(incident_dir, evidence_dir, viewer_dir, prefix_model_dir),
+    )
+    source = _validated_live_sources_v4(incident_dir, evidence_dir, viewer_dir)
+    release_as_of = _utc_timestamp(source["evidence_manifest"]["run"]["release_as_of"])
+    if cutoff > release_as_of + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1):
+        raise ValueError("live score as_of exceeds the immutable evidence release bound")
+
+    model_paths = {
+        "prefix_manifest": prefix_model_dir / "prefix_manifest.json",
+        "prefix_schema": prefix_model_dir / "prefix_feature_schema.json",
+        "prefix_prototypes": prefix_model_dir / "prefix_prototypes.parquet",
+    }
+    _require_files(model_paths)
+    model_fingerprints = {
+        name: _fingerprint(path) for name, path in model_paths.items()
+    }
+    prefix_manifest = _read_json(model_paths["prefix_manifest"])
+    _verify_manifest_artifacts(
+        prefix_manifest,
+        {
+            "prefix_feature_schema.json": model_paths["prefix_schema"],
+            "prefix_prototypes.parquet": model_paths["prefix_prototypes"],
+        },
+    )
+    if prefix_manifest.get("status") != "frozen_diagnostic":
+        raise ValueError("live scoring requires an immutable frozen diagnostic model")
+    prefix_schema = _read_json(model_paths["prefix_schema"])
+    prototypes = pd.read_parquet(model_paths["prefix_prototypes"])
+    model_version = str(prefix_manifest.get("model_version") or "")
+    if (
+        not model_version
+        or str(prefix_schema.get("model_version") or "") != model_version
+        or prototypes.empty
+        or set(prototypes["model_version"].astype(str)) != {model_version}
+    ):
+        raise ValueError("frozen prefix model artifacts disagree on model_version")
+    model = PrefixMotifModel(prefix_schema, prototypes, prefix_manifest)
+    prefix_config = _prefix_config_from_manifest(prefix_manifest)
+
+    checkpoints = pd.read_parquet(source["paths"]["story_checkpoints"]).copy()
+    checkpoints["knowledge_time"] = checkpoints["story_known_time"]
+    windows = pd.read_parquet(source["paths"]["windows"])
+    lineage = pd.read_parquet(source["paths"]["lineage"])
+    live_ledger = build_live_scoring_ledger(
+        windows, lineage, checkpoints, as_of=cutoff
+    )
+    if live_ledger.empty:
+        raise ValueError("no incidents were active at the requested as_of knowledge time")
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix=".incident-live-score-v4-", dir=output_dir.parent) as temporary:
+        stage = Path(temporary) / output_dir.name
+        stage.mkdir()
+        ledger_path = stage / "live_incident_ledger.parquet"
+        joined_daily = stage / ".incident_daily_pressure.parquet"
+        joined_s2 = stage / ".incident_s2_acquisitions.parquet"
+        completed_path = stage / ".completed_story_features.parquet"
+        prefix_path = stage / "live_prefix_features.parquet"
+        assignments_path = stage / "live_prefix_assignments.parquet"
+        _write_parquet(ledger_path, live_ledger)
+        adapter_stats = materialize_causal_incident_evidence_v4(
+            source["paths"]["membership"],
+            source["paths"]["daily_pressure"],
+            source["paths"]["s2_acquisitions"],
+            joined_daily,
+            joined_s2,
+            incident_windows_path=source["paths"]["windows"],
+            incident_lineage_path=source["paths"]["lineage"],
+            incident_checkpoints_path=source["paths"]["story_checkpoints"],
+            threads=threads,
+            memory_limit=memory_limit,
+            temp_dir=temp_dir,
+        )
+        _materialize_learning_features_v4(
+            source["paths"]["story_checkpoints"],
+            joined_daily,
+            joined_s2,
+            ledger_path,
+            completed_path,
+            prefix_path,
+            prefix_config=prefix_config,
+            threads=threads,
+            memory_limit=memory_limit,
+            temp_dir=temp_dir,
+            terminal_only=True,
+        )
+        assignment_bindings = {
+            "source_generation_id": source["source_generation_id"],
+            "incident_manifest_sha256": source["fingerprints"]["incident_manifest"]["sha256"],
+            "evidence_manifest_sha256": source["fingerprints"]["evidence_manifest"]["sha256"],
+            "viewer_manifest_sha256": source["fingerprints"]["viewer_manifest"]["sha256"],
+            "prefix_manifest_sha256": model_fingerprints["prefix_manifest"]["sha256"],
+        }
+        _stream_live_assignments_v4(
+            prefix_path, model, assignments_path, assignment_bindings
+        )
+        for transient in (joined_daily, joined_s2, completed_path):
+            transient.unlink(missing_ok=True)
+        with duckdb.connect(":memory:") as connection:
+            counts = connection.execute(
+                """
+                SELECT COUNT(*)::BIGINT,
+                    COUNT(DISTINCT incident_id)::BIGINT,
+                    COUNT_IF(assignment_status='pending')::BIGINT,
+                    COUNT_IF(is_tentative)::BIGINT
+                FROM read_parquet(?)
+                """,
+                [str(assignments_path)],
+            ).fetchone()
+            duplicate_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM (
+                        SELECT incident_id, prefix_as_of_time, model_version,
+                            COUNT(*) AS n FROM read_parquet(?)
+                        GROUP BY 1,2,3 HAVING n > 1
+                    )
+                    """,
+                    [str(assignments_path)],
+                ).fetchone()[0]
+            )
+        if duplicate_count:
+            raise RuntimeError("live assignments violate the append natural key")
+        manifest = {
+            "status": "complete",
+            "workflow_schema_version": WORKFLOW_SCHEMA_VERSION,
+            "phase": "live_as_of_diagnostic_scoring",
+            "as_of": cutoff.isoformat(),
+            "model_version": model_version,
+            "model": model_fingerprints,
+            "source": source["fingerprints"],
+            "release_binding": {
+                "source_generation_id": source["source_generation_id"],
+                **assignment_bindings,
+            },
+            "evidence_path_adapter": adapter_stats,
+            "counts": {
+                "assignment_rows": int(counts[0]),
+                "active_incidents": int(counts[1]),
+                "pending": int(counts[2]),
+                "tentative": int(counts[3]),
+            },
+            "append_contract": {
+                "mode": "immutable_as_of_delta",
+                "natural_key": [
+                    "incident_id",
+                    "prefix_as_of_time",
+                    "model_version",
+                ],
+                "overwrite_existing_key": False,
+            },
+            "incident_identity_preserved": True,
+            "map_publication_supported": False,
+        }
+        manifest["artifacts"] = _artifact_fingerprints(stage)
+        _write_json(stage / "live_score_manifest.json", manifest)
+        _verify_unchanged(source["paths"], source["fingerprints"])
+        _verify_unchanged(model_paths, model_fingerprints)
+        os.replace(stage, output_dir)
+    return {
+        "status": "complete",
+        "output_dir": str(output_dir),
+        "as_of": cutoff.isoformat(),
+        "model_version": model_version,
+        "active_incident_count": int(counts[1]),
+        "map_publication_supported": False,
+    }
+
+
+def _stream_live_assignments_v4(
+    prefix_path: Path,
+    model: PrefixMotifModel,
+    output_path: Path,
+    bindings: Mapping[str, str],
+    *,
+    batch_rows: int = 100_000,
+) -> None:
+    """Score an as-of prefix delta without loading all active stories at once."""
+
+    parts = output_path.parent / ".live_assignment_parts"
+    parts.mkdir()
+    connection = duckdb.connect(":memory:")
+    part_index = 0
+    try:
+        reader = connection.execute(
+            "SELECT * FROM read_parquet(?) ORDER BY incident_id, prefix_as_of_time",
+            [str(prefix_path)],
+        ).to_arrow_reader(batch_size=int(batch_rows))
+        for batch in reader:
+            frame = batch.to_pandas()
+            if frame.empty:
+                continue
+            assigned = assign_open_set_prefixes(frame, model)
+            for name, value in bindings.items():
+                assigned[name] = value
+            assigned.to_parquet(
+                parts / f"part-{part_index:06d}.parquet",
+                index=False,
+                compression="zstd",
+            )
+            part_index += 1
+        if part_index == 0:
+            raise ValueError("live scoring produced no causal prefixes")
+        connection.execute(
+            f"""
+            COPY (SELECT * FROM read_parquet({_sql_string(str(parts / '*.parquet'))})
+                  ORDER BY incident_id, prefix_as_of_time)
+            TO {_sql_string(str(output_path))} (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+    finally:
+        connection.close()
+        for path in parts.glob("*.parquet"):
+            path.unlink()
+        parts.rmdir()
+
+
+def _prefix_config_from_manifest(
+    manifest: Mapping[str, Any],
+) -> PrefixCalibrationConfig:
+    raw = manifest.get("config") or {}
+    defaults = PrefixCalibrationConfig()
+    config = PrefixCalibrationConfig(
+        weather_day_horizons=tuple(
+            raw.get("weather_day_horizons", defaults.weather_day_horizons)
+        ),
+        s2_acquisition_horizons=tuple(
+            raw.get("s2_acquisition_horizons", defaults.s2_acquisition_horizons)
+        ),
+        minimum_training_support=int(
+            raw.get("minimum_training_support", defaults.minimum_training_support)
+        ),
+        minimum_calibration_support=int(
+            raw.get(
+                "minimum_calibration_support",
+                defaults.minimum_calibration_support,
+            )
+        ),
+        radius_quantile=float(raw.get("radius_quantile", defaults.radius_quantile)),
+        margin_quantile=float(raw.get("margin_quantile", defaults.margin_quantile)),
+        maximum_novel_false_accept_rate=float(
+            raw.get(
+                "maximum_novel_false_accept_rate",
+                defaults.maximum_novel_false_accept_rate,
+            )
+        ),
+        minimum_weather_observed_days=int(
+            raw.get(
+                "minimum_weather_observed_days",
+                defaults.minimum_weather_observed_days,
+            )
+        ),
+        minimum_s2_acquisitions_for_crop_support=int(
+            raw.get(
+                "minimum_s2_acquisitions_for_crop_support",
+                defaults.minimum_s2_acquisitions_for_crop_support,
+            )
+        ),
+    )
+    config.validate()
+    return config
+
+
+def _validated_live_sources_v4(
+    incident_dir: Path, evidence_dir: Path, viewer_dir: Path
+) -> dict[str, Any]:
+    """Validate and fingerprint one mutually bound immutable scoring release."""
+
+    validate_viewer_directory(viewer_dir)
+    evidence_validation = validate_evidence_directory(evidence_dir)
+    paths = {
+        **{name: incident_dir / file_name for name, file_name in SOURCE_NAMES.items()},
+        "story_checkpoints": viewer_dir / VIEWER_STORY_CHECKPOINT_NAME,
+        "daily_pressure": evidence_dir / "field_day_pressure_v4.parquet",
+        "s2_acquisitions": evidence_dir / "field_s2_acquisition_v4.parquet",
+        "incident_manifest": incident_dir / "manifest.json",
+        "evidence_manifest": evidence_dir / "manifest.json",
+        "viewer_manifest": viewer_dir / "manifest.json",
+    }
+    _require_files(paths)
+    fingerprints = {name: _fingerprint(path) for name, path in paths.items()}
+    incident_manifest = _read_json(paths["incident_manifest"])
+    evidence_manifest = _read_json(paths["evidence_manifest"])
+    viewer_manifest = _read_json(paths["viewer_manifest"])
+    incident_run = incident_manifest.get("run") or {}
+    evidence_run = evidence_manifest.get("run") or {}
+    if incident_run.get("status") != "complete" or incident_run.get("immutable") is not True:
+        raise ValueError("live motif scoring requires an immutable complete Incident V3 release")
+    if evidence_run.get("status") != "complete" or evidence_run.get("immutable") is not True:
+        raise ValueError("live motif scoring requires an immutable complete evidence release")
+    if not bool(
+        (incident_manifest.get("semantics") or {}).get(
+            "archetype_is_optional_not_identity"
+        )
+    ):
+        raise ValueError("source manifest does not preserve incident/motif separation")
+    source_generation_id = str(incident_run.get("source_generation_id") or "").strip()
+    evidence_generation_id = str(evidence_run.get("source_generation_id") or "").strip()
+    if evidence_generation_id != str(
+        evidence_validation.get("source_generation_id") or ""
+    ).strip():
+        raise RuntimeError("evidence manifest changed during live source validation")
+    if not source_generation_id or source_generation_id != evidence_generation_id:
+        raise ValueError(
+            "incident and evidence releases must share one nonblank source_generation_id"
+        )
+    checkpoint_path, checkpoint_binding = _validate_viewer_story_checkpoint(
+        viewer_dir, viewer_manifest
+    )
+    if checkpoint_path != paths["story_checkpoints"] or any(
+        fingerprints["story_checkpoints"][name] != checkpoint_binding[name]
+        for name in ("sha256", "size_bytes")
+    ):
+        raise RuntimeError("viewer story checkpoints changed during live source validation")
+    viewer_source = viewer_manifest.get("source") or {}
+    expected_viewer = {
+        "incident_manifest_sha256": fingerprints["incident_manifest"]["sha256"],
+        "evidence_manifest_sha256": fingerprints["evidence_manifest"]["sha256"],
+    }
+    for name, expected in expected_viewer.items():
+        if str(viewer_source.get(name) or "") != expected:
+            raise ValueError(f"V4 viewer {name} does not match the scoring release")
+    if not str(evidence_run.get("release_as_of") or "").strip():
+        raise ValueError("evidence release lacks run.release_as_of")
+    return {
+        "paths": paths,
+        "fingerprints": fingerprints,
+        "incident_manifest": incident_manifest,
+        "evidence_manifest": evidence_manifest,
+        "viewer_manifest": viewer_manifest,
+        "source_generation_id": source_generation_id,
+    }
+
+
 def _stream_holdout_assignments_v4(
     prefix_path: Path,
     split_path: Path,
@@ -1805,12 +2343,12 @@ def _evaluate_assignment_parquet_v4(
         totals = connection.execute(
             f"""
             SELECT COUNT(*)::BIGINT AS n,
-                COUNT_IF(assignment_status='tentative')::BIGINT AS accepted,
-                COUNT_IF(assignment_status='tentative'
+                COUNT_IF(assignment_status IN {TENTATIVE_ASSIGNMENT_SQL})::BIGINT AS accepted,
+                COUNT_IF(assignment_status IN {TENTATIVE_ASSIGNMENT_SQL}
                     AND final_assignment_status='accepted'
                     AND a.reviewed_motif_id=l.reviewed_motif_id)::BIGINT AS correct,
                 COUNT_IF(final_assignment_status='novel_unassigned')::BIGINT AS novel,
-                COUNT_IF(assignment_status='tentative'
+                COUNT_IF(assignment_status IN {TENTATIVE_ASSIGNMENT_SQL}
                     AND final_assignment_status='novel_unassigned')::BIGINT AS false_accept
             FROM read_parquet({assignments}) a
             JOIN read_parquet({labels}) l USING (incident_id)
@@ -1823,14 +2361,14 @@ def _evaluate_assignment_parquet_v4(
             rows = connection.execute(
                 f"""
                 SELECT {columns}, COUNT(*)::BIGINT AS prefix_count,
-                    AVG((assignment_status='tentative')::INTEGER)::DOUBLE
+                    AVG((assignment_status IN {TENTATIVE_ASSIGNMENT_SQL})::INTEGER)::DOUBLE
                         AS accepted_coverage,
-                    COUNT_IF(assignment_status='tentative'
+                    COUNT_IF(assignment_status IN {TENTATIVE_ASSIGNMENT_SQL}
                         AND final_assignment_status='accepted'
                         AND a.reviewed_motif_id=l.reviewed_motif_id)::DOUBLE
-                        / GREATEST(COUNT_IF(assignment_status='tentative'),1)
+                        / GREATEST(COUNT_IF(assignment_status IN {TENTATIVE_ASSIGNMENT_SQL}),1)
                         AS accepted_known_precision,
-                    COUNT_IF(assignment_status='tentative'
+                    COUNT_IF(assignment_status IN {TENTATIVE_ASSIGNMENT_SQL}
                         AND final_assignment_status='novel_unassigned')::DOUBLE
                         / GREATEST(COUNT_IF(final_assignment_status='novel_unassigned'),1)
                         AS final_novel_false_accept_rate
@@ -2229,6 +2767,17 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _utc_timestamp(value: Any) -> pd.Timestamp:
+    parsed = pd.Timestamp(value)
+    if pd.isna(parsed):
+        raise ValueError("timestamp is invalid")
+    return (
+        parsed.tz_localize("UTC")
+        if parsed.tzinfo is None
+        else parsed.tz_convert("UTC")
+    )
+
+
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
     path.write_text(
         json.dumps(value, indent=2, sort_keys=True, allow_nan=False, default=str) + "\n",
@@ -2254,4 +2803,5 @@ __all__ = [
     "evaluate_prefix_release_v4",
     "fit_reviewed_prefix_release_v4",
     "materialize_causal_incident_evidence_v4",
+    "score_live_prefix_release_v4",
 ]

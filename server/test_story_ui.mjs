@@ -15,6 +15,7 @@ import {
   adjacentBuckets,
   assertCompleteFootprintCollection,
   coincidentIncidentCandidates,
+  fieldViewportCoverage,
   footprintRoleCollection,
   footprintVisualModel,
   incidentDetailModel,
@@ -35,10 +36,14 @@ import {
   incidentStoryArc,
 } from "./static/incident-story.js";
 import {
-  fieldEvidenceRibbonModel,
   lifecycleModel,
   prefixTrajectoryModel,
 } from "./static/inspector.js";
+import {
+  cropStoryTrajectoryModel,
+  fieldEvidenceRibbonModel,
+} from "./static/crop-story-trajectory-model.js";
+import { INCIDENT_FACETS, INCIDENT_MODEL_STATUS } from "./static/filters.js";
 import { buildEvolutionModel } from "./static/map-evolution.js";
 import { MapView } from "./static/map-view.js";
 import { alphaForState, lineColorFor } from "./static/palette.js";
@@ -209,42 +214,180 @@ test("causal prefix trajectory preserves gaps and selected week", () => {
   assert.equal(states[2].gapBefore, true);
 });
 
-test("V4 field ribbon keeps pressure, S2 source-known, and story-known clocks separate", () => {
+test("V4 trajectory gives every hazard a distinct lane and distinguishes low from missing", () => {
   const model = fieldEvidenceRibbonModel({
-    as_of_date: "2025-01-12",
-    history: { window_start: "2025-01-01", window_end: "2025-01-12" },
+    as_of_date: "2025-01-03",
+    history: { window_start: "2025-01-01", window_end: "2025-01-03" },
     lanes: {
       daily_pressure: [
-        { calendar_date: "2025-01-05", hazard_family: "heat", risk_rank: 3, pressure_active: true },
-        { calendar_date: "2025-01-05", hazard_family: "drought", risk_rank: 2, pressure_active: true },
+        { calendar_date: "2025-01-01", hazard_family: "heat", risk_rank: 1, pressure_observed: true },
+        { calendar_date: "2025-01-03", hazard_family: "heat", risk_rank: 3, pressure_observed: true },
+        { calendar_date: "2025-01-01", hazard_family: "drought", risk_rank: 2, pressure_observed: true },
+        { calendar_date: "2025-01-01", hazard_family: "damaging_wind", risk_rank: 2, pressure_observed: true },
+        { calendar_date: "2025-01-01", hazard_family: "flooding", risk_rank: 2, pressure_observed: true },
+        { calendar_date: "2025-01-01", hazard_family: "ponding", risk_rank: 2, pressure_observed: true },
       ],
-      s2_attempts: [
-        {
-          spectral_source_date: "2025-01-04", knowledge_date: "2025-01-06",
-          marker_type: "acquisition", spectral_usable: true,
-        },
-        {
-          spectral_source_date: "2025-01-09", knowledge_date: "2025-01-10",
-          marker_type: "rejected", spectral_usable: false,
-        },
-      ],
-      story_checkpoints: [{
-        story_week: "2025-01-06", story_known_date: "2025-01-12",
-        incident_state: "RECOVERING", stage_bucket: "flowering",
-      }],
     },
-  }, "2025-01-12");
-  assert.deepEqual(model.hazardFamilies, ["drought", "heat"]);
-  assert.equal(model.lanes.pressure.length, 2);
-  assert.notEqual(
-    model.lanes.pressure[0].hazardIndex,
-    model.lanes.pressure[1].hazardIndex,
-  );
-  assert.ok(model.lanes.s2[0].sourceX < model.lanes.s2[0].knowledgeX);
-  assert.equal(model.lanes.s2[1].rejected, true);
-  assert.ok(model.lanes.story[0].sourceX < model.lanes.story[0].knowledgeX);
-  assert.equal(model.lanes.story[0].stage, "flowering");
-  assert.equal(model.selectedX, 100);
+  }, "2025-01-03");
+  assert.equal(model.hazards.length, 5);
+  assert.equal(new Set(model.lanes.pressure.map((lane) => lane.hazard)).size, 5);
+  const heat = model.lanes.pressure.find((lane) => lane.hazard === "heat");
+  assert.deepEqual(heat.cells.map((cell) => cell.state), [
+    "observed-low", "missing", "elevated",
+  ]);
+});
+
+test("V4 trajectory separates S2 source and knowledge clocks and step-held freshness", () => {
+  const model = cropStoryTrajectoryModel({
+    as_of_date: "2025-02-10",
+    history: { window_start: "2025-01-01", window_end: "2025-02-10" },
+    s2_attempts: [
+      {
+        field_id: "f1", crop_instance_id: "c1", spectral_source_date: "2025-01-02",
+        knowledge_date: "2025-01-03", marker_type: "acquisition",
+        spectral_usable: true, response_class: "medium_decline",
+      },
+      {
+        field_id: "f2", crop_instance_id: "c2", spectral_source_date: "2025-01-08",
+        knowledge_date: "2025-01-09", marker_type: "rejected", spectral_usable: false,
+      },
+      {
+        field_id: "f3", crop_instance_id: "c3", spectral_source_date: "2025-01-15",
+        knowledge_date: "2025-01-16", marker_type: "acquisition",
+        spectral_usable: true, response_class: "recovery",
+      },
+      {
+        field_id: "f4", crop_instance_id: "c4", spectral_source_date: "2025-01-22",
+        knowledge_date: "2025-01-23", marker_type: "acquisition",
+        spectral_usable: true, response_class: "no_change",
+      },
+    ],
+  }, "2025-02-10");
+  assert.ok(model.lanes.s2.every((event) => event.sourceX <= event.knowledgeX));
+  assert.deepEqual(new Set(model.lanes.s2.map((event) => event.responseKind)), new Set([
+    "decline", "rejected", "recovery", "no-change",
+  ]));
+  assert.deepEqual(new Set(model.lanes.s2Holds.map((hold) => hold.freshness)), new Set([
+    "fresh", "aging", "stale",
+  ]));
+});
+
+test("V4 trajectory uses release freshness policy and rejected S2 cannot change crop stage", () => {
+  const base = {
+    as_of_date: "2025-01-20",
+    history: { window_start: "2025-01-01", window_end: "2025-01-20" },
+    s2_attempts: [
+      {
+        field_id: "f1", crop_instance_id: "c1", spectral_source_date: "2025-01-01",
+        knowledge_date: "2025-01-02", marker_type: "acquisition",
+        spectral_usable: true, response_class: "no_change", stage_bucket: "vegetative",
+      },
+      {
+        field_id: "f2", crop_instance_id: "c2", spectral_source_date: "2025-01-05",
+        knowledge_date: "2025-01-06", marker_type: "rejected",
+        spectral_usable: false, response_class: "no_change", stage_bucket: "poison_stage",
+      },
+    ],
+  };
+  const defaults = cropStoryTrajectoryModel(base);
+  const configured = cropStoryTrajectoryModel({
+    ...base,
+    freshness_policy: { fresh_max_days: 2, aging_max_days: 4 },
+  });
+  const defaultFresh = defaults.lanes.s2Holds.find((hold) => hold.freshness === "fresh");
+  const configuredFresh = configured.lanes.s2Holds.find((hold) => hold.freshness === "fresh");
+  assert.ok(configuredFresh.width < defaultFresh.width);
+  assert.ok(configured.lanes.stage.some((segment) => segment.stage === "vegetative"));
+  assert.ok(!configured.lanes.stage.some((segment) => segment.stage === "poison_stage"));
+});
+
+test("V4 trajectory keeps the full crop-stage band and one labelled row per story", () => {
+  const model = cropStoryTrajectoryModel({
+    as_of_date: "2025-01-31",
+    history: { window_start: "2025-01-01", window_end: "2025-01-31" },
+    story_checkpoints: [
+      { incident_id: "incident-maize", crop_name: "maize", hazard_family: "heat", story_week: "2025-01-01", story_known_date: "2025-01-03", incident_state: "ACTIVE", stage_bucket: "vegetative" },
+      { incident_id: "incident-maize", crop_name: "maize", hazard_family: "heat", story_week: "2025-01-08", story_known_date: "2025-01-10", incident_state: "RECOVERING", stage_bucket: "flowering" },
+      { incident_id: "incident-maize", crop_name: "maize", hazard_family: "heat", story_week: "2025-01-15", story_known_date: "2025-01-17", incident_state: "CLOSED_RECOVERED", stage_bucket: "mature" },
+      { incident_id: "incident-beans", crop_name: "beans", hazard_family: "drought", story_week: "2025-01-05", story_known_date: "2025-01-07", incident_state: "CANDIDATE", stage_bucket: "emergence" },
+    ],
+  }, "2025-01-31");
+  assert.equal(model.lanes.stories.length, 2);
+  assert.equal(new Set(model.lanes.stories.map((story) => story.label)).size, 2);
+  assert.equal(model.lanes.stage[0].stage, "unknown");
+  assert.ok(model.lanes.stage.some((segment) => segment.stage === "vegetative"));
+  assert.ok(model.lanes.stage.some((segment) => segment.stage === "flowering"));
+  const maize = model.lanes.stories.find((story) => story.incidentId === "incident-maize");
+  assert.deepEqual(new Set(maize.milestones.map((item) => item.kind)), new Set([
+    "start", "recovery", "closed",
+  ]));
+  const finalStage = model.lanes.stage.at(-1);
+  assert.ok(Math.abs(finalStage.startX + finalStage.width - 100) < 0.01);
+});
+
+test("V4 incident S2 aggregation bounds the DOM model without losing counts", () => {
+  const start = Date.parse("2020-01-01T00:00:00Z");
+  const attempts = Array.from({ length: 1000 }, (_, index) => {
+    const source = new Date(start + index * 86400000).toISOString().slice(0, 10);
+    const known = new Date(start + (index + 1) * 86400000).toISOString().slice(0, 10);
+    const responses = ["medium_decline", "severe_decline", "recovery", "no_change"];
+    return {
+      field_id: `field-${index}`,
+      crop_instance_id: `crop-${index}`,
+      spectral_source_date: source,
+      knowledge_date: known,
+      marker_type: index % 11 === 0 ? "rejected" : "acquisition",
+      spectral_usable: index % 11 !== 0,
+      response_class: responses[index % responses.length],
+    };
+  });
+  const model = cropStoryTrajectoryModel({
+    as_of_date: "2022-12-31",
+    history: { window_start: "2020-01-01", window_end: "2022-12-31" },
+    s2_attempts: attempts,
+  });
+  assert.equal(model.s2Aggregated, true);
+  assert.ok(model.lanes.s2.length <= 240);
+  assert.ok(model.lanes.s2Holds.length <= 240);
+  assert.equal(model.lanes.s2.reduce((sum, event) => sum + event.count, 0), 1000);
+  assert.ok(model.lanes.s2.every((event) => event.aggregateRange === true));
+  assert.deepEqual(model.ticks.map((tick) => tick.x), [0, 25, 50, 75, 100]);
+});
+
+test("V4 stage and story trajectory visuals stay bounded while retaining endpoints", () => {
+  const start = Date.parse("2020-01-01T00:00:00Z");
+  const checkpoints = Array.from({ length: 1000 }, (_, index) => ({
+    incident_id: `incident-${index % 100}`,
+    crop_name: "maize",
+    hazard_family: "heat",
+    story_week: new Date(start + index * 86400000).toISOString().slice(0, 10),
+    story_known_date: new Date(start + index * 86400000).toISOString().slice(0, 10),
+    incident_state: index % 2 ? "ACTIVE" : "RECOVERING",
+    stage_bucket: index % 3 ? "vegetative" : "flowering",
+  }));
+  const model = cropStoryTrajectoryModel({
+    as_of_date: "2022-12-31",
+    history: { window_start: "2020-01-01", window_end: "2022-12-31" },
+    story_checkpoints: checkpoints,
+  });
+  assert.ok(model.lanes.stories.length <= 64);
+  assert.ok(model.lanes.stage.length <= 120);
+  assert.equal(model.lanes.stage[0].startX, 0);
+  assert.ok(model.lanes.stage.every((segment, index, values) => (
+    index === values.length - 1
+      ? Math.abs(segment.startX + segment.width - 100) < 0.0001
+      : Math.abs(segment.startX + segment.width - values[index + 1].startX) < 0.0001
+  )));
+  assert.ok(Math.abs(model.lanes.stage.reduce(
+    (sum, segment) => sum + segment.width, 0,
+  ) - 100) < 0.0001);
+  assert.ok(model.lanes.stories.reduce(
+    (sum, story) => sum + story.milestones.length, 0,
+  ) <= 256);
+  assert.ok(model.lanes.stories.every((story) => story.blocks.length > 0));
+  assert.equal(model.counts.storySourceLanes, 100);
+  assert.equal(model.counts.storyLanes, 64);
+  assert.equal(model.counts.storyLanesOmitted, 36);
 });
 
 test("history is fetched only for an enabled filtered comparison", () => {
@@ -329,6 +472,25 @@ test("dual-clock V4 mode uses daily labels and audited country representation", 
   assert.equal(overview.pressure.clock, "daily");
   assert.equal(overview.cropImpact.clock, "s2-step-held");
   assert.equal(overview.story.clock, "weekly-knowledge-gated");
+});
+
+test("V4 controls expose hazard filtering, model status, and field cap truth", () => {
+  assert.ok(INCIDENT_FACETS.some(([, key]) => key === "hazard_family"));
+  assert.match(INCIDENT_MODEL_STATUS, /operational crop stories/i);
+  assert.match(INCIDENT_MODEL_STATUS, /motifs are not published/i);
+  const capped = fieldViewportCoverage({
+    features: [{}, {}, {}],
+    meta: { feature_count: 3, source_field_count: 12, truncated: true },
+  });
+  assert.deepEqual(capped, {
+    shown: 3,
+    source: 12,
+    truncated: true,
+    label: "showing 3 of 12 viewport fields · capped",
+  });
+  assert.equal(fieldViewportCoverage({
+    features: [{}, {}], meta: { source_field_count: 2 },
+  }).truncated, false);
 });
 
 test("V3 layer model keeps exact complete footprints primary and hides movement trails", () => {
@@ -493,6 +655,52 @@ test("fallback map source does not reset an unchanged footprint collection", () 
   assert.equal(updates, 1);
 });
 
+test("switching incidents clears the previous onion-skin history immediately", () => {
+  const view = new MapView({});
+  view.selectedIncidentId = "incident-a";
+  view.selectedIncidentHistory = {
+    type: "FeatureCollection", features: [{ properties: { incident_id: "incident-a" } }],
+  };
+  view.selectedIncidentCurrentFootprint = { properties: { incident_id: "incident-a" } };
+  view.setSelectedIncident("incident-b");
+  assert.equal(view.selectedIncidentHistory.features.length, 0);
+  assert.equal(view.selectedIncidentCurrentFootprint, null);
+});
+
+test("Shift-clicking a field keeps the underlying incident selectable at field zoom", () => {
+  const previousDeck = globalThis.deck;
+  globalThis.deck = { GeoJsonLayer: class { constructor(properties) { Object.assign(this, properties); } } };
+  try {
+    const selectedFields = [];
+    const selectedIncidents = [];
+    const incident = {
+      type: "Feature",
+      properties: { incident_id: "incident-a", crop_name: "maize" },
+    };
+    const view = new MapView({
+      incidentMode: true,
+      onSelect(properties) { selectedFields.push(properties.field_id); },
+      onSelectIncident(properties) { selectedIncidents.push(properties.incident_id); },
+    });
+    view.footprints = { type: "FeatureCollection", features: [incident] };
+    view.incidentDeckHitFeatures = () => [incident];
+    const layer = view.fieldDeckLayer("incident-field-drilldown");
+    layer.onClick({
+      object: { properties: { field_id: "field-a" } },
+      srcEvent: { shiftKey: true },
+    });
+    assert.deepEqual(selectedIncidents, ["incident-a"]);
+    assert.deepEqual(selectedFields, []);
+    layer.onClick({
+      object: { properties: { field_id: "field-a" } },
+      srcEvent: { shiftKey: false },
+    });
+    assert.deepEqual(selectedFields, ["field-a"]);
+  } finally {
+    globalThis.deck = previousDeck;
+  }
+});
+
 test("incident story arc is causal and shows stage, pressure, impact, unresolved, and area", () => {
   const arc = incidentStoryArc([
     {
@@ -550,6 +758,12 @@ test("selected incident history uses prior exact polygons only and never implies
   assert.ok(footprintHistoryVisualModel(
     history.collection.features[0].properties,
   ).lineAlpha < 255);
+  const recent = footprintHistoryVisualModel({ age_band: "recent" });
+  const middle = footprintHistoryVisualModel({ age_band: "middle" });
+  const old = footprintHistoryVisualModel({ age_band: "old" });
+  assert.ok(recent.fillAlpha > middle.fillAlpha);
+  assert.ok(middle.fillAlpha > old.fillAlpha);
+  assert.ok(old.fillAlpha > 0);
 });
 
 test("co-located crop incidents remain discoverable in deterministic cycle order", () => {

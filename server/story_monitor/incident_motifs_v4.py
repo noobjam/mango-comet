@@ -21,6 +21,9 @@ import pandas as pd
 FEATURE_SCHEMA_VERSION = "incident-motif-features-v4/1"
 MODEL_SCHEMA_VERSION = "incident-motif-model-v4/1"
 PREFIX_SCHEMA_VERSION = "incident-motif-prefix-v4/1"
+TENTATIVE_ASSIGNMENT_STATES = frozenset(
+    {"tentative_weather_only", "tentative_crop_evidence_supported"}
+)
 
 ELIGIBLE_OPERATIONAL_CLOSURES = frozenset(
     {
@@ -104,6 +107,9 @@ class PrefixCalibrationConfig:
     minimum_calibration_support: int = 10
     radius_quantile: float = 0.95
     margin_quantile: float = 0.05
+    maximum_novel_false_accept_rate: float = 0.05
+    minimum_weather_observed_days: int = 7
+    minimum_s2_acquisitions_for_crop_support: int = 1
 
     def validate(self) -> None:
         if (
@@ -124,6 +130,14 @@ class PrefixCalibrationConfig:
             raise ValueError("prefix support thresholds are invalid")
         if not 0.5 <= self.radius_quantile < 1 or not 0 <= self.margin_quantile <= 0.5:
             raise ValueError("prefix calibration quantiles are invalid")
+        if not 0 <= self.maximum_novel_false_accept_rate < 1:
+            raise ValueError("maximum_novel_false_accept_rate must be in [0, 1)")
+        if self.minimum_weather_observed_days < 1:
+            raise ValueError("minimum_weather_observed_days must be positive")
+        if self.minimum_s2_acquisitions_for_crop_support < 1:
+            raise ValueError(
+                "minimum_s2_acquisitions_for_crop_support must be positive"
+            )
 
 
 @dataclass(frozen=True)
@@ -154,16 +168,24 @@ def build_causal_incident_evidence(
     incident_membership: pd.DataFrame,
     field_daily_pressure: pd.DataFrame,
     field_s2_acquisitions: pd.DataFrame,
+    incident_windows: pd.DataFrame | None = None,
+    incident_lineage: pd.DataFrame | None = None,
 ) -> IncidentDailyEvidence:
     """Join raw V4 field evidence to V3 story ownership without future leakage.
 
-    Ownership is taken from the V3 membership snapshot covering the evidence
-    source week.  A joined row is not available until both that ownership
-    checkpoint and the modality-specific evidence are known.
+    Daily pressure uses the latest ownership already known when that weather
+    row became available.  Ownership carries across missing weekly snapshots,
+    but never beyond a causally known close/split/merge boundary.  Sparse S2
+    remains tied to its acquisition-week ownership.
     """
 
     membership = _prepare_incident_membership(incident_membership)
-    pressure = _join_field_pressure(membership, field_daily_pressure)
+    boundaries = build_incident_ownership_boundaries(
+        incident_windows, incident_lineage, membership=membership
+    )
+    pressure = _join_field_pressure(
+        membership, field_daily_pressure, ownership_boundaries=boundaries
+    )
     s2 = _join_field_s2(membership, field_s2_acquisitions)
     return IncidentDailyEvidence(pressure, s2)
 
@@ -255,6 +277,111 @@ def build_eligibility_ledger(
             "eligibility_reason": reasons,
         }
     ).sort_values("incident_id", kind="mergesort").reset_index(drop=True)
+
+
+def build_live_scoring_ledger(
+    incident_windows: pd.DataFrame,
+    incident_lineage: pd.DataFrame | None,
+    incident_checkpoints: pd.DataFrame,
+    *,
+    as_of: Any,
+) -> pd.DataFrame:
+    """Freeze active incident identity and its causal upper bound at ``as_of``.
+
+    A later source release may already know that an incident eventually closed.
+    Historical scoring still includes it when its latest checkpoint known by the
+    requested cutoff was non-terminal.  Terminal outcomes are never features.
+    """
+
+    cutoff = _timestamp(as_of)
+    windows = incident_windows.copy()
+    checkpoints = incident_checkpoints.copy()
+    _require(
+        windows,
+        ("incident_id", "exposure_id", "crop_name", "hazard_family"),
+        "incident windows",
+    )
+    _require(checkpoints, ("incident_id", "knowledge_time"), "incident checkpoints")
+    if windows["incident_id"].astype(str).duplicated().any():
+        raise ValueError("live scoring requires one window per incident_id")
+    checkpoints["incident_id"] = checkpoints["incident_id"].astype(str)
+    checkpoints["knowledge_time"] = pd.to_datetime(
+        checkpoints["knowledge_time"], errors="coerce", utc=True
+    )
+    if checkpoints["knowledge_time"].isna().any():
+        raise ValueError("incident checkpoints contain invalid knowledge_time")
+    checkpoints = checkpoints[checkpoints["knowledge_time"] <= cutoff].copy()
+    if checkpoints.empty:
+        return _empty_live_ledger()
+    state_name = _first_column(
+        checkpoints, ("current_state", "incident_state", "terminal_state")
+    )
+    if state_name is None:
+        raise ValueError("incident checkpoints require a lifecycle state")
+    checkpoints["_state"] = (
+        checkpoints[state_name].fillna("").astype(str).str.upper()
+    )
+    ordered = checkpoints.sort_values(
+        ["incident_id", "knowledge_time"], kind="mergesort"
+    )
+    latest = ordered.groupby("incident_id", sort=False).tail(1)
+    if latest["_state"].eq("").any():
+        raise ValueError("latest incident checkpoint has a blank lifecycle state")
+    terminal = latest["_state"].str.startswith("CLOSED_") | latest["_state"].eq(
+        "MERGED_INTO"
+    )
+    # CANDIDATE has an incident identifier for deterministic tracking, but it
+    # is explicitly not a confirmed story yet.  Historical scoring must wait
+    # until a confirmation/active checkpoint is itself known at the cutoff.
+    confirmed_live = ~terminal & ~latest["_state"].eq("CANDIDATE")
+    active_ids = set(latest.loc[confirmed_live, "incident_id"])
+    if not active_ids:
+        return _empty_live_ledger()
+    windows["incident_id"] = windows["incident_id"].astype(str)
+    windows = windows[windows["incident_id"].isin(active_ids)].copy()
+    if windows.empty:
+        return _empty_live_ledger()
+    first_known = ordered.groupby("incident_id", sort=False)["knowledge_time"].min()
+    family = _lineage_families(windows, incident_lineage)
+    return pd.DataFrame(
+        {
+            "incident_id": windows["incident_id"],
+            "exposure_id": _nonblank(windows["exposure_id"], "exposure_id"),
+            "crop_name": _dimension(windows["crop_name"]),
+            "hazard_family": _dimension(windows["hazard_family"]),
+            "lineage_family_id": windows["incident_id"].map(family),
+            "purge_group_id": windows["incident_id"].map(family),
+            "first_available_at": windows["incident_id"].map(first_known),
+            "feature_available_at": cutoff,
+            "terminal_state": windows["incident_id"].map(
+                latest.set_index("incident_id")["_state"]
+            ),
+            "right_censored": True,
+            "confirmed": True,
+            "eligible": True,
+            "eligibility_reason": "live_right_censored_as_of",
+        }
+    ).sort_values("incident_id", kind="mergesort").reset_index(drop=True)
+
+
+def _empty_live_ledger() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "incident_id",
+            "exposure_id",
+            "crop_name",
+            "hazard_family",
+            "lineage_family_id",
+            "purge_group_id",
+            "first_available_at",
+            "feature_available_at",
+            "terminal_state",
+            "right_censored",
+            "confirmed",
+            "eligible",
+            "eligibility_reason",
+        ]
+    )
 
 
 def temporal_split_ledger(
@@ -513,7 +640,7 @@ def fit_calibrated_prefix_model(
     _validate_features(prefix_features, prefix=True)
     _require(reviewed_assignments, ("incident_id", "reviewed_motif_id"), "reviewed assignments")
     _require(split_ledger, ("incident_id", "temporal_split"), "split ledger")
-    labels = reviewed_assignments[["incident_id", "reviewed_motif_id"]].dropna().copy()
+    labels = reviewed_assignments[["incident_id", "reviewed_motif_id"]].copy()
     if labels["incident_id"].duplicated().any():
         raise ValueError("reviewed assignments must be unique by incident_id")
     rows = prefix_features.merge(labels, on="incident_id", how="inner", validate="many_to_one")
@@ -526,7 +653,9 @@ def fit_calibrated_prefix_model(
     rows = rows.sort_values("prefix_as_of_time", kind="mergesort").groupby(
         ["incident_id", *maturity], as_index=False, sort=True
     ).tail(1)
-    train = rows[rows["temporal_split"] == "train"].reset_index(drop=True)
+    train = rows[
+        (rows["temporal_split"] == "train") & rows["reviewed_motif_id"].notna()
+    ].reset_index(drop=True)
     calibration = rows[rows["temporal_split"] == "calibration"].reset_index(drop=True)
     if train.empty or calibration.empty:
         raise ValueError("prefix fitting requires nonempty train and calibration cohorts")
@@ -561,15 +690,53 @@ def fit_calibrated_prefix_model(
         mask = np.ones(len(calibration), dtype=bool)
         for name in maturity:
             mask &= calibration[name].astype(str).to_numpy() == str(prototype[name])
-        mask &= calibration["reviewed_motif_id"].astype(str).to_numpy() == str(prototype["reviewed_motif_id"])
-        positions = np.flatnonzero(mask)
-        if len(positions) < config.minimum_calibration_support:
+        positive_mask = mask & calibration["reviewed_motif_id"].notna().to_numpy()
+        positive_mask &= (
+            calibration["reviewed_motif_id"].astype(str).to_numpy()
+            == str(prototype["reviewed_motif_id"])
+        )
+        positive_positions = np.flatnonzero(positive_mask)
+        if len(positive_positions) < config.minimum_calibration_support:
             continue
         center = prototype[vector_columns].to_numpy(float)
-        own = np.linalg.norm(calibration_matrix[positions] - center, axis=1)
+        own = np.linalg.norm(calibration_matrix[positive_positions] - center, axis=1)
+        positive_radius = max(
+            float(np.quantile(own, config.radius_quantile)), 1e-9
+        )
+        novel_positions = np.flatnonzero(
+            mask & calibration["reviewed_motif_id"].isna().to_numpy()
+        )
+        radius = positive_radius
+        novel_radius_cap: float | None = None
+        if len(novel_positions):
+            novel_distances = np.sort(
+                np.linalg.norm(calibration_matrix[novel_positions] - center, axis=1)
+            )
+            allowed = int(
+                math.floor(
+                    config.maximum_novel_false_accept_rate * len(novel_distances)
+                )
+            )
+            if allowed < len(novel_distances):
+                novel_radius_cap = float(
+                    np.nextafter(novel_distances[allowed], -math.inf)
+                )
+                # An expert-labeled novel case at the prototype center makes
+                # this stratum inseparable.  Drop it instead of pretending a
+                # positive epsilon radius satisfies the requested false-accept
+                # ceiling.
+                if novel_radius_cap <= 1e-9:
+                    continue
+                radius = min(radius, novel_radius_cap)
         record = prototype.to_dict()
-        record["radius"] = max(float(np.quantile(own, config.radius_quantile)), 1e-9)
-        record["calibration_support"] = len(positions)
+        record["positive_radius"] = positive_radius
+        record["novel_radius_cap"] = (
+            float(novel_radius_cap) if novel_radius_cap is not None else 0.0
+        )
+        record["radius"] = radius
+        record["calibration_support"] = len(positive_positions)
+        record["novel_calibration_support"] = len(novel_positions)
+        record["radius_constrained_by_novel"] = bool(radius < positive_radius)
         calibrated.append(record)
     prototypes = pd.DataFrame(calibrated)
     if prototypes.empty:
@@ -594,6 +761,58 @@ def fit_calibrated_prefix_model(
         values = margin_values.get(key, [])
         margins.append(max(0.0, float(np.quantile(values, config.margin_quantile))) if values else 0.0)
     prototypes["runner_up_margin"] = margins
+    prototypes["novel_acceptance_score_threshold"] = 0.0
+    prototypes["novel_calibration_final_accept_limit"] = 0
+    prototypes["novel_calibration_final_accept_count"] = 0
+    for key, indexes in prototypes.groupby(list(maturity), sort=True).groups.items():
+        local = prototypes.loc[list(indexes)]
+        calibration_mask = np.ones(len(calibration), dtype=bool)
+        for name, value in zip(maturity, key):
+            calibration_mask &= (
+                calibration[name].astype(str).to_numpy() == str(value)
+            )
+        novel_positions = np.flatnonzero(
+            calibration_mask
+            & calibration["reviewed_motif_id"].isna().to_numpy()
+        )
+        if not len(novel_positions):
+            continue
+        scores: list[float] = []
+        for position in novel_positions:
+            if (
+                int(calibration.iloc[position]["weather_observed_day_count"])
+                < config.minimum_weather_observed_days
+            ):
+                scores.append(-math.inf)
+                continue
+            _, _, _, score = _open_set_candidate_geometry(
+                calibration_matrix[position], local, vector_columns
+            )
+            scores.append(score)
+        allowed = int(
+            math.floor(
+                config.maximum_novel_false_accept_rate * len(novel_positions)
+            )
+        )
+        ordered_scores = np.sort(np.asarray(scores, dtype=float))[::-1]
+        threshold = 0.0
+        if allowed < len(ordered_scores):
+            threshold = max(
+                0.0,
+                float(np.nextafter(ordered_scores[allowed], math.inf)),
+            )
+        accepted_count = int(
+            np.count_nonzero(np.asarray(scores, dtype=float) >= threshold)
+        )
+        if accepted_count > allowed:
+            raise RuntimeError(
+                "joint novel calibration exceeded its stratum false-accept budget"
+            )
+        prototypes.loc[indexes, "novel_acceptance_score_threshold"] = threshold
+        prototypes.loc[indexes, "novel_calibration_final_accept_limit"] = allowed
+        prototypes.loc[indexes, "novel_calibration_final_accept_count"] = (
+            accepted_count
+        )
     prefix_version = "incident-prefix-v4-" + _sha(
         {"model": model_version, "schema": schema, "config": asdict(config), "prototypes": prototypes.to_dict("records")}
     )[:16]
@@ -607,6 +826,9 @@ def fit_calibrated_prefix_model(
         "config": asdict(config),
         "center_fit_split": "train",
         "radius_margin_fit_split": "calibration",
+        "open_set_negative_fit_split": "calibration",
+        "novel_negative_policy": "joint_stratum_final_assignment_false_accept_cap",
+        "assignment_readiness_policy": "minimum_weather_then_explicit_evidence_support",
         "stage_distance_weight": 0.0,
         "prototype_count": len(prototypes),
         "publication_status": "blocked_pending_rolling_evaluation",
@@ -617,12 +839,24 @@ def fit_calibrated_prefix_model(
 def assign_open_set_prefixes(
     prefix_features: pd.DataFrame, model: PrefixMotifModel
 ) -> pd.DataFrame:
-    """Assign every causal prefix as pending, novel_unassigned, or tentative."""
+    """Assign each prefix with explicit readiness and evidence support."""
 
     _validate_features(prefix_features, prefix=True)
     maturity = ("crop_name", "hazard_family", "weather_day_horizon", "s2_acquisition_horizon")
     vectors = _transform(prefix_features, model.feature_schema, allow_missing_strata=True)
     vector_columns = [f"f_{i:03d}" for i in range(len(MODEL_FEATURE_COLUMNS))]
+    model_config = model.manifest.get("config") or {}
+    configured_weather_horizons = tuple(
+        int(value) for value in model_config.get("weather_day_horizons", (7,))
+    )
+    minimum_weather = int(
+        model_config.get(
+            "minimum_weather_observed_days", min(configured_weather_horizons)
+        )
+    )
+    minimum_s2 = int(
+        model_config.get("minimum_s2_acquisitions_for_crop_support", 1)
+    )
     output: list[dict[str, Any]] = []
     for position, row in prefix_features.reset_index(drop=True).iterrows():
         local = _local_prototypes(model.prototypes, row, maturity)
@@ -631,29 +865,109 @@ def assign_open_set_prefixes(
             "prefix_as_of_time": row["prefix_as_of_time"],
             **{name: row[name] for name in maturity},
             "model_version": model.manifest["model_version"],
+            "weather_observed_day_count": int(row["weather_observed_day_count"]),
+            "s2_usable_acquisition_count": int(row["s2_usable_acquisition_count"]),
         }
-        if local.empty or vectors[position] is None:
-            output.append({**base, "assignment_status": "pending", "reviewed_motif_id": None, "candidate_motif_id": None, "distance_ratio": None, "runner_up_separation": None, "assignment_reason": "unsupported_maturity_stratum"})
+        if int(row["weather_observed_day_count"]) < minimum_weather:
+            output.append(
+                {
+                    **base,
+                    "assignment_status": "pending",
+                    "evidence_support": "insufficient_weather",
+                    "is_tentative": False,
+                    "reviewed_motif_id": None,
+                    "candidate_motif_id": None,
+                    "distance_ratio": None,
+                    "runner_up_separation": None,
+                    "assignment_reason": "minimum_weather_readiness_not_met",
+                }
+            )
             continue
+        evidence_support = (
+            "crop_evidence_supported"
+            if int(row["s2_usable_acquisition_count"]) >= minimum_s2
+            else "weather_only"
+        )
+        if local.empty or vectors[position] is None:
+            output.append({**base, "assignment_status": "pending", "evidence_support": evidence_support, "is_tentative": False, "reviewed_motif_id": None, "candidate_motif_id": None, "distance_ratio": None, "runner_up_separation": None, "assignment_reason": "unsupported_maturity_stratum"})
+            continue
+        if "novel_acceptance_score_threshold" not in local:
+            raise ValueError(
+                "prefix model lacks joint stratum novel calibration thresholds"
+            )
         vector = vectors[position]
-        ratios = np.linalg.norm(local[vector_columns].to_numpy(float) - vector, axis=1) / local["radius"].to_numpy(float)
-        order = np.argsort(ratios, kind="stable")
-        best = int(order[0])
-        second = int(order[1]) if len(order) > 1 else None
-        separation = math.inf if second is None else float(ratios[second] - ratios[best])
-        accepted = ratios[best] <= 1.0 and separation >= float(local.iloc[best]["runner_up_margin"])
+        best, distance_ratio, separation, acceptance_score = (
+            _open_set_candidate_geometry(vector, local, vector_columns)
+        )
+        threshold = float(
+            local.iloc[best]["novel_acceptance_score_threshold"]
+        )
+        base_accepted = (
+            distance_ratio <= 1.0
+            and separation >= float(local.iloc[best]["runner_up_margin"])
+        )
+        accepted = base_accepted and acceptance_score >= threshold
+        tentative_status = (
+            "tentative_crop_evidence_supported"
+            if evidence_support == "crop_evidence_supported"
+            else "tentative_weather_only"
+        )
         output.append(
             {
                 **base,
-                "assignment_status": "tentative" if accepted else "novel_unassigned",
+                "assignment_status": tentative_status if accepted else "novel_unassigned",
+                "evidence_support": evidence_support,
+                "is_tentative": bool(accepted),
                 "reviewed_motif_id": local.iloc[best]["reviewed_motif_id"] if accepted else None,
                 "candidate_motif_id": local.iloc[best]["reviewed_motif_id"],
-                "distance_ratio": float(ratios[best]),
+                "distance_ratio": distance_ratio,
                 "runner_up_separation": separation if np.isfinite(separation) else None,
-                "assignment_reason": "within_calibrated_radius_and_margin" if accepted else "outside_radius_or_ambiguous",
+                "assignment_reason": (
+                    "within_calibrated_radius_margin_and_joint_novel_threshold"
+                    if accepted
+                    else (
+                        "below_joint_novel_calibration_threshold"
+                        if base_accepted
+                        else "outside_radius_or_ambiguous"
+                    )
+                ),
             }
         )
     return pd.DataFrame(output)
+
+
+def _open_set_candidate_geometry(
+    vector: np.ndarray,
+    local: pd.DataFrame,
+    vector_columns: Sequence[str],
+) -> tuple[int, float, float, float]:
+    """Return the exact radius/margin geometry used by final assignment."""
+
+    radii = local["radius"].to_numpy(float)
+    if not np.isfinite(radii).all() or (radii <= 0).any():
+        raise ValueError("prefix prototype radii must be finite and positive")
+    ratios = (
+        np.linalg.norm(local[list(vector_columns)].to_numpy(float) - vector, axis=1)
+        / radii
+    )
+    order = np.argsort(ratios, kind="stable")
+    best = int(order[0])
+    second = int(order[1]) if len(order) > 1 else None
+    separation = (
+        math.inf
+        if second is None
+        else float(ratios[second] - ratios[best])
+    )
+    distance_ratio = float(ratios[best])
+    distance_slack = 1.0 - distance_ratio
+    margin_slack = (
+        math.inf
+        if not np.isfinite(separation)
+        else separation - float(local.iloc[best]["runner_up_margin"])
+    )
+    return best, distance_ratio, separation, float(
+        min(distance_slack, margin_slack)
+    )
 
 
 def evaluate_prefix_replay(
@@ -698,14 +1012,14 @@ def evaluate_prefix_replay(
     if replay.empty:
         raise ValueError("rolling replay has no sealed holdout rows")
     final_known = replay["final_assignment_status"].eq("accepted")
-    prefix_accepted = replay["assignment_status"].eq("tentative")
+    prefix_accepted = replay["assignment_status"].isin(TENTATIVE_ASSIGNMENT_STATES)
     correct = prefix_accepted & final_known & (
         replay["reviewed_motif_id_prefix"].astype(str) == replay["reviewed_motif_id_final"].astype(str)
     )
     final_novel = replay["final_assignment_status"].eq("novel_unassigned")
     by_maturity: list[dict[str, Any]] = []
     for key, frame in replay.groupby(["weather_day_horizon", "s2_acquisition_horizon"], sort=True):
-        accepted = frame["assignment_status"].eq("tentative")
+        accepted = frame["assignment_status"].isin(TENTATIVE_ASSIGNMENT_STATES)
         known = frame["final_assignment_status"].eq("accepted")
         matching = accepted & known & (
             frame["reviewed_motif_id_prefix"].astype(str) == frame["reviewed_motif_id_final"].astype(str)
@@ -727,7 +1041,7 @@ def evaluate_prefix_replay(
         replay["prefix_as_of_time"], errors="coerce", utc=True
     ).dt.normalize()
     for origin, frame in replay.groupby("evaluation_origin", sort=True):
-        accepted = frame["assignment_status"].eq("tentative")
+        accepted = frame["assignment_status"].isin(TENTATIVE_ASSIGNMENT_STATES)
         matching = accepted & frame["final_assignment_status"].eq("accepted") & (
             frame["reviewed_motif_id_prefix"].astype(str)
             == frame["reviewed_motif_id_final"].astype(str)
@@ -992,7 +1306,10 @@ def _prepare_incident_membership(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def _join_field_pressure(
-    membership: pd.DataFrame, field_pressure: pd.DataFrame
+    membership: pd.DataFrame,
+    field_pressure: pd.DataFrame,
+    *,
+    ownership_boundaries: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     pressure = field_pressure.copy()
     date_name = _first_column(
@@ -1020,7 +1337,6 @@ def _join_field_pressure(
     )
     if (pressure["pressure_available_at"] < pressure["timeline_date"]).any():
         raise ValueError("field pressure is known before its observation date")
-    pressure["membership_week"] = _week_start(pressure["timeline_date"])
     pressure_key = [
         "field_id",
         "crop_instance_id",
@@ -1034,15 +1350,84 @@ def _join_field_pressure(
     pressure = pressure.drop(columns=["stage_bucket"], errors="ignore")
     joined = pressure.merge(
         membership,
-        on=["membership_week", "field_id", "crop_instance_id", "hazard_family"],
+        on=["field_id", "crop_instance_id", "hazard_family"],
         how="inner",
         validate="many_to_many",
     )
-    if joined.empty:
-        raise ValueError("field pressure did not join to any V3 incident membership")
-    joined["feature_available_at"] = joined[
+    joined = joined[
+        joined["membership_week"] <= joined["timeline_date"]
+    ].copy()
+    joined["_candidate_available_at"] = joined[
         ["pressure_available_at", "membership_available_at"]
     ].max(axis=1)
+    if ownership_boundaries is not None and not ownership_boundaries.empty:
+        joined = joined.merge(
+            ownership_boundaries,
+            on="incident_id",
+            how="left",
+            validate="many_to_one",
+        )
+        after_effective_boundary = (
+            joined["ownership_boundary_effective_at"].notna()
+            & (
+                joined["timeline_date"]
+                >= joined["ownership_boundary_effective_at"]
+            )
+        )
+        boundary_is_known = (
+            joined["ownership_boundary_available_at"].notna()
+            & (
+                joined["_candidate_available_at"]
+                >= joined["ownership_boundary_available_at"]
+            )
+        )
+        joined = joined[~(after_effective_boundary & boundary_is_known)].copy()
+    if joined.empty:
+        raise ValueError("field pressure did not join to any V3 incident membership")
+    # Prefer the latest ownership already known when weather arrived.  For a
+    # story's first week there may be no prior owner; in that case its same-week
+    # membership can claim the row only when that membership itself is known.
+    already_known = joined[
+        joined["membership_available_at"] <= joined["pressure_available_at"]
+    ].sort_values(
+        [*pressure_key, "membership_available_at", "membership_week"],
+        kind="mergesort",
+    )
+    latest_known = already_known.groupby(pressure_key, sort=False).tail(1)
+    known_keys = latest_known[pressure_key]
+    fallback = joined.merge(
+        known_keys.assign(_has_known=True),
+        on=pressure_key,
+        how="left",
+    )
+    fallback = fallback[
+        fallback["_has_known"].isna()
+        & (
+            fallback["membership_week"]
+            == _week_start(fallback["timeline_date"])
+        )
+    ].sort_values(
+        [*pressure_key, "membership_available_at"], kind="mergesort"
+    )
+    earliest_same_week = fallback.groupby(pressure_key, sort=False).head(1)
+    latest = pd.concat(
+        [latest_known, earliest_same_week.drop(columns=["_has_known"])],
+        ignore_index=True,
+    )
+    top_keys = latest[
+        [*pressure_key, "membership_available_at", "membership_week"]
+    ]
+    tied = joined.merge(
+        top_keys,
+        on=[*pressure_key, "membership_available_at", "membership_week"],
+        how="inner",
+    )
+    if (
+        tied.groupby(pressure_key, dropna=False)["incident_id"].nunique() > 1
+    ).any():
+        raise ValueError("daily pressure has ambiguous latest incident ownership")
+    joined = latest.copy()
+    joined["feature_available_at"] = joined["_candidate_available_at"]
     joined["pressure_observed"] = joined["pressure_observed"].fillna(False).astype(bool)
     score_name = _first_column(
         joined,
@@ -1117,6 +1502,175 @@ def _join_field_pressure(
         validate="one_to_one",
     ).rename(columns={"stage_bucket_dominant": "stage_bucket"})
     return summary.sort_values(group_names, kind="mergesort").reset_index(drop=True)
+
+
+def build_incident_ownership_boundaries(
+    incident_windows: pd.DataFrame | None,
+    incident_lineage: pd.DataFrame | None,
+    *,
+    membership: pd.DataFrame | None = None,
+    incident_checkpoints: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Return causally known, half-open ownership boundaries per incident."""
+
+    records: list[dict[str, Any]] = []
+    terminal_checkpoint_known = pd.Series(dtype="datetime64[ns, UTC]")
+    checkpoint_first_known = pd.Series(dtype="datetime64[ns, UTC]")
+    if incident_checkpoints is not None and not incident_checkpoints.empty:
+        checkpoints = incident_checkpoints.copy()
+        known_name = _first_column(
+            checkpoints, ("story_known_time", "knowledge_time")
+        )
+        state_name = _first_column(
+            checkpoints, ("current_state", "incident_state", "terminal_state")
+        )
+        if known_name is None or state_name is None or "incident_id" not in checkpoints:
+            raise ValueError(
+                "ownership checkpoints require incident_id, state, and knowledge time"
+            )
+        checkpoints["incident_id"] = checkpoints["incident_id"].astype(str)
+        checkpoints["_known"] = pd.to_datetime(
+            checkpoints[known_name], errors="coerce", utc=True
+        )
+        if checkpoints["_known"].isna().any():
+            raise ValueError("ownership checkpoints contain invalid knowledge time")
+        checkpoints["_terminal"] = (
+            checkpoints[state_name]
+            .fillna("")
+            .astype(str)
+            .str.upper()
+            .str.startswith("CLOSED_")
+            | checkpoints[state_name]
+            .fillna("")
+            .astype(str)
+            .str.upper()
+            .eq("MERGED_INTO")
+        )
+        terminal_checkpoint_known = checkpoints.loc[
+            checkpoints["_terminal"]
+        ].groupby("incident_id", sort=False)["_known"].min()
+        checkpoint_first_known = checkpoints.groupby("incident_id", sort=False)[
+            "_known"
+        ].min()
+    if incident_windows is not None and not incident_windows.empty:
+        windows = incident_windows.copy()
+        _require(windows, ("incident_id",), "incident windows")
+        state_name = _first_column(windows, ("terminal_state", "final_state"))
+        closed_name = _first_column(windows, ("closed_week", "closed_date"))
+        available_name = _first_column(
+            windows,
+            (
+                "feature_available_at",
+                "closed_knowledge_time",
+                "knowledge_time",
+                "closed_week",
+                "closed_date",
+            ),
+        )
+        right = (
+            windows["right_censored"].fillna(False).astype(bool)
+            if "right_censored" in windows
+            else pd.Series(False, index=windows.index)
+        )
+        state = (
+            windows[state_name].fillna("").astype(str).str.upper()
+            if state_name
+            else pd.Series("", index=windows.index)
+        )
+        terminal = ~right & (state.str.startswith("CLOSED_") | state.eq("MERGED_INTO"))
+        for index in windows.index[terminal]:
+            effective: pd.Timestamp | None = None
+            if closed_name and pd.notna(windows.at[index, closed_name]):
+                effective = _timestamp(windows.at[index, closed_name]).normalize()
+                # V3 close dates are weekly buckets; ownership remains valid for
+                # that observed week and stops at the next week boundary.
+                effective += pd.Timedelta(days=7)
+            elif available_name and pd.notna(windows.at[index, available_name]):
+                # When only a terminal knowledge timestamp is available, keep
+                # its calendar day's evidence and stop at the following day.
+                effective = _timestamp(windows.at[index, available_name]).normalize()
+                effective += pd.Timedelta(days=1)
+            if effective is None:
+                continue
+            incident_id = str(windows.at[index, "incident_id"])
+            available = (
+                _timestamp(terminal_checkpoint_known.loc[incident_id])
+                if incident_id in terminal_checkpoint_known.index
+                else _timestamp(windows.at[index, available_name])
+                if available_name and pd.notna(windows.at[index, available_name])
+                else effective
+            )
+            records.append(
+                {
+                    "incident_id": incident_id,
+                    "ownership_boundary_effective_at": effective,
+                    "ownership_boundary_available_at": available,
+                }
+            )
+    if incident_lineage is not None and not incident_lineage.empty:
+        lineage = incident_lineage.copy()
+        _require(
+            lineage,
+            ("parent_incident_id", "child_incident_id"),
+            "incident lineage",
+        )
+        type_name = _first_column(lineage, ("lineage_type",))
+        effective_name = _first_column(
+            lineage, ("timeline_bucket", "lineage_date", "effective_at")
+        )
+        available_name = _first_column(
+            lineage, ("knowledge_time", "feature_available_at", "known_at")
+        )
+        child_first_known = (
+            membership.groupby("incident_id", sort=False)[
+                "membership_available_at"
+            ].min()
+            if membership is not None and not membership.empty
+            else pd.Series(dtype="datetime64[ns, UTC]")
+        )
+        for row in lineage.to_dict("records"):
+            lineage_type = str(row.get(type_name, "")).lower() if type_name else ""
+            if lineage_type and lineage_type not in {"split", "merge"}:
+                continue
+            # A split can leave the parent alive for retained fields.  Its
+            # boundary is therefore field-level and is enforced by the newer
+            # child membership winning the causal ownership join.  Only a
+            # merge terminates the complete parent incident here.
+            if lineage_type == "split":
+                continue
+            if effective_name is None or pd.isna(row.get(effective_name)):
+                continue
+            effective = _timestamp(row[effective_name])
+            child = str(row["child_incident_id"])
+            if available_name and pd.notna(row.get(available_name)):
+                available = _timestamp(row[available_name])
+            elif child in child_first_known.index:
+                available = _timestamp(child_first_known.loc[child])
+            elif child in checkpoint_first_known.index:
+                available = _timestamp(checkpoint_first_known.loc[child])
+            else:
+                available = effective
+            records.append(
+                {
+                    "incident_id": str(row["parent_incident_id"]),
+                    "ownership_boundary_effective_at": effective,
+                    "ownership_boundary_available_at": max(effective, available),
+                }
+            )
+    if not records:
+        return pd.DataFrame(
+            columns=[
+                "incident_id",
+                "ownership_boundary_effective_at",
+                "ownership_boundary_available_at",
+            ]
+        )
+    boundaries = pd.DataFrame(records).sort_values(
+        ["incident_id", "ownership_boundary_effective_at"], kind="mergesort"
+    )
+    return boundaries.drop_duplicates("incident_id", keep="first").reset_index(
+        drop=True
+    )
 
 
 def _join_field_s2(
@@ -1603,11 +2157,14 @@ __all__ = [
     "MotifDiscoveryConfig",
     "PrefixCalibrationConfig",
     "PrefixMotifModel",
+    "TENTATIVE_ASSIGNMENT_STATES",
     "assign_open_set_prefixes",
     "build_causal_incident_evidence",
     "build_causal_prefix_features",
     "build_completed_story_features",
     "build_eligibility_ledger",
+    "build_incident_ownership_boundaries",
+    "build_live_scoring_ledger",
     "build_review_overlay_template",
     "discover_completed_motifs",
     "evaluate_prefix_replay",

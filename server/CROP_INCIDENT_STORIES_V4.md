@@ -86,6 +86,16 @@ required field/crop/hazard evidence. Reconstructed releases may raise the bound
 but remain explicitly diagnostic and retain the source and component timestamps
 for audit.
 
+Viewer schema `crop-incident-viewer-v4/2` adds a required
+`lifecycle_reconciliation_v4.parquet` ledger. For every displayed checkpoint it
+reconciles the V3 membership counts and every positive pressure, decline, and
+recovery claim against evidence known by that checkpoint. Any contradiction
+blocks the bundle atomically. This is deliberately narrower than replaying the
+V3 lifecycle: V4 does **not** recompute lifecycle state, infer component
+absence, or claim that V4 alone owns story start/end. The correct presentation
+claim is “knowledge-gated V3 lifecycle with fail-closed V4 positive-evidence
+reconciliation.” Older V4/1 bundles are rejected and must be rebuilt.
+
 ## Authoritative V4 evidence ledgers
 
 V4 evidence is published as a separate immutable directory. It never mutates
@@ -167,15 +177,30 @@ tracking and cannot change the operational story graph.
    each as-of.
 6. Compare a live prefix only with prototypes having compatible daily-weather
    maturity and distinct usable-S2-acquisition maturity.
+7. Constrain the **combined** nearest-prototype assignment rule with reviewed
+   novel calibration incidents, so the whole crop/hazard/maturity stratum—not
+   each prototype independently—respects the configured false-accept ceiling.
 
-Live outputs are only `pending`, `novel_unassigned`, or `tentative`. Stage,
-district, and season are audit/facet dimensions by default and have zero core
-trajectory-distance weight. Discovered labels remain unreviewed until an
-immutable review overlay approves, merges, or rejects them.
+`score-live` writes one immutable as-of delta for confirmed, non-terminal
+incidents only. `CANDIDATE` checkpoints are not eligible. Daily weather after a
+weekly checkpoint is assigned to the latest causally known ownership whose
+effective week is not later than the weather day; close/merge boundaries stop
+carry and split fields transition only when their child membership is known.
+Sentinel-2 remains acquisition-week owned.
+
+Live outputs are explicitly `pending`, `novel_unassigned`,
+`tentative_weather_only`, or `tentative_crop_evidence_supported`. They are
+hash-bound to the incident, evidence, viewer, and frozen prefix-model releases,
+remain `map_publication_supported=false`, and cannot create, merge, split,
+close, or rename a story. Stage, district, and season are audit/facet
+dimensions by default and have zero core trajectory-distance weight.
+Discovered labels remain unreviewed until an immutable review overlay approves,
+merges, or rejects them.
 
 ## Map contract
 
-The V4 viewer uses one daily playhead and three visually separate layers:
+The V4 viewer uses one daily playhead and linked map/detail views. The map has
+three visually separate evidence layers:
 
 - daily pressure footprint;
 - acquisition-to-acquisition crop evidence, step-held and visibly aging;
@@ -185,6 +210,22 @@ Pressure, crop-impact, and full story geometries never substitute for one
 another. Selected histories use exact footprint outlines with age fading; no
 centroid arrows, interpolated hulls, smooth morphs, or implied propagation are
 allowed.
+
+The field and selected-incident inspectors use one aligned linear-time
+trajectory with:
+
+- one non-overlapping lane per hazard, distinguishing missing, partial,
+  observed-low, and elevated pressure;
+- Sentinel-2 source and knowledge markers, rejected attempts, response class,
+  and step-held fresh/aging/stale state using the bundle's freshness policy;
+- a continuous known crop-stage band;
+- one row per incident, with prelude, lifecycle blocks, and explicit
+  start/recovery/pressure-off/close milestones.
+
+Long histories are deterministically bounded for rendering while API
+truncation is disclosed. Aggregated Sentinel-2 markers do not draw a fictitious
+source-to-known connector. At field zoom, normal click selects a field and
+Shift-click selects/cycles the incident footprint beneath it.
 
 Every mappable field contributes at country scale through a complete
 precomputed aggregate/density representation. Middle zoom may use centroids;

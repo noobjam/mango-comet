@@ -16,10 +16,15 @@ from story_monitor.incident_motif_workflow_v4 import (
     evaluate_prefix_release_v4,
     fit_reviewed_prefix_release_v4,
     materialize_causal_incident_evidence_v4,
+    score_live_prefix_release_v4,
 )
 from story_monitor.incident_motifs_v4 import (
     MotifDiscoveryConfig,
     PrefixCalibrationConfig,
+)
+from story_monitor.incident_viewer_v4 import (
+    LIFECYCLE_RECONCILIATION_SCHEMA_VERSION,
+    SCHEMA_VERSION as VIEWER_SCHEMA_VERSION,
 )
 
 
@@ -215,6 +220,7 @@ def _fixture(root: Path) -> tuple[Path, Path, Path, Path]:
     viewer_dir = root / "viewer-v4"
     viewer_dir.mkdir()
     checkpoints = pd.DataFrame(weekly).copy()
+    checkpoints["story_week"] = pd.to_datetime(checkpoints["knowledge_time"])
     checkpoints["source_checkpoint_knowledge_time"] = checkpoints["knowledge_time"]
     checkpoints["story_known_time"] = checkpoints[
         "source_checkpoint_knowledge_time"
@@ -230,14 +236,41 @@ def _fixture(root: Path) -> tuple[Path, Path, Path, Path]:
     checkpoints["knowledge_bound_complete"] = True
     checkpoint_path = viewer_dir / "story_checkpoints_v4.parquet"
     checkpoints.to_parquet(checkpoint_path, index=False)
+    lifecycle_path = viewer_dir / "lifecycle_reconciliation_v4.parquet"
+    pd.DataFrame(
+        {
+            "schema_version": LIFECYCLE_RECONCILIATION_SCHEMA_VERSION,
+            "incident_id": checkpoints["incident_id"].astype(str),
+            "story_week": checkpoints["story_week"],
+            "contradiction_count": 0,
+            "positive_claim_reconciliation_complete": True,
+            "source_state_preserved": True,
+            "lifecycle_state_recomputed": False,
+            "component_absence_replayed": False,
+            "full_lifecycle_replay_supported": False,
+            "lifecycle_causal_claim_supported": False,
+        }
+    ).to_parquet(lifecycle_path, index=False)
     checkpoint_artifact = {
         "sha256": _sha256(checkpoint_path),
         "size_bytes": checkpoint_path.stat().st_size,
         "row_count": len(checkpoints),
     }
+    lifecycle_artifact = {
+        "sha256": _sha256(lifecycle_path),
+        "size_bytes": lifecycle_path.stat().st_size,
+        "row_count": len(checkpoints),
+    }
+    viewer_artifacts = {
+        checkpoint_path.name: checkpoint_artifact,
+        lifecycle_path.name: lifecycle_artifact,
+    }
     content_hash = hashlib.sha256(
         json.dumps(
-            {checkpoint_path.name: checkpoint_artifact["sha256"]},
+            {
+                name: artifact["sha256"]
+                for name, artifact in viewer_artifacts.items()
+            },
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -245,7 +278,7 @@ def _fixture(root: Path) -> tuple[Path, Path, Path, Path]:
     (viewer_dir / "manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": "crop-incident-viewer-v4/1",
+                "schema_version": VIEWER_SCHEMA_VERSION,
                 "mode": "crop_incident_v4_dual_clock",
                 "run": {
                     "status": "complete",
@@ -261,8 +294,19 @@ def _fixture(root: Path) -> tuple[Path, Path, Path, Path]:
                     ),
                     "bundle_content_sha256": content_hash,
                 },
-                "outputs": {"story_checkpoints": checkpoint_path.name},
-                "artifacts": {checkpoint_path.name: checkpoint_artifact},
+                "semantics": {
+                    "lifecycle_reconciliation_schema_version": (
+                        LIFECYCLE_RECONCILIATION_SCHEMA_VERSION
+                    ),
+                    "lifecycle_state_recomputed_from_v4": False,
+                    "lifecycle_causal_ownership_claimed": False,
+                    "component_absence_replayed_from_v4": False,
+                },
+                "outputs": {
+                    "story_checkpoints": checkpoint_path.name,
+                    "lifecycle_reconciliation": lifecycle_path.name,
+                },
+                "artifacts": viewer_artifacts,
             }
         ),
         encoding="utf-8",
@@ -285,6 +329,182 @@ def _refresh_viewer_manifest_bindings(
 
 
 class IncidentMotifWorkflowV4Tests(unittest.TestCase):
+    def test_path_adapter_carries_monday_weather_then_stops_after_close(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            membership_path = root / "membership.parquet"
+            pressure_path = root / "pressure.parquet"
+            s2_path = root / "s2.parquet"
+            windows_path = root / "windows.parquet"
+            lineage_path = root / "lineage.parquet"
+            checkpoints_path = root / "checkpoints.parquet"
+            pd.DataFrame(
+                [
+                    {
+                        "incident_id": "parent",
+                        "field_id": "field-1",
+                        "crop_instance_id": "crop-1",
+                        "hazard_family": "heat",
+                        "timeline_bucket": "2025-01-06",
+                        "knowledge_time": "2025-01-10",
+                        "membership_role": "impact_lag",
+                    }
+                ]
+            ).to_parquet(membership_path, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "field_id": "field-1",
+                        "crop_instance_id": "crop-1",
+                        "hazard_family": "heat",
+                        "observation_date": day,
+                        "knowledge_time": day,
+                        "pressure_observed": True,
+                        "weather_intensity": 1.0,
+                        "pressure_rank": 3,
+                    }
+                    for day in ("2025-01-13", "2025-01-20")
+                ]
+            ).to_parquet(pressure_path, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "field_id": "field-1",
+                        "crop_instance_id": "crop-1",
+                        "acquisition_id": "s2-1",
+                        "spectral_source_date": "2025-01-06",
+                        "knowledge_time": "2025-01-10",
+                        "acquisition_attempted": False,
+                        "spectral_usable": False,
+                    }
+                ]
+            ).to_parquet(s2_path, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "incident_id": "parent",
+                        "terminal_state": "CLOSED_RECOVERED",
+                        "right_censored": False,
+                        "closed_week": "2025-01-13",
+                        "feature_available_at": "2025-01-17",
+                    }
+                ]
+            ).to_parquet(windows_path, index=False)
+            pd.DataFrame(
+                columns=["parent_incident_id", "child_incident_id", "lineage_type"]
+            ).to_parquet(lineage_path, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "incident_id": "parent",
+                        "story_known_time": "2025-01-10",
+                        "current_state": "ACTIVE",
+                    },
+                    {
+                        "incident_id": "parent",
+                        "story_known_time": "2025-01-17",
+                        "current_state": "CLOSED_RECOVERED",
+                    },
+                ]
+            ).to_parquet(checkpoints_path, index=False)
+            daily_output = root / "joined-daily.parquet"
+            s2_output = root / "joined-s2.parquet"
+            materialize_causal_incident_evidence_v4(
+                membership_path,
+                pressure_path,
+                s2_path,
+                daily_output,
+                s2_output,
+                incident_windows_path=windows_path,
+                incident_lineage_path=lineage_path,
+                incident_checkpoints_path=checkpoints_path,
+                threads=1,
+                memory_limit="256MB",
+            )
+            joined = pd.read_parquet(daily_output)
+            self.assertEqual(
+                list(pd.to_datetime(joined["timeline_date"], utc=True)),
+                [pd.Timestamp("2025-01-13T00:00:00Z")],
+            )
+
+    def test_path_adapter_filters_effective_week_before_late_weather_asof(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            membership_path = root / "membership.parquet"
+            pressure_path = root / "pressure.parquet"
+            s2_path = root / "s2.parquet"
+            pd.DataFrame(
+                [
+                    {
+                        "incident_id": "parent",
+                        "field_id": "field-1",
+                        "crop_instance_id": "crop-1",
+                        "hazard_family": "heat",
+                        "timeline_bucket": "2025-01-06",
+                        "knowledge_time": "2025-01-10",
+                        "membership_role": "impact_lag",
+                    },
+                    {
+                        "incident_id": "child",
+                        "field_id": "field-1",
+                        "crop_instance_id": "crop-1",
+                        "hazard_family": "heat",
+                        "timeline_bucket": "2025-01-20",
+                        "knowledge_time": "2025-01-20",
+                        "membership_role": "impact_lag",
+                    },
+                ]
+            ).to_parquet(membership_path, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "field_id": "field-1",
+                        "crop_instance_id": "crop-1",
+                        "hazard_family": "heat",
+                        "observation_date": "2025-01-15",
+                        # This row arrived after the future-effective child
+                        # membership was already known.  The Jan-15 observation
+                        # still belongs to the latest eligible Jan-06 owner.
+                        "knowledge_time": "2025-02-01",
+                        "pressure_observed": True,
+                        "weather_intensity": 1.0,
+                        "pressure_rank": 3,
+                    }
+                ]
+            ).to_parquet(pressure_path, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "field_id": "field-1",
+                        "crop_instance_id": "crop-1",
+                        "acquisition_id": "s2-1",
+                        "spectral_source_date": "2025-01-06",
+                        "knowledge_time": "2025-01-10",
+                        "acquisition_attempted": False,
+                        "spectral_usable": False,
+                    }
+                ]
+            ).to_parquet(s2_path, index=False)
+
+            daily_output = root / "joined-daily.parquet"
+            s2_output = root / "joined-s2.parquet"
+            materialize_causal_incident_evidence_v4(
+                membership_path,
+                pressure_path,
+                s2_path,
+                daily_output,
+                s2_output,
+                threads=1,
+                memory_limit="256MB",
+            )
+
+            joined = pd.read_parquet(daily_output)
+            self.assertEqual(list(joined["incident_id"]), ["parent"])
+            self.assertEqual(
+                list(pd.to_datetime(joined["timeline_date"], utc=True)),
+                [pd.Timestamp("2025-01-15T00:00:00Z")],
+            )
+
     def test_calibration_dispositions_include_explicit_novel_incidents(self) -> None:
         review_hash = "a" * 64
         split = pd.DataFrame(
@@ -439,6 +659,7 @@ class IncidentMotifWorkflowV4Tests(unittest.TestCase):
                 s2_acquisition_horizons=(0,),
                 minimum_training_support=2,
                 minimum_calibration_support=1,
+                minimum_weather_observed_days=2,
             )
             discovery_dir = root / "motif-discovery"
             with self.assertRaises(ValueError):
@@ -622,6 +843,101 @@ class IncidentMotifWorkflowV4Tests(unittest.TestCase):
             prefix_manifest = json.loads(
                 prefix_manifest_path.read_text(encoding="utf-8")
             )
+            live_before = root / "live-score-before"
+            live_result = score_live_prefix_release_v4(
+                incident_dir,
+                daily_path.parent,
+                viewer_dir,
+                prefix_dir,
+                live_before,
+                as_of="2025-01-08T23:00:00Z",
+                threads=1,
+                memory_limit="256MB",
+            )
+            self.assertEqual(live_result["active_incident_count"], 1)
+            live_assignments = pd.read_parquet(
+                live_before / "live_prefix_assignments.parquet"
+            )
+            self.assertEqual(set(live_assignments["incident_id"]), {"train-1"})
+            self.assertEqual(
+                set(live_assignments["prefix_manifest_sha256"]),
+                {_sha256(prefix_manifest_path)},
+            )
+            self.assertTrue(
+                {
+                    "incident_manifest_sha256",
+                    "evidence_manifest_sha256",
+                    "viewer_manifest_sha256",
+                    "source_generation_id",
+                }
+                <= set(live_assignments.columns)
+            )
+            live_manifest = json.loads(
+                (live_before / "live_score_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                live_manifest["append_contract"]["mode"],
+                "immutable_as_of_delta",
+            )
+            before_release_hash = _sha256(live_before / "live_score_manifest.json")
+            with self.assertRaises(FileExistsError):
+                score_live_prefix_release_v4(
+                    incident_dir,
+                    daily_path.parent,
+                    viewer_dir,
+                    prefix_dir,
+                    live_before,
+                    as_of="2025-01-08T23:00:00Z",
+                )
+
+            # A later source release may contain arbitrarily different future
+            # evidence.  The already-published as-of delta remains immutable,
+            # and rescoring the same cutoff produces identical causal features.
+            future_pressure = pd.read_parquet(daily_path)
+            future_mask = (
+                future_pressure["field_id"].eq("field-train-1")
+                & pd.to_datetime(future_pressure["observation_date"], utc=True).eq(
+                    pd.Timestamp("2025-01-09T00:00:00Z")
+                )
+            )
+            self.assertTrue(future_mask.any())
+            future_pressure.loc[future_mask, "weather_intensity"] = 999.0
+            future_pressure.to_parquet(daily_path, index=False)
+            evidence_manifest_path = daily_path.parent / "manifest.json"
+            changed_evidence_manifest = json.loads(
+                evidence_manifest_path.read_text(encoding="utf-8")
+            )
+            changed_evidence_manifest["artifacts"]["pressure"].update(
+                sha256=_sha256(daily_path),
+                size_bytes=daily_path.stat().st_size,
+                row_count=len(future_pressure),
+            )
+            evidence_manifest_path.write_text(
+                json.dumps(changed_evidence_manifest), encoding="utf-8"
+            )
+            _refresh_viewer_manifest_bindings(
+                viewer_dir, incident_dir, daily_path.parent
+            )
+            live_after = root / "live-score-after"
+            score_live_prefix_release_v4(
+                incident_dir,
+                daily_path.parent,
+                viewer_dir,
+                prefix_dir,
+                live_after,
+                as_of="2025-01-08T23:00:00Z",
+                threads=1,
+                memory_limit="256MB",
+            )
+            pd.testing.assert_frame_equal(
+                pd.read_parquet(live_before / "live_prefix_features.parquet"),
+                pd.read_parquet(live_after / "live_prefix_features.parquet"),
+            )
+            self.assertEqual(
+                _sha256(live_before / "live_score_manifest.json"),
+                before_release_hash,
+            )
+
             final_labels_path = root / "sealed-holdout-labels.parquet"
             pd.DataFrame(
                 [
@@ -663,11 +979,13 @@ class IncidentMotifWorkflowV4Tests(unittest.TestCase):
                 evaluation_dir / "prefix_replay_assignments.parquet"
             )
             holdout = assignments[assignments["incident_id"].eq("hold-1")]
-            self.assertNotIn("pending", set(holdout["assignment_status"]))
-            self.assertIn("tentative", set(holdout["assignment_status"]))
+            self.assertIn("pending", set(holdout["assignment_status"]))
+            self.assertIn(
+                "tentative_crop_evidence_supported", set(holdout["assignment_status"])
+            )
             self.assertEqual(
                 holdout.sort_values("prefix_as_of_time").iloc[-1]["assignment_status"],
-                "tentative",
+                "tentative_crop_evidence_supported",
                 holdout.to_string(index=False),
             )
 

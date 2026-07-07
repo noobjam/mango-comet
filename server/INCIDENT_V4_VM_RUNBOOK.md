@@ -168,7 +168,20 @@ printf 'ENRICHED_SOURCE=%s\nEVIDENCE_DIR=%s\nVIEWER_DIR=%s\n' \
   "$ENRICHED_SOURCE" "$EVIDENCE_DIR" "$VIEWER_DIR"
 PYTHONPATH=server "$PYTHON" -c \
   'import json,os; from pathlib import Path; from story_monitor.incident_viewer_v4 import validate_viewer_directory; print(json.dumps(validate_viewer_directory(Path(os.environ["VIEWER_DIR"])),indent=2))'
+
+"$PYTHON" -c '
+import json, os
+manifest = json.load(open(os.path.join(os.environ["VIEWER_DIR"], "manifest.json")))
+assert manifest["schema_version"] == "crop-incident-viewer-v4/2", manifest["schema_version"]
+assert manifest["semantics"]["lifecycle_state_recomputed_from_v4"] is False
+assert manifest["semantics"]["lifecycle_causal_ownership_claimed"] is False
+print("Fresh V4/2 viewer and bounded reconciliation semantics confirmed")
+'
 ```
+
+Do not reuse a V4/1 viewer directory. V4/2 requires the immutable lifecycle
+reconciliation artifact and the server rejects a missing, altered, or
+contradictory ledger.
 
 Audit the three clocks and simultaneous hazard lanes:
 
@@ -205,6 +218,15 @@ print(con.execute("""
            AS late_known_observations
   FROM read_parquet(?)
 """, [f"{v}/pressure_observations_v4.parquet"]).fetchdf().to_string(index=False))
+print(con.execute("""
+  SELECT reconciliation_status, quiet_evidence_status,
+         COUNT(*) AS checkpoints, SUM(contradiction_count) AS contradictions
+  FROM read_parquet(?) GROUP BY 1,2 ORDER BY 1,2
+""", [f"{v}/lifecycle_reconciliation_v4.parquet"]).fetchdf().to_string(index=False))
+assert con.execute(
+  "SELECT COUNT(*) FROM read_parquet(?) WHERE contradiction_count > 0",
+  [f"{v}/lifecycle_reconciliation_v4.parquet"],
+).fetchone()[0] == 0
 '
 ```
 
@@ -322,7 +344,11 @@ Visual acceptance:
 - rejected acquisitions are visible as rejected markers;
 - crop name and stage are visible, and stage changes do not create a new story;
 - a story appears only after its weekly checkpoint is known;
-- selected history is made of exact age-faded footprint outlines, with no
+- the selected trajectory has separate hazard lanes, explicit missing versus
+  observed-low pressure, S2 source-to-known clocks, freshness aging, a crop
+  stage band, and one row per story;
+- history truncation/capping is visible instead of looking complete;
+- selected history is made of exact age-faded footprint polygons/outlines, with no
   arrow, centroid motion, interpolation, or propagation claim;
 - terminal stories leave the overview after the documented 28-day review
   window, so frame payloads do not grow forever.
@@ -496,6 +522,43 @@ export EVALUATION_DIR="$ROOT/evaluations/incident_motif_v4_$MOTIF_TAG"
 `evaluate` exits with code `21` when any hard replay gate fails, while retaining
 the immutable diagnostic report for inspection. Do not treat a failed-gate
 directory as a successful model release.
+
+After a reviewed prefix model passes the engineering gates, score one immutable
+diagnostic delta for a requested as-of. The command excludes unconfirmed
+`CANDIDATE` and terminal incidents, uses daily post-checkpoint weather only
+while causal incident ownership remains valid, and never publishes motifs to
+the map:
+
+```bash
+export AS_OF=2026-05-17
+export LIVE_TAG=$(date -u +%Y%m%dT%H%M%SZ)
+export LIVE_DIR="$ROOT/live_scores/score_${AS_OF}_${LIVE_TAG}"
+export LIVE_JSON="$ROOT/logs/incident_motif_v4_live_${LIVE_TAG}.json"
+export LIVE_LOG="$ROOT/logs/incident_motif_v4_live_${LIVE_TAG}.log"
+
+nohup env PYTHONUNBUFFERED=1 \
+  "$PYTHON" server/run_incident_motifs_v4.py score-live \
+  --incident-dir "$INCIDENT_DIR" \
+  --evidence-dir "$EVIDENCE_DIR" \
+  --viewer-dir "$VIEWER_DIR" \
+  --prefix-model-dir "$PREFIX_DIR" \
+  --output-dir "$LIVE_DIR" \
+  --as-of "$AS_OF" \
+  --threads 32 \
+  --memory-limit 96GB \
+  --temp-dir "$ROOT/duckdb_tmp" \
+  --heartbeat-seconds 30 \
+  >"$LIVE_JSON" 2>"$LIVE_LOG" </dev/null &
+echo "$!" | tee "$ROOT/logs/incident_motif_v4_live_${LIVE_TAG}.pid"
+tail -f "$LIVE_LOG"
+```
+
+Every run needs a fresh output directory. Inspect
+`live_score_manifest.json`, `live_incident_ledger.parquet`, and
+`live_prefix_assignments.parquet`; accepted rows remain tentative and
+`map_publication_supported` must remain `false`. A release with no eligible
+active confirmed incident fails explicitly instead of writing a misleading
+empty delta.
 
 Use one H100 for discovery; the strata are independent offline work, but eight
 GPUs do not make the HTTP timeline or browser faster. CPU and GPU HDBSCAN are

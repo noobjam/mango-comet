@@ -12,6 +12,7 @@ import { incidentSelectionTransition } from "./incident-story.js";
 import {
   adjacentBuckets,
   assertCompleteFootprintCollection,
+  fieldViewportCoverage,
   footprintLegendEntries,
   incidentDetailModel,
   isCropIncident,
@@ -70,14 +71,16 @@ boot().catch((error) => fail(error, "The story explorer could not start"));
 
 async function boot() {
   setStatus("Loading story evidence", "loading");
-  const [config, manifest, motifData] = await Promise.all([
+  const [config, manifest] = await Promise.all([
     api.get("/api/config", { channel: "boot-config", cache: true }),
     api.get("/api/manifest", { channel: "boot-manifest", cache: true }),
-    api.get("/api/motifs?limit=500", { channel: "motifs" }),
   ]);
   state.manifest = manifest;
   state.v4Mode = isCropIncidentV4(manifest);
   state.incidentMode = isCropIncident(manifest);
+  const motifData = state.incidentMode
+    ? { motifs: [], exact_stories: [], facets: {}, taxonomy: { source: "operational_incidents" } }
+    : await api.get("/api/motifs?limit=500", { channel: "motifs" });
   const timelineData = await api.get(
     state.v4Mode ? "/api/v4/timeline" : "/api/timeline",
     { channel: "boot-timeline", cache: true },
@@ -376,19 +379,24 @@ async function loadV4Frame({ force = false } = {}) {
     const s2 = Number(payload.timeline?.new_s2_field_count || 0);
     const rejected = Number(payload.timeline?.rejected_s2_attempt_count || 0);
     const stories = Number(payload.story_footprints?.features?.length || 0);
+    const fieldCoverage = fieldViewportCoverage(payload.fields || EMPTY_FRAME);
     state.timeline.commit(
       requestedIndex,
       `${represented.toLocaleString()} mapped fields`
         + `${unmappable ? ` · ${unmappable.toLocaleString()} unmappable` : ""} · `
         + `${pressure.toLocaleString()} elevated pressure · ${s2.toLocaleString()} S2 updates`
         + `${rejected ? ` · ${rejected.toLocaleString()} rejected` : ""}`
-        + ` · ${stories.toLocaleString()} known stories`,
+        + ` · ${stories.toLocaleString()} known stories`
+        + `${wantsFields ? ` · ${fieldCoverage.label}` : ""}`,
     );
     refreshSelectedIncidentContext();
     if (state.selectedIncidentId) refreshV4IncidentDetail(day);
+    const warning = !overview.complete || (wantsFields && fieldCoverage.truncated);
     setStatus(
-      overview.complete ? "Map is current" : "Map coverage is incomplete for this day",
-      overview.complete ? "ready" : "warning",
+      fieldCoverage.truncated && wantsFields
+        ? `Field viewport capped at ${fieldCoverage.shown.toLocaleString()} of ${fieldCoverage.source.toLocaleString()}`
+        : overview.complete ? "Map is current" : "Map coverage is incomplete for this day",
+      warning ? "warning" : "ready",
     );
     prefetchV4Adjacent(filters, bbox, wantsFields);
   } catch (error) {
@@ -438,7 +446,7 @@ async function refreshV4IncidentDetail(day) {
       { channel: "incident-detail", cache: true },
     );
     if (generation !== state.selectionGeneration || incidentId !== state.selectedIncidentId) return;
-    state.selectedIncidentDetail = payload;
+    state.selectedIncidentDetail = withV4DisplayPolicy(payload);
     state.selectedIncidentContext = null;
     refreshSelectedIncidentContext();
   } catch (error) {
@@ -493,7 +501,7 @@ async function selectIncident(properties) {
       cache: true,
     });
     if (selectionGeneration !== state.selectionGeneration) return;
-    state.selectedIncidentDetail = payload;
+    state.selectedIncidentDetail = state.v4Mode ? withV4DisplayPolicy(payload) : payload;
     refreshSelectedIncidentContext();
   } catch (error) {
     if (!isAbortError(error)) inspector.showIncidentError(properties, error);
@@ -595,10 +603,18 @@ async function selectV4Field(properties) {
       selectionGeneration !== state.selectionGeneration
       || selectionBucket !== state.selectionBucket
     ) return;
-    inspector.showV4Field(properties, payload);
+    inspector.showV4Field(properties, withV4DisplayPolicy(payload));
   } catch (error) {
     if (!isAbortError(error)) inspector.showV4FieldError(properties, error);
   }
+}
+
+function withV4DisplayPolicy(payload = {}) {
+  return {
+    ...payload,
+    freshness_policy: payload.freshness_policy
+      || state.manifest?.freshness_policy || {},
+  };
 }
 
 async function refreshEvolution(filters, filterGeneration) {
@@ -742,7 +758,7 @@ function configureModeUi() {
     ui.timelineTitle.textContent = "Selected day";
     ui.previousBucket.setAttribute("aria-label", "Previous day");
     ui.nextBucket.setAttribute("aria-label", "Next day");
-    ui.mapHelp.textContent = "Every mappable field contributes to the country grid. Daily pressure, step-held S2 crop evidence, and knowledge-gated weekly stories are separate layers. Exact fields appear on zoom; select one for the three-clock evidence ribbon. No footprint implies physical movement.";
+    ui.mapHelp.textContent = "Every mappable field contributes to the country grid. Daily pressure, step-held S2 crop evidence, and knowledge-gated weekly stories are separate layers. Exact fields appear on zoom; select one for the three-clock evidence ribbon, or Shift-click to select and cycle its story footprint. No footprint implies physical movement.";
     ui.incidentLegendNote.textContent = "Colored pressure bands update daily. Magenta/green crop-impact cells change only with usable S2 acquisitions and visibly age. Story outlines update only when a weekly checkpoint is known. The muted country grid represents mapped monitored fields and reports any coverage gap.";
   } else {
     ui.mapHelp.textContent = "Exact complete crop-incident footprints are the primary overview. Fields appear after zooming in for evidence drilldown. Footprint evolution, not physical movement.";

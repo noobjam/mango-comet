@@ -350,68 +350,212 @@ button:disabled { cursor: wait; opacity: 0.58; }
 .muted { color: var(--muted); }
 
 .lifecycle-ribbon { display: grid; gap: 4px; padding: 8px; border: 1px solid var(--line); border-radius: 9px; background: rgba(5, 15, 12, 0.46); }
-.field-evidence-ribbon {
+.crop-story-trajectory {
   display: grid;
   gap: 7px;
   padding: 9px;
   overflow: hidden;
-  border: 1px solid rgba(115, 226, 180, 0.25);
+  border: 1px solid rgba(115, 226, 180, 0.28);
   border-radius: 10px;
-  background: linear-gradient(180deg, rgba(5, 15, 12, 0.7), rgba(11, 31, 25, 0.52));
+  background: linear-gradient(180deg, rgba(5, 15, 12, 0.76), rgba(11, 31, 25, 0.56));
 }
-.meteo-ribbon-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
-.meteo-ribbon-heading span { font-size: 8px; text-transform: uppercase; letter-spacing: 0.08em; }
-.meteo-lane { display: grid; grid-template-columns: 72px minmax(0, 1fr); align-items: center; gap: 7px; }
-.meteo-lane-label { color: var(--muted-strong); font-size: 8px; line-height: 1.15; text-transform: uppercase; letter-spacing: 0.05em; }
-.meteo-track {
+.trajectory-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.trajectory-heading span { font-size: 8px; text-align: right; }
+.trajectory-evidence-lane,
+.trajectory-axis { display: grid; grid-template-columns: 96px minmax(0, 1fr); align-items: center; gap: 7px; }
+.trajectory-evidence-label {
+  overflow: hidden;
+  color: var(--muted-strong);
+  font-size: 8px;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  letter-spacing: 0.045em;
+}
+.trajectory-evidence-track {
   position: relative;
-  height: 31px;
+  min-width: 0;
+  height: 24px;
   overflow: hidden;
   border-radius: 5px;
   background:
-    repeating-linear-gradient(90deg, transparent 0 19%, rgba(168, 188, 179, 0.1) 19% 20%),
-    rgba(168, 188, 179, 0.055);
+    repeating-linear-gradient(90deg, transparent 0 24.5%, rgba(168, 188, 179, 0.11) 24.5% 25%),
+    rgba(168, 188, 179, 0.06);
 }
-.meteo-selected-day { position: absolute; z-index: 4; top: 0; bottom: 0; left: var(--x); width: 1px; background: rgba(255, 255, 255, 0.72); }
-.meteo-pressure {
+.trajectory-evidence-track.is-s2 { height: 44px; }
+.trajectory-evidence-track.is-stage { height: 22px; }
+.trajectory-evidence-track.is-story { height: 32px; }
+.trajectory-selected-day {
+  position: absolute;
+  z-index: 8;
+  top: 0;
+  bottom: 0;
+  left: var(--x);
+  width: 1px;
+  pointer-events: none;
+  background: rgba(255, 255, 255, 0.78);
+}
+.trajectory-pressure-cell {
   position: absolute;
   z-index: 2;
-  top: calc(3px + var(--hazard-row) * 8px);
+  top: 3px;
   left: var(--x);
-  width: 4px;
-  height: 6px;
-  transform: translateX(-2px);
-  border: 1px solid rgba(255, 255, 255, 0.68);
-  border-radius: 2px;
+  width: var(--width);
+  height: 18px;
+  min-width: 1px;
+  border-right: 1px solid rgba(5, 15, 12, 0.35);
   background: var(--hazard-color);
   opacity: 0.7;
 }
-.meteo-pressure.risk-2 { height: 7px; opacity: 0.78; }
-.meteo-pressure.risk-3,
-.meteo-pressure.risk-4 { height: 8px; box-shadow: 0 0 5px rgba(242, 193, 78, 0.48); opacity: 1; }
-.meteo-clock-span { position: absolute; z-index: 1; top: 15px; left: var(--x); width: var(--width); height: 1px; background: rgba(168, 188, 179, 0.62); }
-.meteo-clock-span::before { position: absolute; top: -2px; left: 0; width: 5px; height: 5px; border-radius: 50%; background: rgba(168, 188, 179, 0.74); content: ""; }
-.meteo-clock-marker {
+.trajectory-pressure-cell.is-observed-low { opacity: 0.22; }
+.trajectory-pressure-cell.is-partial {
+  background: repeating-linear-gradient(135deg, var(--hazard-color) 0 3px, rgba(5, 15, 12, 0.55) 3px 6px);
+  opacity: 0.7;
+}
+.trajectory-pressure-cell.is-missing {
+  background: repeating-linear-gradient(135deg, rgba(168, 188, 179, 0.08) 0 2px, rgba(168, 188, 179, 0.28) 2px 3px, rgba(168, 188, 179, 0.08) 3px 6px);
+  opacity: 1;
+}
+.trajectory-pressure-cell.risk-3,
+.trajectory-pressure-cell.risk-4 { opacity: 1; box-shadow: inset 0 2px rgba(255, 255, 255, 0.24); }
+.trajectory-clock-span {
+  position: absolute;
+  z-index: 2;
+  top: 17px;
+  left: var(--x);
+  width: var(--width);
+  min-width: 2px;
+  height: 1px;
+  background: rgba(210, 225, 218, 0.62);
+}
+.trajectory-clock-span.is-story { top: 3px; background: rgba(255, 255, 255, 0.55); }
+.trajectory-s2-source {
   position: absolute;
   z-index: 3;
-  top: 9px;
+  top: 14px;
   left: var(--x);
-  min-width: 10px;
-  height: 13px;
+  width: 6px;
+  height: 6px;
+  transform: translateX(-50%) rotate(45deg);
+  border: 1px solid #d2e1da;
+  background: #233c33;
+}
+.trajectory-s2-marker {
+  position: absolute;
+  z-index: 5;
+  top: 8px;
+  left: var(--x);
+  min-width: 12px;
+  height: 15px;
+  padding: 0 2px;
   transform: translateX(-50%);
-  border: 1px solid var(--accent);
-  border-radius: 3px;
-  background: #176650;
+  border: 1px solid #a8bcb3;
+  border-radius: 4px;
   color: #fff;
+  background: #52635c;
   font-size: 6px;
-  line-height: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 13px;
   text-align: center;
 }
-.meteo-clock-marker.is-s2 { min-width: 9px; width: 9px; height: 9px; top: 11px; border-radius: 50%; }
-.meteo-clock-marker.is-s2.is-rejected { border-color: #f07b68; background: transparent; box-shadow: inset 0 0 0 1px #f07b68; }
-.meteo-clock-marker.is-story[class*="state-recover"] { border-color: #42c9a0; background: #176650; }
-.meteo-clock-marker.is-story[class*="state-closed"] { border-style: dashed; opacity: 0.7; }
-.meteo-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 8px; }
+.trajectory-s2-marker.is-decline { border-color: #e39ac2; background: #854b70; }
+.trajectory-s2-marker.is-severe-decline { border-color: #ffc2df; background: #a53469; }
+.trajectory-s2-marker.is-recovery { border-color: #73e2b4; background: #176650; }
+.trajectory-s2-marker.is-no-change { border-color: #9fc4d8; background: #35576a; }
+.trajectory-s2-marker.is-rejected { border-color: #f07b68; background: #351d1b; color: transparent; }
+.trajectory-s2-marker.is-rejected::before,
+.trajectory-s2-marker.is-rejected::after {
+  position: absolute;
+  top: 6px;
+  left: 2px;
+  width: 8px;
+  height: 1px;
+  background: #f07b68;
+  content: "";
+}
+.trajectory-s2-marker.is-rejected::before { transform: rotate(45deg); }
+.trajectory-s2-marker.is-rejected::after { transform: rotate(-45deg); }
+.trajectory-s2-hold {
+  position: absolute;
+  z-index: 1;
+  left: var(--x);
+  width: var(--width);
+  min-width: 2px;
+  height: 4px;
+  border-radius: 2px;
+}
+.trajectory-s2-hold.is-fresh { top: 29px; background: rgba(115, 226, 180, 0.78); }
+.trajectory-s2-hold.is-aging { top: 34px; background: rgba(242, 193, 78, 0.68); }
+.trajectory-s2-hold.is-stale { top: 39px; background: rgba(168, 188, 179, 0.32); }
+.trajectory-stage-segment,
+.trajectory-story-block {
+  position: absolute;
+  left: var(--x);
+  width: var(--width);
+  min-width: 2px;
+  overflow: hidden;
+  border-right: 1px solid rgba(5, 15, 12, 0.55);
+  color: #eff8f4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.trajectory-stage-segment {
+  top: 3px;
+  height: 16px;
+  padding: 0 4px;
+  background: rgba(42, 157, 143, 0.68);
+  font-size: 7px;
+  line-height: 16px;
+}
+.trajectory-stage-segment.is-unknown,
+.trajectory-story-block.state-not-known {
+  background: repeating-linear-gradient(135deg, rgba(168, 188, 179, 0.08) 0 3px, rgba(168, 188, 179, 0.22) 3px 5px);
+  color: var(--muted);
+}
+.trajectory-story-block {
+  z-index: 2;
+  top: 7px;
+  height: 20px;
+  padding: 0 4px;
+  background: #82682c;
+  font-size: 7px;
+  line-height: 20px;
+}
+.trajectory-story-block[class*="state-active"],
+.trajectory-story-block[class*="state-confirmed"] { background: #a75334; }
+.trajectory-story-block[class*="state-quiet"] { background: #7a6428; }
+.trajectory-story-block[class*="state-recover"] { background: #217b65; }
+.trajectory-story-block[class*="state-closed"] { background: #315c50; opacity: 0.66; }
+.trajectory-story-block.is-open { border-right: 2px dashed #fff; }
+.trajectory-story-milestone {
+  position: absolute;
+  z-index: 6;
+  top: 2px;
+  left: var(--x);
+  width: 7px;
+  height: 7px;
+  transform: translateX(-50%) rotate(45deg);
+  border: 1px solid #fff;
+  background: #8b9d95;
+}
+.trajectory-story-milestone.is-start { background: #f2c14e; }
+.trajectory-story-milestone.is-pressure-off { background: #a98bd4; }
+.trajectory-story-milestone.is-recovery { background: #42c9a0; }
+.trajectory-story-milestone.is-closed { border-style: dashed; background: #315c50; }
+.trajectory-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 8px; }
+.trajectory-axis { margin-top: -2px; }
+.trajectory-axis-track { position: relative; height: 14px; }
+.trajectory-axis-tick {
+  position: absolute;
+  left: var(--x);
+  transform: translateX(-50%);
+  color: var(--muted);
+  font-size: 7px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.trajectory-axis-tick:first-child { transform: none; }
+.trajectory-axis-tick:last-child { transform: translateX(-100%); }
 .lifecycle-lanes { display: grid; gap: 7px; }
 .lifecycle-lane,
 .trajectory-lane { display: grid; gap: 3px; }

@@ -45,6 +45,25 @@ export function v3LayerModel(zoom = 0) {
   };
 }
 
+export function fieldViewportCoverage(collection = {}) {
+  const meta = collection.meta || {};
+  const shown = Math.max(0, Number(
+    meta.feature_count ?? collection.features?.length ?? meta.state_count ?? 0,
+  ));
+  const source = Math.max(shown, Number(
+    meta.source_row_count ?? meta.source_field_count ?? shown,
+  ));
+  const truncated = truthy(meta.truncated) || truthy(meta.limit_hit) || shown < source;
+  return {
+    shown,
+    source,
+    truncated,
+    label: truncated
+      ? `showing ${shown.toLocaleString()} of ${source.toLocaleString()} viewport fields · capped`
+      : `${shown.toLocaleString()} exact viewport fields`,
+  };
+}
+
 export function normalizeFootprintCollection(payload = {}) {
   const source = Array.isArray(payload.features)
     ? payload.features

@@ -4,8 +4,13 @@ const FACETS = [
   ["hazardFilter", "hazard_signature", "All hazards"],
   ["responseFilter", "response_signature", "All responses"],
 ];
-const INCIDENT_FACETS = [
+export const INCIDENT_MODEL_STATUS = (
+  "Operational crop stories are shown. Learned similarity motifs are not published in this release."
+);
+
+export const INCIDENT_FACETS = [
   ["cropFilter", "crop_name", "All crops"],
+  ["incidentHazardFilter", "hazard_family", "All hazards"],
   ["stageFilter", "stage_bucket", "All crop stages"],
   ["lifecycleFilter", "incident_state", "All lifecycle states"],
 ];
@@ -23,7 +28,8 @@ export class FilterController {
       "situationMode", "exactMode", "situationFilters", "exactFilters", "storySearch",
       "storySelect", "familyFilter", "riskFilter", "hazardFilter", "responseFilter",
       "clearFilters", "storySummary", "familyFilterLabel", "modeSwitch",
-      "incidentFilters", "cropFilter", "stageFilter", "lifecycleFilter",
+      "incidentFilters", "cropFilter", "incidentHazardFilter", "stageFilter",
+      "lifecycleFilter",
     ].map((id) => [id, document.getElementById(id)]));
     this.bind();
   }
@@ -212,7 +218,7 @@ export class FilterController {
       title = Object.keys(filters).length
         ? Object.values(filters).map(prettyValue).join(" · ")
         : "All crop incidents in the selected week";
-      text = "Exact monitored footprints are primary; zoom in for contributing field evidence.";
+      text = `${INCIDENT_MODEL_STATUS} Exact monitored footprints are primary; zoom in for contributing field evidence.`;
     } else if (this.mode === "exact" && !story) {
       title = "Choose one strict temporal signature";
       text = "Exact-story mode preserves sequence identity instead of broadening it to similar evidence.";

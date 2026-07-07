@@ -18,6 +18,7 @@ from story_monitor.incident_motif_workflow_v4 import (
     build_diagnostic_motif_release_v4,
     evaluate_prefix_release_v4,
     fit_reviewed_prefix_release_v4,
+    score_live_prefix_release_v4,
 )
 from story_monitor.incident_motifs_v4 import (
     MotifDiscoveryConfig,
@@ -37,6 +38,14 @@ def _date(value: str) -> date:
         return date.fromisoformat(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("expected YYYY-MM-DD") from exc
+
+
+def _as_of(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected an ISO-8601 date/time") from exc
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
 
 
 def _integer_tuple(value: str, *, allow_zero: bool) -> tuple[int, ...]:
@@ -71,6 +80,11 @@ def _add_prefix_config(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--minimum-calibration-support", type=_positive, default=10)
     parser.add_argument("--radius-quantile", type=float, default=0.95)
     parser.add_argument("--margin-quantile", type=float, default=0.05)
+    parser.add_argument("--maximum-novel-false-accept-rate", type=float, default=0.05)
+    parser.add_argument("--minimum-weather-observed-days", type=_positive, default=7)
+    parser.add_argument(
+        "--minimum-s2-acquisitions-for-crop-support", type=_positive, default=1
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -118,6 +132,21 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--final-labels", type=Path, required=True)
     evaluate.add_argument("--output-dir", type=Path, required=True)
     evaluate.add_argument("--heartbeat-seconds", type=_positive, default=30)
+
+    live = commands.add_parser(
+        "score-live",
+        help="Score an immutable as-of delta for currently active incidents.",
+    )
+    live.add_argument("--incident-dir", type=Path, required=True)
+    live.add_argument("--evidence-dir", type=Path, required=True)
+    live.add_argument("--viewer-dir", type=Path, required=True)
+    live.add_argument("--prefix-model-dir", type=Path, required=True)
+    live.add_argument("--output-dir", type=Path, required=True)
+    live.add_argument("--as-of", type=_as_of, required=True)
+    live.add_argument("--threads", type=_positive, default=32)
+    live.add_argument("--memory-limit", default="96GB")
+    live.add_argument("--temp-dir", type=Path)
+    live.add_argument("--heartbeat-seconds", type=_positive, default=30)
     return parser
 
 
@@ -129,6 +158,11 @@ def _prefix_config(args: argparse.Namespace) -> PrefixCalibrationConfig:
         minimum_calibration_support=args.minimum_calibration_support,
         radius_quantile=args.radius_quantile,
         margin_quantile=args.margin_quantile,
+        maximum_novel_false_accept_rate=args.maximum_novel_false_accept_rate,
+        minimum_weather_observed_days=args.minimum_weather_observed_days,
+        minimum_s2_acquisitions_for_crop_support=(
+            args.minimum_s2_acquisitions_for_crop_support
+        ),
     )
 
 
@@ -201,12 +235,24 @@ def main(argv: list[str] | None = None) -> int:
                 args.output_dir,
                 config=_prefix_config(args),
             )
-        else:
+        elif args.command == "evaluate":
             result = evaluate_prefix_release_v4(
                 args.discovery_dir,
                 args.prefix_model_dir,
                 args.final_labels,
                 args.output_dir,
+            )
+        else:
+            result = score_live_prefix_release_v4(
+                args.incident_dir,
+                args.evidence_dir,
+                args.viewer_dir,
+                args.prefix_model_dir,
+                args.output_dir,
+                as_of=args.as_of,
+                threads=args.threads,
+                memory_limit=args.memory_limit,
+                temp_dir=args.temp_dir,
             )
     print(json.dumps(result, indent=2, sort_keys=True))
     if args.command == "evaluate" and not result.get("hard_gates_passed", False):

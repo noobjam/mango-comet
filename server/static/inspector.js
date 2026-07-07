@@ -1,4 +1,10 @@
 import { INCIDENT_TRUTH_LABEL, incidentDetailModel } from "./incident-v3.js";
+import { cropStoryTrajectory } from "./crop-story-trajectory.js";
+
+export {
+  cropStoryTrajectoryModel,
+  fieldEvidenceRibbonModel,
+} from "./crop-story-trajectory.js";
 
 export class Inspector {
   constructor() {
@@ -57,6 +63,9 @@ export class Inspector {
   showIncident(properties, payload = {}) {
     const model = incidentDetailModel(payload, properties);
     const children = incidentHeader({ ...properties, incident_id: model.incidentId });
+    const trajectory = payload.as_of_date
+      ? cropStoryTrajectory(payload, payload.as_of_date, "Selected incident trajectory")
+      : null;
     children.push(
       detailPair("Crop", pretty(model.crop)),
       ...(model.coincident.count > 1 ? [
@@ -67,6 +76,7 @@ export class Inspector {
       ] : []),
       detailPair("Lifecycle", pretty(model.lifecycle)),
       selectedWeekEvidenceView(model),
+      ...(trajectory ? [trajectory] : []),
       lifecycleDatesView(model.lifecycleDates),
       storyArcView(model.storyArc),
       footprintContextView(model),
@@ -77,6 +87,11 @@ export class Inspector {
       detailPair("Carry / recovery", `${count(model.counts.unresolved)} unresolved carried · ${count(model.counts.recovered)} recovered`),
       detailPair("Lineage / recurrence", `${count(model.counts.split)} split · ${count(model.counts.merge)} merge · ${count(model.counts.relapse)} relapse`),
       evidenceView(model.evidence),
+      ...(payload.history?.any_truncated ? [node(
+        "p",
+        `History is capped at ${count(payload.history.history_limit_per_collection)} rows per collection.`,
+        "truth-note incident-truth",
+      )] : []),
       node("p", INCIDENT_TRUTH_LABEL, "truth-note incident-truth"),
     );
     this.selection.replaceChildren(...children);
@@ -144,7 +159,7 @@ export class Inspector {
         "Evidence cutoff",
         `${payload.as_of_date || "—"} · ${history.lookback_days || "—"} day lookback`,
       ),
-      fieldEvidenceRibbon(payload, payload.as_of_date),
+      cropStoryTrajectory(payload, payload.as_of_date, "Field crop-story trajectory"),
     );
     if (history.any_truncated) {
       children.push(node(
@@ -407,155 +422,6 @@ export function prefixTrajectoryModel(states = [], selectedBucket = "") {
   }));
 }
 
-export function fieldEvidenceRibbonModel(payload = {}, selectedDate = "") {
-  const lanes = payload.lanes || {};
-  const pressureRows = lanes.daily_pressure || payload.daily_pressure || [];
-  const s2Rows = lanes.s2_attempts || payload.s2_attempts || [];
-  const storyRows = lanes.story_checkpoints || payload.story_checkpoints || [];
-  const candidateDates = [
-    payload.history?.window_start,
-    payload.history?.window_end,
-    payload.as_of_date,
-    selectedDate,
-    ...pressureRows.map((row) => row.calendar_date),
-    ...s2Rows.flatMap((row) => [row.spectral_source_date, row.knowledge_date]),
-    ...storyRows.flatMap((row) => [row.story_week, row.story_known_date]),
-  ].map(dateValue).filter(Number.isFinite);
-  const start = dateValue(payload.history?.window_start)
-    || (candidateDates.length ? Math.min(...candidateDates) : NaN);
-  const rawEnd = dateValue(payload.history?.window_end)
-    || dateValue(payload.as_of_date)
-    || (candidateDates.length ? Math.max(...candidateDates) : NaN);
-  const end = Number.isFinite(start) && Number.isFinite(rawEnd)
-    ? Math.max(rawEnd, start + 86400000) : NaN;
-  const position = (value) => {
-    const timestamp = dateValue(value);
-    if (!Number.isFinite(timestamp) || !Number.isFinite(start) || !Number.isFinite(end)) {
-      return null;
-    }
-    return Math.max(0, Math.min(100, ((timestamp - start) / (end - start)) * 100));
-  };
-  const hazardFamilies = [...new Set(
-    pressureRows.map((row) => String(row.hazard_family || "unknown")),
-  )].sort();
-  const hazardIndex = new Map(hazardFamilies.map((hazard, index) => [hazard, index]));
-  const pressure = pressureRows.map((row) => ({
-    ...row,
-    date: String(row.calendar_date || "").slice(0, 10),
-    x: position(row.calendar_date),
-    hazard: String(row.hazard_family || "unknown"),
-    hazardIndex: hazardIndex.get(String(row.hazard_family || "unknown")) || 0,
-    riskRank: Number(row.risk_rank || 0),
-    active: Boolean(row.pressure_active),
-  })).filter((row) => row.x !== null)
-    .sort((left, right) => left.date.localeCompare(right.date)
-      || left.hazard.localeCompare(right.hazard));
-  const s2 = s2Rows.map((row) => ({
-    ...row,
-    sourceDate: String(row.spectral_source_date || row.knowledge_date || "").slice(0, 10),
-    knowledgeDate: String(row.knowledge_date || "").slice(0, 10),
-    sourceX: position(row.spectral_source_date || row.knowledge_date),
-    knowledgeX: position(row.knowledge_date),
-    rejected: String(row.marker_type || "") === "rejected" || !row.spectral_usable,
-  })).filter((row) => row.sourceX !== null && row.knowledgeX !== null)
-    .sort((left, right) => left.knowledgeDate.localeCompare(right.knowledgeDate));
-  const story = storyRows.map((row) => ({
-    ...row,
-    storyWeek: String(row.story_week || "").slice(0, 10),
-    knowledgeDate: String(row.story_known_date || "").slice(0, 10),
-    sourceX: position(row.story_week),
-    knowledgeX: position(row.story_known_date),
-    lifecycle: String(row.incident_state || "unknown"),
-    stage: String(row.stage_bucket || "unknown"),
-  })).filter((row) => row.sourceX !== null && row.knowledgeX !== null)
-    .sort((left, right) => left.knowledgeDate.localeCompare(right.knowledgeDate));
-  return {
-    start,
-    end,
-    selectedX: position(selectedDate || payload.as_of_date),
-    hazardFamilies,
-    lanes: { pressure, s2, story },
-    truncated: payload.history?.truncated || {},
-  };
-}
-
-function fieldEvidenceRibbon(payload, selectedDate) {
-  const model = fieldEvidenceRibbonModel(payload, selectedDate);
-  const wrapper = document.createElement("section");
-  wrapper.className = "field-evidence-ribbon";
-  wrapper.setAttribute("aria-label", "Causal field evidence timeline");
-  const heading = document.createElement("div");
-  heading.className = "meteo-ribbon-heading";
-  heading.append(
-    node("strong", "Field evidence ribbon"),
-    node("span", "source → known", "muted"),
-  );
-  wrapper.appendChild(heading);
-  wrapper.append(
-    meteoLane("Daily pressure", "pressure", model.lanes.pressure, model.selectedX),
-    meteoLane("S2 attempts", "s2", model.lanes.s2, model.selectedX),
-    meteoLane("Weekly crop story", "story", model.lanes.story, model.selectedX),
-  );
-  const extents = document.createElement("div");
-  extents.className = "lifecycle-extents";
-  extents.append(
-    node("span", Number.isFinite(model.start) ? shortDay(model.start) : "—"),
-    node("span", Number.isFinite(model.end) ? shortDay(model.end) : "—"),
-  );
-  wrapper.appendChild(extents);
-  return wrapper;
-}
-
-function meteoLane(label, kind, values, selectedX) {
-  const lane = document.createElement("div");
-  lane.className = `meteo-lane is-${kind}`;
-  lane.appendChild(node("span", label, "meteo-lane-label"));
-  const track = document.createElement("div");
-  track.className = "meteo-track";
-  track.setAttribute("role", "list");
-  if (selectedX !== null) {
-    const cursor = node("span", "", "meteo-selected-day");
-    cursor.style.setProperty("--x", `${selectedX}%`);
-    track.appendChild(cursor);
-  }
-  if (!values.length) track.appendChild(node("span", "No observations", "meteo-empty"));
-  for (const value of values) {
-    if (kind === "pressure") {
-      const marker = node("span", "", `meteo-pressure risk-${Math.min(4, value.riskRank)}`);
-      marker.style.setProperty("--x", `${value.x}%`);
-      marker.style.setProperty("--hazard-row", String(value.hazardIndex % 3));
-      marker.style.setProperty("--hazard-color", hazardColor(value.hazard));
-      marker.setAttribute("role", "listitem");
-      marker.title = [
-        value.date, pretty(value.hazard), value.risk_band,
-        value.active ? "active" : "observed",
-      ].filter(Boolean).join(" · ");
-      marker.setAttribute("aria-label", marker.title);
-      track.appendChild(marker);
-      continue;
-    }
-    const sourceX = Math.min(value.sourceX, value.knowledgeX);
-    const knowledgeX = Math.max(value.sourceX, value.knowledgeX);
-    const span = node("span", "", `meteo-clock-span is-${kind}`);
-    span.style.setProperty("--x", `${sourceX}%`);
-    span.style.setProperty("--width", `${Math.max(0.35, knowledgeX - sourceX)}%`);
-    track.appendChild(span);
-    const markerClass = kind === "s2"
-      ? `meteo-clock-marker is-s2${value.rejected ? " is-rejected" : " is-usable"}`
-      : `meteo-clock-marker is-story state-${cssToken(value.lifecycle)}`;
-    const marker = node("span", kind === "story" ? shortStage(value.stage) : "", markerClass);
-    marker.style.setProperty("--x", `${value.knowledgeX}%`);
-    marker.setAttribute("role", "listitem");
-    marker.title = kind === "s2"
-      ? `${value.sourceDate} source → ${value.knowledgeDate} known · ${value.rejected ? "rejected" : "usable"}`
-      : `${value.storyWeek} story week → ${value.knowledgeDate} known · ${pretty(value.lifecycle)} · ${pretty(value.stage)}`;
-    marker.setAttribute("aria-label", marker.title);
-    track.appendChild(marker);
-  }
-  lane.appendChild(track);
-  return lane;
-}
-
 function prefixTrajectoryRibbon(states, selectedBucket) {
   const model = prefixTrajectoryModel(states, selectedBucket);
   const wrapper = document.createElement("div");
@@ -715,20 +581,6 @@ function shortDay(timestamp) {
 
 function cssToken(value) {
   return String(value || "unknown").toLowerCase().replace(/[^a-z0-9]+/g, "-");
-}
-
-function shortStage(value) {
-  const text = String(value || "?").replaceAll("_", " ").trim();
-  return text ? text.slice(0, 2).toUpperCase() : "?";
-}
-
-function hazardColor(value) {
-  const key = String(value || "").toLowerCase();
-  if (key.includes("heat")) return "#f07b68";
-  if (key.includes("drought") || key.includes("dry")) return "#e2ae45";
-  if (key.includes("flood") || key.includes("pond")) return "#59a9d8";
-  if (key.includes("wind")) return "#a98bd4";
-  return "#73e2b4";
 }
 
 function shortId(value) {

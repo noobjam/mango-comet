@@ -43,10 +43,14 @@ availability timestamps. Echo rows only age the last usable S2 observation,
 rejected/unknown-QA attempts cannot become references, and S2 evidence never
 makes a missing weather day observable.
 
-Serve only a completed `incident_viewer_v4_*` as `STORY_MAP_RUN_DIR` for the
-dual-clock product. Static geometry is hydrated separately from compact daily
-state, and field drilldown has distinct daily-pressure, S2-attempt, and weekly
-story/stage lanes. Footprints and density representations are precomputed;
+Serve only a completed `crop-incident-viewer-v4/2` bundle as
+`STORY_MAP_RUN_DIR` for the dual-clock product. V4/2 preserves the V3 lifecycle
+and fail-closed reconciles its positive pressure/response claims against V4
+ledgers; it does not claim to replay component absence or own lifecycle state.
+Static geometry is hydrated separately from compact daily state, and field and
+incident drilldown use one aligned linear timeline with separate hazard lanes,
+S2 source/known/freshness marks, a crop-stage band, and one row per story.
+Footprints and density representations are precomputed;
 requests do not cluster or reconstruct stories. Both server and browser
 response caches are byte-bounded, and the release must pass the VM latency
 benchmark plus browser visual gates before presentation.
@@ -55,7 +59,12 @@ V4 motif learning is a downstream, review-gated descriptor layer over eligible
 completed incidents. Discovery uses knowledge-time-separated and
 lineage/exposure-purged train, calibration, and sealed holdout cohorts. Live
 prefixes are maturity-matched by observed weather days and distinct usable S2
-source dates, and may only be `pending`, `novel_unassigned`, or `tentative`.
+source dates. Confirmed non-terminal incidents may only be `pending`,
+`novel_unassigned`, `tentative_weather_only`, or
+`tentative_crop_evidence_supported`; unconfirmed candidates are excluded.
+Daily weather carries causally between weekly checkpoints until a known
+close/merge/field-level split boundary. Open-set calibration constrains the
+combined stratum assignment rule, not each prototype independently.
 An unreviewed motif never appears as a map-approved story label.
 
 Never claim crop death, causation, hazard propagation, diagnosis, yield loss,

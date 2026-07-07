@@ -29,9 +29,12 @@ from .incident_validation_v4 import validate_evidence_directory
 from .incident_viewer_v3 import export_incident_viewer_v3
 
 
-SCHEMA_VERSION = "crop-incident-viewer-v4/1"
+SCHEMA_VERSION = "crop-incident-viewer-v4/2"
 MODE = "crop_incident_v4_dual_clock"
 PUBLICATION_STATUS = "diagnostic_uncalibrated_not_map_approved"
+LIFECYCLE_RECONCILIATION_SCHEMA_VERSION = (
+    "incident-lifecycle-evidence-reconciliation-v4/1"
+)
 
 EVIDENCE_FILES = {
     "crop": "crop_day_context_v4.parquet",
@@ -48,6 +51,7 @@ OUTPUT_FILES = {
     "s2_attempts": "s2_attempts_v4.parquet",
     "s2_updates": "s2_updates_v4.parquet",
     "story_checkpoints": "story_checkpoints_v4.parquet",
+    "lifecycle_reconciliation": "lifecycle_reconciliation_v4.parquet",
     "story_footprints": "story_footprints_v4.parquet",
 }
 REQUIRED_NONEMPTY_OUTPUTS = frozenset({"timeline", "field_state", "grid"})
@@ -176,6 +180,11 @@ def export_incident_viewer_v4(
                 connection.read_parquet(
                     str(stage / OUTPUT_FILES["story_checkpoints"])
                 ).create_view("story_checkpoints_v4")
+                _write_lifecycle_reconciliation(
+                    connection,
+                    stage / OUTPUT_FILES["lifecycle_reconciliation"],
+                    availability_mode=str(evidence_validation["availability_mode"]),
+                )
                 _write_story_footprints(
                     connection, stage / OUTPUT_FILES["story_footprints"]
                 )
@@ -945,6 +954,364 @@ def _write_story_checkpoints(
     )
 
 
+def _write_lifecycle_reconciliation(
+    connection: duckdb.DuckDBPyConnection,
+    output_path: Path,
+    *,
+    availability_mode: str,
+) -> None:
+    """Fail closed when V3 positive lifecycle claims contradict V4 evidence.
+
+    This deliberately does not replay the V3 lifecycle.  A full replay requires
+    the frozen effective V3 policy values, component-significance inputs, and
+    weekly coverage denominator ledger, none of which are complete V4 inputs.
+    The artifact instead proves the narrower statement that every positive
+    pressure/response claim used by a published checkpoint is supported by the
+    immutable V4 ledgers and that the published checkpoint counters reconcile
+    with stable V3 membership.  Component *absence* remains explicitly
+    unreplayed; observed quiet and missing weather are recorded separately.
+    """
+    if availability_mode not in {"strict", "reconstructed"}:
+        raise ValueError("Lifecycle reconciliation availability mode is invalid")
+    weekly_columns = {
+        str(row[0]) for row in connection.execute("DESCRIBE story_checkpoints_v4").fetchall()
+    }
+    required_weekly = {
+        "incident_id", "story_week", "story_known_time", "incident_state",
+        "pressure_core_field_count", "impact_lag_field_count",
+        "fresh_decline_field_count", "fresh_recovery_field_count",
+        "knowledge_bound_complete",
+    }
+    missing_weekly = sorted(required_weekly - weekly_columns)
+    if missing_weekly:
+        raise ValueError(
+            "Incident V4 lifecycle reconciliation requires checkpoint columns: "
+            + ", ".join(missing_weekly)
+        )
+
+    connection.execute(
+        f"""
+        COPY (
+            WITH checkpoints AS (
+                SELECT
+                    CAST(incident_id AS VARCHAR) AS incident_id,
+                    CAST(story_week AS DATE) AS story_week,
+                    CAST(story_known_time AS TIMESTAMP) AS story_known_time,
+                    UPPER(CAST(incident_state AS VARCHAR)) AS source_incident_state,
+                    COALESCE(TRY_CAST(pressure_core_field_count AS BIGINT), 0)
+                        AS source_pressure_core_field_count,
+                    COALESCE(TRY_CAST(impact_lag_field_count AS BIGINT), 0)
+                        AS source_impact_lag_field_count,
+                    COALESCE(TRY_CAST(fresh_decline_field_count AS BIGINT), 0)
+                        AS source_fresh_decline_field_count,
+                    COALESCE(TRY_CAST(fresh_recovery_field_count AS BIGINT), 0)
+                        AS source_fresh_recovery_field_count,
+                    COALESCE(TRY_CAST(knowledge_bound_complete AS BOOLEAN), FALSE)
+                        AS knowledge_bound_complete
+                FROM story_checkpoints_v4
+            ), members AS (
+                SELECT DISTINCT
+                    c.incident_id, c.story_week, c.story_known_time,
+                    NULLIF(TRIM(CAST(m.field_id AS VARCHAR)), '') AS field_id,
+                    NULLIF(TRIM(CAST(m.crop_instance_id AS VARCHAR)), '')
+                        AS crop_instance_id,
+                    NULLIF(LOWER(TRIM(CAST(m.hazard_family AS VARCHAR))), '')
+                        AS hazard_family,
+                    LOWER(COALESCE(CAST(m.membership_role AS VARCHAR), ''))
+                        AS membership_role,
+                    LOWER(COALESCE(CAST(m.response_class AS VARCHAR), ''))
+                        AS response_class,
+                    COALESCE(TRY_CAST(m.fresh_response_evidence AS BOOLEAN), FALSE)
+                        AS fresh_response_evidence
+                FROM incident_membership_v4 AS m
+                JOIN checkpoints AS c
+                  ON CAST(m.incident_id AS VARCHAR) = c.incident_id
+                 AND CAST(m.timeline_bucket AS DATE) = c.story_week
+            ), pressure_support AS (
+                SELECT m.*,
+                    COUNT(DISTINCT p.pressure_observation_date) FILTER (
+                        WHERE p.pressure_observed
+                    )::BIGINT AS observed_pressure_day_count,
+                    COUNT(DISTINCT p.pressure_observation_date) FILTER (
+                        WHERE p.pressure_observed AND p.pressure_active
+                    )::BIGINT AS active_pressure_day_count
+                FROM members AS m
+                LEFT JOIN pressure_v4 AS p
+                  ON p.field_id = m.field_id
+                 AND p.crop_instance_id = m.crop_instance_id
+                 AND p.hazard_family = m.hazard_family
+                 AND p.pressure_observation_date BETWEEN m.story_week
+                     AND m.story_week + INTERVAL 6 DAY
+                 AND p.pressure_knowledge_time <= m.story_known_time
+                GROUP BY ALL
+            ), member_support AS (
+                SELECT p.*,
+                    COUNT(a.acquisition_id) FILTER (
+                        WHERE a.new_response_evidence
+                          AND a.response_class = p.response_class
+                    )::BIGINT AS matching_s2_response_count
+                FROM pressure_support AS p
+                LEFT JOIN s2_updates_v4 AS a
+                  ON a.field_id = p.field_id
+                 AND a.crop_instance_id = p.crop_instance_id
+                 AND a.knowledge_time <= p.story_known_time
+                 AND (
+                     a.spectral_source_date BETWEEN p.story_week
+                         AND p.story_week + INTERVAL 6 DAY
+                     OR (
+                         a.knowledge_date BETWEEN p.story_week
+                             AND p.story_week + INTERVAL 6 DAY
+                         AND a.spectral_source_date < p.story_week
+                     )
+                 )
+                GROUP BY ALL
+            ), membership_evidence AS (
+                SELECT incident_id, story_week,
+                    COUNT(DISTINCT field_id)::BIGINT AS attributed_member_field_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE membership_role = 'pressure_core'
+                    )::BIGINT AS membership_pressure_core_field_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE membership_role = 'impact_lag'
+                    )::BIGINT AS membership_impact_lag_field_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE fresh_response_evidence
+                          AND response_class IN ('medium_decline', 'severe_decline')
+                    )::BIGINT AS membership_fresh_decline_field_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE fresh_response_evidence AND response_class = 'recovery'
+                    )::BIGINT AS membership_fresh_recovery_field_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE fresh_response_evidence
+                          AND response_class NOT IN (
+                              'medium_decline', 'severe_decline', 'recovery'
+                          )
+                    )::BIGINT AS unclassified_fresh_response_field_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE membership_role = 'pressure_core'
+                          AND active_pressure_day_count > 0
+                    )::BIGINT AS supported_pressure_core_field_count,
+                    COUNT(*) FILTER (
+                        WHERE membership_role = 'pressure_core'
+                          AND active_pressure_day_count = 0
+                    )::BIGINT AS unsupported_pressure_core_membership_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE membership_role = 'pressure_core'
+                          AND observed_pressure_day_count = 0
+                    )::BIGINT AS pressure_core_missing_weather_field_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE membership_role = 'pressure_core'
+                          AND observed_pressure_day_count > 0
+                          AND active_pressure_day_count = 0
+                    )::BIGINT AS pressure_core_observed_inactive_field_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE fresh_response_evidence
+                          AND response_class IN ('medium_decline', 'severe_decline')
+                          AND matching_s2_response_count > 0
+                    )::BIGINT AS supported_fresh_decline_field_count,
+                    COUNT(*) FILTER (
+                        WHERE fresh_response_evidence
+                          AND response_class IN ('medium_decline', 'severe_decline')
+                          AND matching_s2_response_count = 0
+                    )::BIGINT AS unsupported_fresh_decline_membership_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE fresh_response_evidence AND response_class = 'recovery'
+                          AND matching_s2_response_count > 0
+                    )::BIGINT AS supported_fresh_recovery_field_count,
+                    COUNT(*) FILTER (
+                        WHERE fresh_response_evidence AND response_class = 'recovery'
+                          AND matching_s2_response_count = 0
+                    )::BIGINT AS unsupported_fresh_recovery_membership_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE observed_pressure_day_count = 0
+                    )::BIGINT AS missing_weather_member_field_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE observed_pressure_day_count > 0
+                          AND active_pressure_day_count = 0
+                    )::BIGINT AS observed_quiet_member_field_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE active_pressure_day_count > 0
+                    )::BIGINT AS observed_active_member_field_count
+                FROM member_support
+                GROUP BY incident_id, story_week
+            ), compared AS (
+                SELECT c.*,
+                    COALESCE(m.attributed_member_field_count, 0)
+                        AS attributed_member_field_count,
+                    COALESCE(m.membership_pressure_core_field_count, 0)
+                        AS membership_pressure_core_field_count,
+                    COALESCE(m.membership_impact_lag_field_count, 0)
+                        AS membership_impact_lag_field_count,
+                    COALESCE(m.membership_fresh_decline_field_count, 0)
+                        AS membership_fresh_decline_field_count,
+                    COALESCE(m.membership_fresh_recovery_field_count, 0)
+                        AS membership_fresh_recovery_field_count,
+                    COALESCE(m.unclassified_fresh_response_field_count, 0)
+                        AS unclassified_fresh_response_field_count,
+                    COALESCE(m.supported_pressure_core_field_count, 0)
+                        AS supported_pressure_core_field_count,
+                    COALESCE(m.unsupported_pressure_core_membership_count, 0)
+                        AS unsupported_pressure_core_membership_count,
+                    COALESCE(m.pressure_core_missing_weather_field_count, 0)
+                        AS pressure_core_missing_weather_field_count,
+                    COALESCE(m.pressure_core_observed_inactive_field_count, 0)
+                        AS pressure_core_observed_inactive_field_count,
+                    COALESCE(m.supported_fresh_decline_field_count, 0)
+                        AS supported_fresh_decline_field_count,
+                    COALESCE(m.unsupported_fresh_decline_membership_count, 0)
+                        AS unsupported_fresh_decline_membership_count,
+                    COALESCE(m.supported_fresh_recovery_field_count, 0)
+                        AS supported_fresh_recovery_field_count,
+                    COALESCE(m.unsupported_fresh_recovery_membership_count, 0)
+                        AS unsupported_fresh_recovery_membership_count,
+                    COALESCE(m.missing_weather_member_field_count, 0)
+                        AS missing_weather_member_field_count,
+                    COALESCE(m.observed_quiet_member_field_count, 0)
+                        AS observed_quiet_member_field_count,
+                    COALESCE(m.observed_active_member_field_count, 0)
+                        AS observed_active_member_field_count
+                FROM checkpoints AS c
+                LEFT JOIN membership_evidence AS m USING (incident_id, story_week)
+            ), checks AS (
+                SELECT *,
+                    source_pressure_core_field_count
+                        <> membership_pressure_core_field_count
+                        AS pressure_membership_count_mismatch,
+                    source_impact_lag_field_count
+                        <> membership_impact_lag_field_count
+                        AS impact_membership_count_mismatch,
+                    source_fresh_decline_field_count
+                        <> membership_fresh_decline_field_count
+                        AS decline_membership_count_mismatch,
+                    source_fresh_recovery_field_count
+                        <> membership_fresh_recovery_field_count
+                        AS recovery_membership_count_mismatch,
+                    unsupported_pressure_core_membership_count > 0
+                        AS unsupported_pressure_core_claim,
+                    unsupported_fresh_decline_membership_count > 0
+                        AS unsupported_fresh_decline_claim,
+                    unsupported_fresh_recovery_membership_count > 0
+                        AS unsupported_fresh_recovery_claim
+                FROM compared
+            ), scored AS (
+                SELECT *,
+                    CAST(pressure_membership_count_mismatch AS INTEGER)
+                    + CAST(impact_membership_count_mismatch AS INTEGER)
+                    + CAST(decline_membership_count_mismatch AS INTEGER)
+                    + CAST(recovery_membership_count_mismatch AS INTEGER)
+                    + CAST(unsupported_pressure_core_claim AS INTEGER)
+                    + CAST(unsupported_fresh_decline_claim AS INTEGER)
+                    + CAST(unsupported_fresh_recovery_claim AS INTEGER)
+                    + CAST(unclassified_fresh_response_field_count > 0 AS INTEGER)
+                        AS contradiction_count,
+                    CONCAT_WS(', ',
+                        CASE WHEN pressure_membership_count_mismatch
+                            THEN 'pressure_membership_count_mismatch' END,
+                        CASE WHEN impact_membership_count_mismatch
+                            THEN 'impact_membership_count_mismatch' END,
+                        CASE WHEN decline_membership_count_mismatch
+                            THEN 'decline_membership_count_mismatch' END,
+                        CASE WHEN recovery_membership_count_mismatch
+                            THEN 'recovery_membership_count_mismatch' END,
+                        CASE WHEN unsupported_pressure_core_claim
+                            THEN 'unsupported_pressure_core_claim' END,
+                        CASE WHEN unsupported_fresh_decline_claim
+                            THEN 'unsupported_fresh_decline_claim' END,
+                        CASE WHEN unsupported_fresh_recovery_claim
+                            THEN 'unsupported_fresh_recovery_claim' END,
+                        CASE WHEN unclassified_fresh_response_field_count > 0
+                            THEN 'unclassified_fresh_response_claim' END
+                    ) AS contradiction_reasons
+                FROM checks
+            )
+            SELECT
+                '{LIFECYCLE_RECONCILIATION_SCHEMA_VERSION}' AS schema_version,
+                CAST('{availability_mode}' AS VARCHAR) AS availability_mode,
+                incident_id, story_week, source_incident_state,
+                source_pressure_core_field_count,
+                source_impact_lag_field_count,
+                source_fresh_decline_field_count,
+                source_fresh_recovery_field_count,
+                attributed_member_field_count,
+                membership_pressure_core_field_count,
+                membership_impact_lag_field_count,
+                membership_fresh_decline_field_count,
+                membership_fresh_recovery_field_count,
+                supported_pressure_core_field_count,
+                supported_fresh_decline_field_count,
+                supported_fresh_recovery_field_count,
+                unsupported_pressure_core_membership_count,
+                unsupported_fresh_decline_membership_count,
+                unsupported_fresh_recovery_membership_count,
+                pressure_core_missing_weather_field_count,
+                pressure_core_observed_inactive_field_count,
+                missing_weather_member_field_count,
+                observed_quiet_member_field_count,
+                observed_active_member_field_count,
+                unclassified_fresh_response_field_count,
+                knowledge_bound_complete,
+                contradiction_count,
+                contradiction_reasons,
+                contradiction_count = 0 AS positive_claim_reconciliation_complete,
+                CASE
+                    WHEN source_pressure_core_field_count > 0
+                        THEN 'not_applicable_pressure_present'
+                    WHEN attributed_member_field_count = 0
+                        THEN 'insufficient_no_attributed_members'
+                    WHEN missing_weather_member_field_count > 0
+                        THEN 'missing_weather'
+                    WHEN observed_active_member_field_count > 0
+                        THEN 'active_field_pressure_component_absence_not_replayed'
+                    ELSE 'observed_quiet_for_attributed_members'
+                END AS quiet_evidence_status,
+                CASE WHEN contradiction_count > 0 THEN 'contradiction'
+                    WHEN '{availability_mode}' = 'strict'
+                        THEN 'strict_positive_claims_reconciled'
+                    ELSE 'diagnostic_positive_claims_reconciled'
+                END AS reconciliation_status,
+                TRUE AS source_state_preserved,
+                FALSE AS lifecycle_state_recomputed,
+                FALSE AS component_absence_replayed,
+                FALSE AS full_lifecycle_replay_supported,
+                FALSE AS lifecycle_causal_claim_supported,
+                CAST(
+                    'positive V3 pressure/response claims only; component absence, '
+                    'coverage thresholds, registries, and lifecycle policy are not replayed'
+                    AS VARCHAR
+                ) AS reconciliation_scope
+            FROM scored
+            ORDER BY story_week, incident_id
+        ) TO ? (FORMAT PARQUET, COMPRESSION ZSTD)
+        """,
+        [str(output_path)],
+    )
+    contradictions = connection.execute(
+        """
+        SELECT incident_id, story_week, contradiction_reasons
+        FROM read_parquet(?)
+        WHERE contradiction_count > 0
+        ORDER BY story_week, incident_id
+        LIMIT 5
+        """,
+        [str(output_path)],
+    ).fetchall()
+    if contradictions:
+        examples = "; ".join(
+            f"{incident_id}@{story_week}[{reasons}]"
+            for incident_id, story_week, reasons in contradictions
+        )
+        total = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM read_parquet(?) WHERE contradiction_count > 0",
+                [str(output_path)],
+            ).fetchone()[0]
+        )
+        raise ValueError(
+            "Incident V4 lifecycle evidence reconciliation failed closed: "
+            f"contradictory_checkpoints={total}; {examples}"
+        )
+
+
 def _write_story_footprints(
     connection: duckdb.DuckDBPyConnection, output_path: Path
 ) -> None:
@@ -1015,50 +1382,84 @@ def _write_daily_grid(
                 QUALIFY ROW_NUMBER() OVER (
                     PARTITION BY s.calendar_date, s.field_id
                     ORDER BY s.monitored DESC, s.evaluable DESC,
-                        s.s2_knowledge_date DESC NULLS LAST, s.crop_instance_id
+                        s.crop_context_observed DESC,
+                        s.stage_source_date DESC NULLS LAST,
+                        s.crop_observation_date DESC NULLS LAST,
+                        s.crop_instance_id, s.hazard_family
                 ) = 1
+            ), crop_stage_counts AS (
+                SELECT calendar_date, grid_x, grid_y, crop_name, stage_bucket,
+                    COUNT(DISTINCT field_id)::BIGINT AS represented_field_count
+                FROM mapped
+                GROUP BY calendar_date, grid_x, grid_y, crop_name, stage_bucket
+            ), crop_stage_mode AS (
+                SELECT calendar_date, grid_x, grid_y,
+                    crop_name AS dominant_crop_name,
+                    stage_bucket AS dominant_stage_bucket
+                FROM crop_stage_counts
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY calendar_date, grid_x, grid_y
+                    ORDER BY represented_field_count DESC, crop_name, stage_bucket
+                ) = 1
+            ), aggregated AS (
+                SELECT
+                    calendar_date, grid_x, grid_y,
+                    COUNT(DISTINCT field_id)::BIGINT AS represented_field_count,
+                    COUNT(DISTINCT crop_instance_id)::BIGINT AS crop_instance_count,
+                    COUNT(DISTINCT field_id) FILTER (WHERE pressure_observed)::BIGINT
+                        AS pressure_field_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE pressure_observed AND risk_rank >= 2
+                    )::BIGINT AS elevated_pressure_field_count,
+                    MAX(risk_rank)::INTEGER AS max_risk_rank,
+                    ARG_MAX(hazard_family, risk_rank) AS dominant_hazard_family,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE crop_impact_active AND response_class IN
+                            ('medium_decline', 'severe_decline')
+                    )::BIGINT AS decline_field_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE crop_impact_active AND response_class = 'recovery'
+                    )::BIGINT AS recovery_field_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE spectral_source_date IS NOT NULL
+                    )::BIGINT AS crop_evidence_field_count,
+                    COUNT(DISTINCT field_id) FILTER (
+                        WHERE evidence_freshness = 'stale'
+                    )::BIGINT AS stale_evidence_field_count,
+                    MAX(spectral_source_date) AS newest_spectral_source_date,
+                    MAX(s2_knowledge_date) AS newest_s2_knowledge_date
+                FROM mapped
+                GROUP BY calendar_date, grid_x, grid_y
             )
             SELECT
-                calendar_date,
-                'v4:' || CAST(grid_x AS VARCHAR) || ':' || CAST(grid_y AS VARCHAR)
+                a.calendar_date,
+                'v4:' || CAST(a.grid_x AS VARCHAR) || ':' || CAST(a.grid_y AS VARCHAR)
                     AS grid_id,
-                grid_x,
-                grid_y,
-                -180.0 + grid_x * ? AS min_lon,
-                -90.0 + grid_y * ? AS min_lat,
-                -180.0 + (grid_x + 1) * ? AS max_lon,
-                -90.0 + (grid_y + 1) * ? AS max_lat,
-                COUNT(DISTINCT field_id)::BIGINT AS represented_field_count,
-                COUNT(DISTINCT crop_instance_id)::BIGINT AS crop_instance_count,
-                COUNT(DISTINCT field_id) FILTER (WHERE pressure_observed)::BIGINT
-                    AS pressure_field_count,
-                COUNT(DISTINCT field_id) FILTER (
-                    WHERE pressure_observed AND risk_rank >= 2
-                )::BIGINT AS elevated_pressure_field_count,
-                MAX(risk_rank)::INTEGER AS max_risk_rank,
-                ARG_MAX(hazard_family, risk_rank) AS dominant_hazard_family,
-                ARG_MAX(crop_name, s2_knowledge_date) AS dominant_crop_name,
-                ARG_MAX(stage_bucket, s2_knowledge_date) AS dominant_stage_bucket,
-                COUNT(DISTINCT field_id) FILTER (
-                    WHERE crop_impact_active AND response_class IN
-                        ('medium_decline', 'severe_decline')
-                )::BIGINT AS decline_field_count,
-                COUNT(DISTINCT field_id) FILTER (
-                    WHERE crop_impact_active AND response_class = 'recovery'
-                )::BIGINT AS recovery_field_count,
-                COUNT(DISTINCT field_id) FILTER (
-                    WHERE spectral_source_date IS NOT NULL
-                )::BIGINT AS crop_evidence_field_count,
-                COUNT(DISTINCT field_id) FILTER (
-                    WHERE evidence_freshness = 'stale'
-                )::BIGINT AS stale_evidence_field_count,
-                MAX(spectral_source_date) AS newest_spectral_source_date,
-                MAX(s2_knowledge_date) AS newest_s2_knowledge_date,
+                a.grid_x,
+                a.grid_y,
+                -180.0 + a.grid_x * ? AS min_lon,
+                -90.0 + a.grid_y * ? AS min_lat,
+                -180.0 + (a.grid_x + 1) * ? AS max_lon,
+                -90.0 + (a.grid_y + 1) * ? AS max_lat,
+                a.represented_field_count,
+                a.crop_instance_count,
+                a.pressure_field_count,
+                a.elevated_pressure_field_count,
+                a.max_risk_rank,
+                a.dominant_hazard_family,
+                m.dominant_crop_name,
+                m.dominant_stage_bucket,
+                a.decline_field_count,
+                a.recovery_field_count,
+                a.crop_evidence_field_count,
+                a.stale_evidence_field_count,
+                a.newest_spectral_source_date,
+                a.newest_s2_knowledge_date,
                 CAST(? AS DOUBLE) AS grid_cell_degrees,
                 CAST('complete_centroid_aggregation' AS VARCHAR) AS representation_method
-            FROM mapped
-            GROUP BY calendar_date, grid_x, grid_y
-            ORDER BY calendar_date, grid_x, grid_y
+            FROM aggregated AS a
+            JOIN crop_stage_mode AS m USING (calendar_date, grid_x, grid_y)
+            ORDER BY a.calendar_date, a.grid_x, a.grid_y
         ) TO ? (FORMAT PARQUET, COMPRESSION ZSTD)
         """,
         [
@@ -1336,6 +1737,62 @@ def _validate_outputs(
             [str(stage / OUTPUT_FILES["story_checkpoints"])],
         ).fetchone()
     )
+    (
+        lifecycle_contradictions,
+        invalid_lifecycle_contract,
+        quiet_observed_checkpoints,
+        quiet_missing_checkpoints,
+    ) = (
+        int(value or 0) for value in connection.execute(
+            """
+            SELECT
+                COUNT_IF(contradiction_count > 0),
+                COUNT_IF(
+                    schema_version <> ?
+                    OR NOT source_state_preserved
+                    OR lifecycle_state_recomputed
+                    OR component_absence_replayed
+                    OR full_lifecycle_replay_supported
+                    OR lifecycle_causal_claim_supported
+                    OR positive_claim_reconciliation_complete
+                        IS DISTINCT FROM (contradiction_count = 0)
+                ),
+                COUNT_IF(quiet_evidence_status = 'observed_quiet_for_attributed_members'),
+                COUNT_IF(quiet_evidence_status = 'missing_weather')
+            FROM read_parquet(?)
+            """,
+            [
+                LIFECYCLE_RECONCILIATION_SCHEMA_VERSION,
+                str(stage / OUTPUT_FILES["lifecycle_reconciliation"]),
+            ],
+        ).fetchone()
+    )
+    lifecycle_key_mismatch = int(
+        connection.execute(
+            """
+            WITH checkpoints AS (
+                SELECT CAST(incident_id AS VARCHAR) AS incident_id,
+                    CAST(story_week AS DATE) AS story_week
+                FROM read_parquet(?)
+            ), reconciled AS (
+                SELECT CAST(incident_id AS VARCHAR) AS incident_id,
+                    CAST(story_week AS DATE) AS story_week
+                FROM read_parquet(?)
+            )
+            SELECT
+                (SELECT COUNT(*) FROM checkpoints ANTI JOIN reconciled USING (
+                    incident_id, story_week
+                ))
+                + (SELECT COUNT(*) FROM reconciled ANTI JOIN checkpoints USING (
+                    incident_id, story_week
+                ))
+            """,
+            [
+                str(stage / OUTPUT_FILES["story_checkpoints"]),
+                str(stage / OUTPUT_FILES["lifecycle_reconciliation"]),
+            ],
+        ).fetchone()[0]
+    )
     unreconciled = int(
         connection.execute(
             """
@@ -1346,13 +1803,17 @@ def _validate_outputs(
     )
     if (
         echoed_markers or nonmarkers or future_story
-        or invalid_story_bound or unreconciled
+        or invalid_story_bound or lifecycle_contradictions
+        or invalid_lifecycle_contract or lifecycle_key_mismatch or unreconciled
     ):
         raise ValueError(
             "V4 truth contract failed: "
             f"echoed_markers={echoed_markers}, nonmarkers={nonmarkers}, "
             f"future_story={future_story}, "
             f"invalid_story_bound={invalid_story_bound}, "
+            f"lifecycle_contradictions={lifecycle_contradictions}, "
+            f"invalid_lifecycle_contract={invalid_lifecycle_contract}, "
+            f"lifecycle_key_mismatch={lifecycle_key_mismatch}, "
             f"unreconciled_days={unreconciled}"
         )
     return {
@@ -1367,6 +1828,11 @@ def _validate_outputs(
         "story_checkpoint_count": counts["story_checkpoints"],
         "story_checkpoint_raised_count": raised_story_bound,
         "story_checkpoint_incomplete_bound_count": incomplete_story_bound,
+        "lifecycle_reconciliation_count": counts["lifecycle_reconciliation"],
+        "lifecycle_reconciliation_contradiction_count": lifecycle_contradictions,
+        "lifecycle_full_replay_supported_count": 0,
+        "lifecycle_quiet_observed_checkpoint_count": quiet_observed_checkpoints,
+        "lifecycle_quiet_missing_checkpoint_count": quiet_missing_checkpoints,
         "counts": counts,
     }
 
@@ -1441,6 +1907,19 @@ def _manifest(
                 "and_applicable_s2_response_knowledge_times"
             ),
             "story_checkpoint_full_timestamp_preserved": True,
+            "lifecycle_evidence_reconciliation": (
+                "fail_closed_positive_v3_pressure_and_response_claims_against_v4_ledgers"
+            ),
+            "lifecycle_reconciliation_schema_version": (
+                LIFECYCLE_RECONCILIATION_SCHEMA_VERSION
+            ),
+            "lifecycle_state_recomputed_from_v4": False,
+            "lifecycle_causal_ownership_claimed": False,
+            "component_absence_replayed_from_v4": False,
+            "lifecycle_reconciliation_scope": (
+                "positive_claims_only_component_absence_coverage_registries_"
+                "and_policy_not_replayed"
+            ),
             "strict_checkpoint_bound_enforced": (
                 evidence_validation.get("availability_mode") == "strict"
             ),
@@ -1626,6 +2105,64 @@ def validate_viewer_directory(viewer_dir: Path) -> dict[str, Any]:
             raise ValueError(
                 "V4 viewer story checkpoint knowledge bounds are invalid"
             )
+        lifecycle_name = OUTPUT_FILES["lifecycle_reconciliation"]
+        if lifecycle_name not in verified_rows:
+            raise ValueError("V4 viewer inventory is missing lifecycle reconciliation")
+        try:
+            invalid_lifecycle, lifecycle_contradictions = connection.execute(
+                """
+                SELECT
+                    COUNT_IF(
+                        schema_version <> ?
+                        OR NOT source_state_preserved
+                        OR lifecycle_state_recomputed
+                        OR component_absence_replayed
+                        OR full_lifecycle_replay_supported
+                        OR lifecycle_causal_claim_supported
+                        OR positive_claim_reconciliation_complete
+                            IS DISTINCT FROM (contradiction_count = 0)
+                    ),
+                    COUNT_IF(contradiction_count > 0)
+                FROM read_parquet(?)
+                """,
+                [
+                    LIFECYCLE_RECONCILIATION_SCHEMA_VERSION,
+                    str(root / lifecycle_name),
+                ],
+            ).fetchone()
+            lifecycle_key_mismatch = connection.execute(
+                """
+                WITH checkpoints AS (
+                    SELECT CAST(incident_id AS VARCHAR) AS incident_id,
+                        CAST(story_week AS DATE) AS story_week
+                    FROM read_parquet(?)
+                ), reconciled AS (
+                    SELECT CAST(incident_id AS VARCHAR) AS incident_id,
+                        CAST(story_week AS DATE) AS story_week
+                    FROM read_parquet(?)
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM checkpoints ANTI JOIN reconciled USING (
+                        incident_id, story_week
+                    ))
+                    + (SELECT COUNT(*) FROM reconciled ANTI JOIN checkpoints USING (
+                        incident_id, story_week
+                    ))
+                """,
+                [str(root / checkpoint_name), str(root / lifecycle_name)],
+            ).fetchone()[0]
+        except duckdb.Error as exc:
+            raise ValueError(
+                "V4 viewer lifecycle reconciliation schema is invalid"
+            ) from exc
+        if (
+            int(invalid_lifecycle or 0)
+            or int(lifecycle_contradictions or 0)
+            or int(lifecycle_key_mismatch or 0)
+        ):
+            raise ValueError(
+                "V4 viewer lifecycle evidence reconciliation is invalid"
+            )
 
     outputs = manifest.get("outputs") or {}
     counts = (manifest.get("validation") or {}).get("counts") or {}
@@ -1644,6 +2181,15 @@ def validate_viewer_directory(viewer_dir: Path) -> dict[str, Any]:
     ).hexdigest()
     if content_sha != str((manifest.get("source") or {}).get("bundle_content_sha256") or ""):
         raise ValueError("V4 viewer bundle content hash does not match its inventory")
+    semantics = manifest.get("semantics") or {}
+    if (
+        semantics.get("lifecycle_reconciliation_schema_version")
+        != LIFECYCLE_RECONCILIATION_SCHEMA_VERSION
+        or semantics.get("lifecycle_state_recomputed_from_v4") is not False
+        or semantics.get("lifecycle_causal_ownership_claimed") is not False
+        or semantics.get("component_absence_replayed_from_v4") is not False
+    ):
+        raise ValueError("V4 viewer lifecycle reconciliation semantics are invalid")
     return {
         "status": "valid",
         "schema_version": SCHEMA_VERSION,
