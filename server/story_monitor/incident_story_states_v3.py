@@ -584,10 +584,43 @@ def finalize_crop_story_artifacts(
         owned_followup_by_key: dict[
             tuple[str, tuple[str, str, str]], dict[str, Any]
         ] = {}
+        direct_owners = _direct_claim_owner_lookup(
+            week, runtimes, current_by_base
+        )
+        unresolved_owners = _unresolved_owner_lookup(runtimes)
+        recovered_owners = _recovered_owner_lookup(runtimes)
+        seed_owners = _active_seed_owner_lookup(runtimes)
         for row in followup_by_week.get(week, followup.iloc[0:0]).to_dict("records"):
+            if not bool(row.get("fresh_decline_evidence")) and not bool(
+                row.get("fresh_recovery_evidence")
+            ):
+                continue
             source = str(row["incident_id"])
             evidence_key = _evidence_key(row)
-            owner = redirects.get((source, evidence_key), source)
+            owner_key = (str(row.get("hazard_family") or ""), evidence_key)
+            owner = (
+                direct_owners.get(owner_key)
+                or unresolved_owners.get(owner_key)
+                or recovered_owners.get(owner_key)
+                or redirects.get((source, evidence_key))
+            )
+            if owner is None:
+                candidates = sorted(seed_owners.get(owner_key, set()))
+                if len(candidates) > 1:
+                    raise ValueError(
+                        "Follow-up evidence has ambiguous active story seeds: "
+                        f"week={week.date()}, hazard={owner_key[0]}, "
+                        f"evidence={evidence_key}, owners={','.join(candidates)}"
+                    )
+                owner = candidates[0] if candidates else None
+            if owner is None:
+                continue
+            if owner != source:
+                # Persist the causal owner through a recovery observation.  A
+                # recovery removes the key from ``unresolved`` below, so a
+                # later relapse must still return to this story rather than
+                # the historical source that happened to seed the follow-up.
+                redirects[(source, evidence_key)] = owner
             runtime = runtimes.get(owner)
             if (
                 runtime is None
@@ -626,6 +659,7 @@ def finalize_crop_story_artifacts(
                 current_followup,
             )
             _assert_unique_unresolved_owners(runtimes)
+            _recovered_owner_lookup(runtimes)
 
             unresolved_field_count = _registry_field_count(runtime["unresolved"])
             recovered_field_count = _evidence_field_count(runtime["recovered"])
@@ -1329,23 +1363,66 @@ def _unresolved_owner_lookup(
     return owners
 
 
-def _reconcile_direct_unresolved_claims(
+def _recovered_owner_lookup(
+    runtimes: Mapping[str, Mapping[str, Any]],
+) -> dict[tuple[str, tuple[str, str, str]], str]:
+    unresolved = _unresolved_owner_lookup(runtimes)
+    owner_sets = _recovered_owner_sets(runtimes)
+    owners: dict[tuple[str, tuple[str, str, str]], str] = {}
+    for owner_key, values in sorted(owner_sets.items()):
+        recovered = sorted(values)
+        if len(recovered) > 1:
+            hazard, evidence_key = owner_key
+            raise ValueError(
+                "Recovered episode has multiple active crop-story owners: "
+                f"hazard={hazard}, evidence={evidence_key}, "
+                f"owners={','.join(recovered)}"
+            )
+        recovered_owner = recovered[0]
+        unresolved_owner = unresolved.get(owner_key)
+        if unresolved_owner is not None:
+            hazard, evidence_key = owner_key
+            raise ValueError(
+                "Episode has conflicting unresolved and recovered owners: "
+                f"hazard={hazard}, evidence={evidence_key}, "
+                f"unresolved_owner={unresolved_owner}, "
+                f"recovered_owner={recovered_owner}"
+            )
+        owners[owner_key] = recovered_owner
+    return owners
+
+
+def _recovered_owner_sets(
+    runtimes: Mapping[str, Mapping[str, Any]],
+) -> dict[tuple[str, tuple[str, str, str]], set[str]]:
+    owners: dict[tuple[str, tuple[str, str, str]], set[str]] = defaultdict(set)
+    for base, runtime in runtimes.items():
+        if runtime.get("incident_id") is None:
+            continue
+        hazard = str(runtime.get("hazard") or "")
+        for evidence_key in runtime.get("recovered", set()):
+            owners[(hazard, evidence_key)].add(base)
+    return owners
+
+
+def _active_seed_owner_lookup(
+    runtimes: Mapping[str, Mapping[str, Any]],
+) -> dict[tuple[str, tuple[str, str, str]], set[str]]:
+    owners: dict[tuple[str, tuple[str, str, str]], set[str]] = defaultdict(set)
+    for base, runtime in runtimes.items():
+        if runtime.get("incident_id") is None:
+            continue
+        hazard = str(runtime.get("hazard") or "")
+        for evidence_key in runtime.get("seed_keys", set()):
+            owners[(hazard, evidence_key)].add(base)
+    return owners
+
+
+def _direct_claim_owner_lookup(
     week: pd.Timestamp,
-    runtimes: dict[str, dict[str, Any]],
+    runtimes: Mapping[str, Mapping[str, Any]],
     current_by_base: Mapping[str, pd.DataFrame],
-    redirects: dict[tuple[str, tuple[str, str, str]], str],
-    lineage_edges: pd.DataFrame,
-) -> None:
-    """Move stale carried ownership to the one admitted current claimant."""
-    owners = _unresolved_owner_lookup(runtimes)
-    outgoing_merge_parents: set[str] = set()
-    if not lineage_edges.empty:
-        outgoing_merge_parents = set(
-            lineage_edges.loc[
-                lineage_edges["lineage_type"].astype(str).str.lower().eq("merge"),
-                "parent_incident_id",
-            ].astype(str)
-        )
+) -> dict[tuple[str, tuple[str, str, str]], str]:
     claimants: dict[
         tuple[str, tuple[str, str, str]], set[str]
     ] = defaultdict(set)
@@ -1357,9 +1434,9 @@ def _reconcile_direct_unresolved_claims(
         for row in current_by_base[base].to_dict("records"):
             if _row_claims_unresolved_ownership(row):
                 claimants[(hazard, _evidence_key(row))].add(base)
-
-    for owner_key in sorted(claimants):
-        direct = sorted(claimants[owner_key])
+    owners: dict[tuple[str, tuple[str, str, str]], str] = {}
+    for owner_key, values in sorted(claimants.items()):
+        direct = sorted(values)
         if len(direct) > 1:
             hazard, evidence_key = owner_key
             raise ValueError(
@@ -1367,7 +1444,30 @@ def _reconcile_direct_unresolved_claims(
                 f"week={pd.Timestamp(week).date()}, hazard={hazard}, "
                 f"evidence={evidence_key}, claimants={','.join(direct)}"
             )
-        current_owner = direct[0]
+        owners[owner_key] = direct[0]
+    return owners
+
+
+def _reconcile_direct_unresolved_claims(
+    week: pd.Timestamp,
+    runtimes: dict[str, dict[str, Any]],
+    current_by_base: Mapping[str, pd.DataFrame],
+    redirects: dict[tuple[str, tuple[str, str, str]], str],
+    lineage_edges: pd.DataFrame,
+) -> None:
+    """Move stale carried ownership to the one admitted current claimant."""
+    owners = _unresolved_owner_lookup(runtimes)
+    recovered_owner_sets = _recovered_owner_sets(runtimes)
+    outgoing_merge_parents: set[str] = set()
+    if not lineage_edges.empty:
+        outgoing_merge_parents = set(
+            lineage_edges.loc[
+                lineage_edges["lineage_type"].astype(str).str.lower().eq("merge"),
+                "parent_incident_id",
+            ].astype(str)
+        )
+    direct_owners = _direct_claim_owner_lookup(week, runtimes, current_by_base)
+    for owner_key, current_owner in sorted(direct_owners.items()):
         if current_owner in outgoing_merge_parents:
             hazard, evidence_key = owner_key
             raise ValueError(
@@ -1375,31 +1475,34 @@ def _reconcile_direct_unresolved_claims(
                 f"week={pd.Timestamp(week).date()}, hazard={hazard}, "
                 f"evidence={evidence_key}, claimant={current_owner}"
             )
-        previous_owner = owners.get(owner_key)
-        if previous_owner is None or previous_owner == current_owner:
-            continue
 
+    for owner_key, current_owner in sorted(direct_owners.items()):
+        previous_owner = owners.get(owner_key)
         evidence_key = owner_key[1]
-        previous_runtime = runtimes[previous_owner]
         current_runtime = runtimes[current_owner]
-        if evidence_key in current_runtime["unresolved"]:
-            raise ValueError(
-                "Direct unresolved claimant already owns a duplicate registry entry: "
-                f"week={pd.Timestamp(week).date()}, evidence={evidence_key}, "
-                f"owners={previous_owner},{current_owner}"
-            )
-        evidence = previous_runtime["unresolved"].pop(evidence_key)
-        previous_runtime["recovered"].discard(evidence_key)
-        previous_runtime["seed_keys"].discard(evidence_key)
-        current_runtime["unresolved"][evidence_key] = evidence
+        stale_owners = set(recovered_owner_sets.get(owner_key, set()))
+        if previous_owner is not None:
+            stale_owners.add(previous_owner)
+        stale_owners.discard(current_owner)
+
+        if previous_owner is not None and previous_owner != current_owner:
+            previous_runtime = runtimes[previous_owner]
+            evidence = previous_runtime["unresolved"].pop(evidence_key)
+            previous_runtime["seed_keys"].discard(evidence_key)
+            current_runtime["unresolved"][evidence_key] = evidence
+        for stale_owner in stale_owners:
+            runtimes[stale_owner]["recovered"].discard(evidence_key)
+            runtimes[stale_owner]["seed_keys"].discard(evidence_key)
         current_runtime["recovered"].discard(evidence_key)
         current_runtime["seed_keys"].add(evidence_key)
         for origin_key, owner in list(redirects.items()):
-            if origin_key[1] == evidence_key and owner == previous_owner:
+            if origin_key[1] == evidence_key:
                 redirects[origin_key] = current_owner
-        redirects[(previous_owner, evidence_key)] = current_owner
+        for stale_owner in stale_owners:
+            redirects[(stale_owner, evidence_key)] = current_owner
 
     _assert_unique_unresolved_owners(runtimes)
+    _recovered_owner_lookup(runtimes)
 
 
 def _apply_impact_registry(

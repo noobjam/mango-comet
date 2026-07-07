@@ -8,6 +8,7 @@ import unittest
 import pandas as pd
 
 from story_monitor.incident_story_states_v3 import (
+    _reconcile_direct_unresolved_claims,
     build_crop_story_artifacts,
     build_crop_story_scaffold,
     build_incident_followup_evidence,
@@ -705,6 +706,251 @@ class IncidentStoryStatesV3Tests(unittest.TestCase):
         ]
         self.assertEqual(set(ownership["incident_id"]), {fixture["old_incident"]})
 
+    def test_nonowner_followup_routes_to_registered_owner_and_persists(self) -> None:
+        fixture = _unresolved_ownership_fixture("watch")
+        weeks = fixture["weeks"]
+        old_incident = fixture["old_incident"]
+        new_incident = fixture["new_incident"]
+        common = {
+            "field_id": "field-shared",
+            "crop_instance_id": "crop-shared",
+            "episode_id": "episode-shared",
+            "hazard_family": "heat",
+            "event_state": "RECOVERING",
+            "stage_bucket": "flowering",
+        }
+        duplicate_decline = pd.DataFrame(
+            [
+                {
+                    **common,
+                    "timeline_bucket": weeks[2],
+                    "incident_id": source,
+                    "response_class": "medium_decline",
+                    "knowledge_time": weeks[2],
+                    "fresh_decline_evidence": True,
+                    "fresh_recovery_evidence": False,
+                }
+                for source in (old_incident, new_incident)
+            ]
+        )
+        no_op_followup = duplicate_decline.assign(
+            response_class="no_new_event_response",
+            fresh_decline_evidence=False,
+        )
+        without_followup = finalize_crop_story_artifacts(
+            fixture["scaffold"],
+            fixture["summary"],
+            fixture["config"],
+            weekly_cells=fixture["cells"],
+        )
+        with_no_op_followup = finalize_crop_story_artifacts(
+            fixture["scaffold"],
+            fixture["summary"],
+            fixture["config"],
+            followup_evidence=no_op_followup,
+            weekly_cells=fixture["cells"],
+        )
+        pd.testing.assert_frame_equal(
+            without_followup.weekly_state,
+            with_no_op_followup.weekly_state,
+        )
+        pd.testing.assert_frame_equal(
+            without_followup.memberships,
+            with_no_op_followup.memberships,
+        )
+        result = finalize_crop_story_artifacts(
+            fixture["scaffold"],
+            fixture["summary"],
+            fixture["config"],
+            followup_evidence=duplicate_decline,
+            weekly_cells=fixture["cells"],
+        )
+        edge = result.weekly_state[
+            result.weekly_state["timeline_bucket"].eq(weeks[2])
+        ].set_index("base_incident_id")
+        self.assertEqual(
+            edge.loc[old_incident, "unresolved_carried_field_count"], 1
+        )
+        self.assertEqual(
+            edge.loc[new_incident, "unresolved_carried_field_count"], 0
+        )
+        ownership = result.memberships[
+            result.memberships["timeline_bucket"].eq(weeks[2])
+            & result.memberships["episode_id"].eq("episode-shared")
+            & result.memberships["membership_role"].eq("unresolved")
+        ]
+        self.assertEqual(len(ownership), 1)
+        self.assertEqual(ownership.iloc[0]["incident_id"], old_incident)
+
+        recovery_then_relapse = pd.DataFrame(
+            [
+                {
+                    **common,
+                    "timeline_bucket": weeks[2],
+                    "incident_id": new_incident,
+                    "response_class": "recovery",
+                    "knowledge_time": weeks[2],
+                    "fresh_decline_evidence": False,
+                    "fresh_recovery_evidence": True,
+                },
+                {
+                    **common,
+                    "timeline_bucket": weeks[3],
+                    "incident_id": new_incident,
+                    "response_class": "medium_decline",
+                    "knowledge_time": weeks[3],
+                    "fresh_decline_evidence": True,
+                    "fresh_recovery_evidence": False,
+                },
+            ]
+        )
+        persisted = finalize_crop_story_artifacts(
+            fixture["scaffold"],
+            fixture["summary"],
+            fixture["config"],
+            followup_evidence=recovery_then_relapse,
+            weekly_cells=fixture["cells"],
+        )
+        relapse_edge = persisted.weekly_state[
+            persisted.weekly_state["timeline_bucket"].eq(weeks[3])
+        ].set_index("base_incident_id")
+        self.assertEqual(
+            relapse_edge.loc[old_incident, "unresolved_carried_field_count"], 1
+        )
+        self.assertEqual(
+            relapse_edge.loc[new_incident, "unresolved_carried_field_count"], 0
+        )
+
+    def test_direct_claim_supersedes_recovered_owner(self) -> None:
+        fixture = _unresolved_ownership_fixture("watch")
+        weeks = fixture["weeks"]
+        old_incident = fixture["old_incident"]
+        new_incident = fixture["new_incident"]
+        scaffold = fixture["scaffold"]
+        direct = scaffold.memberships[
+            scaffold.memberships["incident_id"].eq(new_incident)
+            & scaffold.memberships["episode_id"].eq("episode-shared")
+        ].iloc[0].to_dict()
+        direct.update(
+            {
+                "timeline_bucket": weeks[3],
+                "membership_role": "impact_lag",
+                "event_state": "RECOVERING",
+                "response_class": "medium_decline",
+                "fresh_response_evidence": True,
+                "knowledge_time": weeks[3],
+            }
+        )
+        direct_scaffold = type(scaffold)(
+            catalog=scaffold.catalog,
+            weekly_state=scaffold.weekly_state,
+            memberships=pd.concat(
+                [scaffold.memberships, pd.DataFrame([direct])],
+                ignore_index=True,
+            ),
+        )
+        recovery = pd.DataFrame(
+            [
+                {
+                    "timeline_bucket": weeks[2],
+                    "incident_id": new_incident,
+                    "field_id": "field-shared",
+                    "crop_instance_id": "crop-shared",
+                    "episode_id": "episode-shared",
+                    "hazard_family": "heat",
+                    "event_state": "RECOVERING",
+                    "response_class": "recovery",
+                    "stage_bucket": "flowering",
+                    "knowledge_time": weeks[2],
+                    "fresh_decline_evidence": False,
+                    "fresh_recovery_evidence": True,
+                }
+            ]
+        )
+        result = finalize_crop_story_artifacts(
+            direct_scaffold,
+            fixture["summary"],
+            fixture["config"],
+            followup_evidence=recovery,
+            weekly_cells=fixture["cells"],
+        )
+        edge = result.weekly_state[
+            result.weekly_state["timeline_bucket"].eq(weeks[3])
+        ].set_index("base_incident_id")
+        self.assertEqual(
+            edge.loc[old_incident, "unresolved_carried_field_count"], 0
+        )
+        self.assertEqual(
+            edge.loc[new_incident, "unresolved_carried_field_count"], 1
+        )
+
+    def test_cross_state_owners_without_direct_claim_fail_closed(self) -> None:
+        fixture = _unresolved_ownership_fixture("watch")
+        scaffold = fixture["scaffold"]
+        memberships = scaffold.memberships.copy()
+        mask = (
+            memberships["incident_id"].eq(fixture["new_incident"])
+            & memberships["episode_id"].eq("episode-shared")
+        )
+        memberships.loc[mask, "response_class"] = "recovery"
+        memberships.loc[mask, "fresh_response_evidence"] = True
+        conflicting = type(scaffold)(
+            catalog=scaffold.catalog,
+            weekly_state=scaffold.weekly_state,
+            memberships=memberships,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "conflicting unresolved and recovered owners"
+        ):
+            finalize_crop_story_artifacts(
+                conflicting,
+                fixture["summary"],
+                fixture["config"],
+                weekly_cells=fixture["cells"],
+            )
+
+    def test_direct_claim_cleans_multiple_stale_recovered_markers(self) -> None:
+        evidence_key = ("field", "crop", "episode")
+        runtimes = {
+            base: {
+                "incident_id": base,
+                "hazard": "heat",
+                "unresolved": {},
+                "recovered": ({evidence_key} if base in {"A", "B"} else set()),
+                "seed_keys": {evidence_key},
+            }
+            for base in ("A", "B", "C")
+        }
+        current = {
+            "C": pd.DataFrame(
+                [
+                    {
+                        "field_id": "field",
+                        "crop_instance_id": "crop",
+                        "episode_id": "episode",
+                        "membership_role": "impact_lag",
+                        "event_state": "RECOVERING",
+                        "response_class": "medium_decline",
+                        "fresh_response_evidence": True,
+                    }
+                ]
+            )
+        }
+        redirects = {
+            ("origin-a", evidence_key): "A",
+            ("origin-b", evidence_key): "B",
+        }
+        _reconcile_direct_unresolved_claims(
+            pd.Timestamp("2026-01-12"),
+            runtimes,
+            current,
+            redirects,
+            pd.DataFrame(),
+        )
+        self.assertNotIn(evidence_key, runtimes["A"]["recovered"])
+        self.assertNotIn(evidence_key, runtimes["B"]["recovered"])
+        self.assertTrue(all(owner == "C" for owner in redirects.values()))
+
     def test_unobservable_carried_impact_cell_freezes_lifecycle_coverage(self) -> None:
         weeks = pd.to_datetime(["2026-01-05", "2026-01-12"])
         assignments = pd.DataFrame(
@@ -1336,7 +1582,7 @@ def _coverage_summary(
 
 
 def _unresolved_ownership_fixture(mode: str) -> dict[str, object]:
-    weeks = pd.date_range("2026-01-05", periods=2, freq="7D")
+    weeks = pd.date_range("2026-01-05", periods=4, freq="7D")
     old_assignment = {
         "timeline_bucket": weeks[0],
         "hazard_family": "heat",
@@ -1465,7 +1711,8 @@ def _unresolved_ownership_fixture(mode: str) -> dict[str, object]:
     config = {
         "policy_version": "test",
         "minimum_evaluable_fields": 1,
-        "confirmation_observed_weeks": 2,
+        "confirmation_observed_weeks": 1,
+        "quiet_close_weeks": 4,
     }
     scaffold = build_crop_story_scaffold(
         exposure, assignments, memberships, cells, config

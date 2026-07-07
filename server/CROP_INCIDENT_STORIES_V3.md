@@ -210,7 +210,11 @@ This moves only the episode registry, recovery state, and follow-up routing; it
 does not merge or rename either crop-impact story. A plain `WATCH` row without
 fresh attributed decline cannot take ownership. Multiple direct current
 claimants remain an ambiguity and fail closed. A terminal story clears its
-registry before any recurrence.
+registry before any recurrence. Exact follow-up evidence is routed in causal
+ownership order: a unique current direct claim, then an active unresolved
+owner, then an active recovered owner, then an existing redirect, and finally
+a unique active seed. Ambiguous seed-only ownership fails closed; follow-up
+source order never chooses the owner.
 
 ## 7. Story clustering paradigm
 
