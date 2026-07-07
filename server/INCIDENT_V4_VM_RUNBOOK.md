@@ -179,6 +179,24 @@ nohup "$PYTHON" server/run_incident_v4.py resume \
 echo "$!" | tee "$JOB_DIR/resume.pid"
 ```
 
+After that exact same-tag V4 job reaches status `0`, continue the failed outer
+wrapper without creating a new tag or rebuilding V3, the enriched source, or
+V4 evidence:
+
+```bash
+test "$(cat "$JOB_DIR/status")" = "0"
+server/vm_story_pipeline.sh continue .env.vm
+server/vm_story_pipeline.sh logs .env.vm
+# In another shell:
+server/vm_story_pipeline.sh status .env.vm
+```
+
+`continue` fails closed unless the latest outer pipeline is failed, its exact
+same-tag V4 state is complete and matches `.env.vm`, the configured V3 release
+is still compatible, and no downstream server/benchmark/motif artifact already
+exists. It reuses the original tag and only validates the immutable release,
+starts the map server, benchmarks it, and optionally enters motif discovery.
+
 Never delete an incomplete output just to reuse its job tag. Read the exact
 stage `*.stderr.log`; a generated source without its complete immutable
 manifest intentionally blocks resume.

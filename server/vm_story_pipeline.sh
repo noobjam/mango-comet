@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REQUIRED_COMMIT=9b0ac54d33908bc594b8a9279ec29f178e13115a
+REQUIRED_COMMIT=1ac6e4b534fbf84bd11207663df9ea26168547a4
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DEFAULT_REPO=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
@@ -9,6 +9,7 @@ usage() {
   cat <<'EOF'
 Usage:
   server/vm_story_pipeline.sh launch [ENV_FILE]
+  server/vm_story_pipeline.sh continue [ENV_FILE]
   server/vm_story_pipeline.sh status [ENV_FILE]
   server/vm_story_pipeline.sh logs [ENV_FILE]
   server/vm_story_pipeline.sh check-node [ENV_FILE]
@@ -21,6 +22,11 @@ launch starts one detached, logged pipeline that:
   3. writes server/.env, starts the map server, and waits for health;
   4. runs the cold/warm/concurrent timeline benchmark;
   5. optionally runs GPU motif discovery and stops at the mandatory review gate.
+
+continue is a fail-closed recovery path for the latest outer pipeline only. It
+requires that the same-tag Incident V4 runner was resumed separately and is
+complete, then runs validation, server startup, and benchmarking without
+building V3, preparing a source, or rebuilding V4 evidence.
 
 The default ENV_FILE is REPO/.env.vm. It is gitignored.
 EOF
@@ -295,6 +301,100 @@ print(json.dumps(result, indent=2, sort_keys=True))
 ' "$viewer_dir"
 }
 
+validate_evidence() {
+  local evidence_dir=$1
+  PYTHONPATH=server "$PYTHON" -c '
+import json,sys
+from pathlib import Path
+from story_monitor.incident_validation_v4 import validate_evidence_directory
+print(json.dumps(validate_evidence_directory(Path(sys.argv[1])), indent=2, sort_keys=True))
+' "$evidence_dir"
+}
+
+prepare_completed_v4_continuation() {
+  local tag=$1
+  local base job_dir state status prior_pid artifact
+  base=$(pipeline_base "$tag")
+  [[ -s "${base}.status" ]] || fail "pipeline $tag has no terminal status"
+  status=$(tr -d '\r\n' < "${base}.status")
+  [[ "$status" != 0 ]] || fail "pipeline $tag is already complete"
+  [[ "$(tr -d '\r\n' < "${base}.phase" 2>/dev/null || true)" == FAILED ]] || \
+    fail "pipeline $tag is not in FAILED phase"
+  prior_pid=$(tr -dc '0-9' < "${base}.pid" 2>/dev/null || true)
+  if [[ -n "$prior_pid" && "$prior_pid" != "$$" ]] \
+      && kill -0 "$prior_pid" 2>/dev/null; then
+    fail "pipeline $tag is still running as PID $prior_pid"
+  fi
+  for artifact in \
+    "$ROOT/logs/incident_v4_server_${tag}.pid" \
+    "$ROOT/logs/incident_v4_server_${tag}.log" \
+    "$ROOT/logs/incident_v4_benchmark_${tag}.json" \
+    "$ROOT/models/incident_motif_v4_discovery_${tag}" \
+    "$ROOT/logs/incident_motif_v4_discovery_${tag}.json"; do
+    [[ ! -e "$artifact" ]] || \
+      fail "pipeline $tag already has a downstream artifact: $artifact"
+  done
+
+  resolve_compatible_v3_incident_dir || \
+    fail "the V3 incident release used by pipeline $tag is no longer compatible"
+  job_dir="$ROOT/jobs/incident_v4_${tag}"
+  state="$job_dir/state.json"
+  [[ -f "$state" ]] || fail "same-tag V4 state is missing: $state"
+  [[ -s "$job_dir/status" ]] || fail "same-tag V4 status is missing: $job_dir/status"
+  [[ "$(tr -d '\r\n' < "$job_dir/status")" == 0 ]] || \
+    fail "same-tag V4 job is not complete: $job_dir"
+
+  "$PYTHON" -c '
+import json,sys
+from pathlib import Path
+
+state_path, tag = Path(sys.argv[1]), sys.argv[2]
+expected = {
+    "root": Path(sys.argv[3]).resolve(),
+    "repo": Path(sys.argv[4]).resolve(),
+    "generation": Path(sys.argv[5]).resolve(),
+    "incident": Path(sys.argv[6]).resolve(),
+}
+availability, first_release = sys.argv[7], sys.argv[8].lower() == "true"
+previous = None if sys.argv[9] == "" else Path(sys.argv[9]).resolve()
+state = json.loads(state_path.read_text())
+config, paths = state.get("config") or {}, state.get("paths") or {}
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(f"continuation refused: {message}")
+
+root = expected["root"]
+job = root / "jobs" / f"incident_v4_{tag}"
+evidence = root / "releases" / f"incident_evidence_v4_{tag}"
+viewer = root / "releases" / f"incident_viewer_v4_{tag}"
+require(state.get("schema_version") == "incident-v4-runner/1", "runner schema mismatch")
+require(str(state.get("job_tag")) == tag, "job tag mismatch")
+require(state.get("status") == "complete", "runner state is not complete")
+require(state.get("current_stage") == "complete", "runner stage is not complete")
+require(int(state.get("exit_code", -1)) == 0, "runner exit code is not zero")
+require(Path(paths.get("job_dir", "")).resolve() == job, "job path mismatch")
+require(Path(paths.get("evidence_dir", "")).resolve() == evidence, "evidence path mismatch")
+require(Path(paths.get("viewer_dir", "")).resolve() == viewer, "viewer path mismatch")
+require(Path(config.get("root", "")).resolve() == expected["root"], "ROOT mismatch")
+require(Path(config.get("repo_dir", "")).resolve() == expected["repo"], "REPO mismatch")
+require(Path(config.get("generation_dir", "")).resolve() == expected["generation"], "GEN mismatch")
+require(Path(config.get("incident_dir", "")).resolve() == expected["incident"], "V3 incident mismatch")
+require(config.get("availability_mode") == availability, "availability mode mismatch")
+require(bool(config.get("first_release")) == first_release, "release mode mismatch")
+configured_previous = config.get("previous_evidence_dir")
+actual_previous = None if not configured_previous else Path(configured_previous).resolve()
+require(actual_previous == previous, "previous evidence mismatch")
+for stage in ("python_tests", "ui_tests", "ui_syntax", "source_preparation", "evidence", "export", "smoke"):
+    require((state.get("stages") or {}).get(stage, {}).get("status") == "complete", f"stage {stage} is incomplete")
+' "$state" "$tag" "$ROOT" "$REPO" "$GEN" "$INCIDENT_DIR" \
+    "$AVAILABILITY_MODE" "$V4_FIRST_RELEASE" "${PREVIOUS_EVIDENCE_DIR:-}" || \
+    fail "same-tag V4 job does not match the configured pipeline"
+
+  EVIDENCE_DIR=$(json_value "$state" paths.evidence_dir)
+  VIEWER_DIR=$(json_value "$state" paths.viewer_dir)
+}
+
 start_server_and_benchmark() {
   local viewer_dir=$1
   write_server_env "$viewer_dir"
@@ -382,6 +482,32 @@ run_motif_discovery() {
     "$ROOT/logs/latest_incident_motif_v4_discovery.txt"
 }
 
+run_downstream_from_completed_v4() {
+  local evidence_dir=$1
+  local viewer_dir=$2
+  phase VALIDATE_V4_2
+  validate_evidence "$evidence_dir"
+  validate_viewer "$viewer_dir"
+
+  phase START_SERVER_AND_BENCHMARK
+  start_server_and_benchmark "$viewer_dir"
+
+  if [[ "${RUN_MOTIF_DISCOVERY,,}" == true ]]; then
+    phase GPU_MOTIF_DISCOVERY
+    run_motif_discovery "$evidence_dir" "$viewer_dir"
+    phase AWAITING_MANDATORY_MOTIF_REVIEW
+    printf '%s INFO review_template=%s/review_overlay_template.parquet\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$DISCOVERY_DIR"
+  else
+    phase COMPLETE_MAP_READY
+  fi
+
+  printf '%s INFO viewer_dir=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$viewer_dir"
+  printf '%s INFO server=http://%s:%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MAP_HOST" "$MAP_PORT"
+  printf '%s INFO benchmark=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BENCHMARK_JSON"
+}
+
 run_pipeline() {
   local env_file=$1
   PIPELINE_TAG=$2
@@ -437,27 +563,34 @@ run_pipeline() {
     fail "V4 runner did not succeed: $job_dir"
   EVIDENCE_DIR=$(json_value "$job_dir/state.json" paths.evidence_dir)
   VIEWER_DIR=$(json_value "$job_dir/state.json" paths.viewer_dir)
+  run_downstream_from_completed_v4 "$EVIDENCE_DIR" "$VIEWER_DIR"
+}
 
-  phase VALIDATE_V4_2
-  validate_viewer "$VIEWER_DIR"
+continue_pipeline() {
+  local env_file=$1
+  PIPELINE_TAG=$2
+  PIPELINE_BASE=$(pipeline_base "$PIPELINE_TAG")
+  finish_status() {
+    local code=$?
+    local temporary="${PIPELINE_BASE}.status.tmp.$$"
+    if [[ "$code" != 0 ]]; then
+      phase FAILED || true
+    fi
+    printf '%s\n' "$code" > "$temporary"
+    mv "$temporary" "${PIPELINE_BASE}.status"
+  }
+  trap finish_status EXIT
+  exec 9> "$ROOT/logs/vm_story_pipeline.lock"
+  flock -n 9 || fail "another VM story pipeline is already running"
 
-  phase START_SERVER_AND_BENCHMARK
-  start_server_and_benchmark "$VIEWER_DIR"
-
-  if [[ "${RUN_MOTIF_DISCOVERY,,}" == true ]]; then
-    phase GPU_MOTIF_DISCOVERY
-    run_motif_discovery "$EVIDENCE_DIR" "$VIEWER_DIR"
-    phase AWAITING_MANDATORY_MOTIF_REVIEW
-    printf '%s INFO review_template=%s/review_overlay_template.parquet\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$DISCOVERY_DIR"
-  else
-    phase COMPLETE_MAP_READY
-  fi
-
-  printf '%s INFO viewer_dir=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$VIEWER_DIR"
-  printf '%s INFO server=http://%s:%s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MAP_HOST" "$MAP_PORT"
-  printf '%s INFO benchmark=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BENCHMARK_JSON"
+  preflight
+  prepare_completed_v4_continuation "$PIPELINE_TAG"
+  mv "${PIPELINE_BASE}.status" \
+    "${PIPELINE_BASE}.status.before-continue.$(date -u +%Y%m%dT%H%M%SZ)"
+  phase CONTINUE_PREFLIGHT
+  printf '%s INFO continuing_same_tag_v4=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$ROOT/jobs/incident_v4_${PIPELINE_TAG}"
+  run_downstream_from_completed_v4 "$EVIDENCE_DIR" "$VIEWER_DIR"
 }
 
 show_status() {
@@ -521,9 +654,27 @@ case "$command" in
     mv "$pointer_tmp" "$ROOT/logs/latest_vm_story_pipeline.txt"
     printf 'Pipeline started.\nPID=%s\nLOG=%s.log\n' "$pipeline_pid" "$base"
     ;;
+  continue)
+    preflight
+    exec 8> "$ROOT/logs/vm_story_pipeline_launch.lock"
+    flock -n 8 || fail "another pipeline launch is being prepared"
+    tag=$(latest_tag)
+    prepare_completed_v4_continuation "$tag"
+    base=$(pipeline_base "$tag")
+    nohup "$0" __continue "$env_file" "$tag" \
+      >> "${base}.log" 2>&1 < /dev/null &
+    pipeline_pid=$!
+    printf '%s\n' "$pipeline_pid" > "${base}.pid"
+    printf 'Pipeline continuation started.\nTAG=%s\nPID=%s\nLOG=%s.log\n' \
+      "$tag" "$pipeline_pid" "$base"
+    ;;
   __run)
     [[ $# -eq 3 ]] || fail "invalid internal pipeline invocation"
     run_pipeline "$2" "$3"
+    ;;
+  __continue)
+    [[ $# -eq 3 ]] || fail "invalid internal pipeline continuation"
+    continue_pipeline "$2" "$3"
     ;;
   status)
     require_value ROOT

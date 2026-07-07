@@ -25,7 +25,25 @@ class VmStoryPipelineTests(unittest.TestCase):
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         self.assertIn("launch starts one detached, logged pipeline", help_result.stdout)
         self.assertIn("mandatory review gate", help_result.stdout)
+        self.assertIn("continue [ENV_FILE]", help_result.stdout)
+        self.assertIn("without\nbuilding V3", help_result.stdout)
         self.assertIn("--capture-stage9-replay", SCRIPT.read_text(encoding="utf-8"))
+
+    def test_continue_path_cannot_reach_v3_source_or_evidence_builds(self) -> None:
+        script = SCRIPT.read_text(encoding="utf-8")
+        continuation = script.split("continue_pipeline() {", 1)[1].split(
+            "show_status() {", 1
+        )[0]
+        self.assertIn("prepare_completed_v4_continuation", continuation)
+        self.assertIn("run_downstream_from_completed_v4", continuation)
+        self.assertNotIn("ensure_v3_incident_dir", continuation)
+        self.assertNotIn("run_incident_v4.py", continuation)
+        self.assertNotIn("prepare_incident_source_v4.py", continuation)
+        self.assertNotIn("build-evidence-v4", continuation)
+        self.assertIn(
+            "REQUIRED_COMMIT=1ac6e4b534fbf84bd11207663df9ea26168547a4",
+            script,
+        )
 
     def test_missing_env_fails_before_any_pipeline_action(self) -> None:
         result = subprocess.run(
