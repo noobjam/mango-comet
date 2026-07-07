@@ -5,6 +5,29 @@ source, keeps daily weather and irregular Sentinel-2 on separate evidence
 clocks, projects the immutable weekly V3 story spine onto a daily playhead,
 exports the map bundle, verifies it, and measures real latency.
 
+## Recommended one-command launcher
+
+For this VM, prefer `server/vm_story_pipeline.sh`. It reads the gitignored
+`REPO/.env.vm`, resolves the latest successful V3 incident directory, builds a
+matching V3 story spine when none exists, builds a fresh V4/2 release, validates
+it, writes the generated `server/.env`, starts the viewer, runs the latency
+benchmark, and optionally runs GPU motif discovery.
+It deliberately stops at `AWAITING_MANDATORY_MOTIF_REVIEW`: expert review and
+sealed calibration/holdout labels cannot be honestly auto-generated.
+
+```bash
+cd /mnt/KSA-Oasis/El-Mohammed/mango-comet
+git pull --ff-only origin main
+chmod +x server/vm_story_pipeline.sh
+server/vm_story_pipeline.sh launch .env.vm
+server/vm_story_pipeline.sh status .env.vm
+server/vm_story_pipeline.sh logs .env.vm
+```
+
+Both `.env.vm` and the generated `server/.env` are ignored by git. The manual
+commands below remain the authoritative stage-by-stage fallback and audit
+reference.
+
 The current historical files do not contain original ingestion timestamps, so
 the first build must use `reconstructed` availability and remains diagnostic.
 Operational monitoring must switch to `strict` after the upstream pipeline

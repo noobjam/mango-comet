@@ -1,0 +1,133 @@
+from pathlib import Path
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+SCRIPT = Path(__file__).with_name("vm_story_pipeline.sh")
+
+
+class VmStoryPipelineTests(unittest.TestCase):
+    def test_script_has_valid_bash_syntax_and_help_needs_no_env(self) -> None:
+        syntax = subprocess.run(
+            ["bash", "-n", str(SCRIPT)], capture_output=True, text=True, check=False
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        help_result = subprocess.run(
+            [str(SCRIPT), "--help"], capture_output=True, text=True, check=False
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("launch starts one detached, logged pipeline", help_result.stdout)
+        self.assertIn("mandatory review gate", help_result.stdout)
+
+    def test_missing_env_fails_before_any_pipeline_action(self) -> None:
+        result = subprocess.run(
+            [str(SCRIPT), "status", "/definitely/missing/.env.vm"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("environment file does not exist", result.stderr)
+
+    def test_status_reports_dead_process_without_requiring_source_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            repo = Path(temporary) / "repo"
+            logs = root / "logs"
+            logs.mkdir(parents=True)
+            repo.mkdir()
+            tag = "dead-job"
+            base = logs / f"vm_story_pipeline_{tag}"
+            (logs / "latest_vm_story_pipeline.txt").write_text(f"{tag}\n")
+            Path(f"{base}.pid").write_text("99999999\n")
+            Path(f"{base}.phase").write_text("PREFLIGHT\n")
+            Path(f"{base}.log").write_text("started\n")
+            env_file = Path(temporary) / ".env.vm"
+            env_file.write_text(
+                "\n".join(
+                    (
+                        f"ROOT={root}",
+                        f"REPO={repo}",
+                        f"PYTHON={sys.executable}",
+                        "MAP_HOST=127.0.0.1",
+                        "MAP_PORT=9",
+                    )
+                )
+                + "\n"
+            )
+            result = subprocess.run(
+                [str(SCRIPT), "status", str(env_file)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("STATUS=DEAD_WITHOUT_STATUS", result.stdout)
+            self.assertIn("PHASE=PREFLIGHT", result.stdout)
+
+    def test_v3_compatibility_uses_generation_schema_and_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            generation = Path(temporary) / "generation"
+            incident = Path(temporary) / "incident"
+            job = root / "jobs" / "incident_v3_fixture"
+            logs = root / "logs"
+            for path in (generation, incident, job, logs):
+                path.mkdir(parents=True, exist_ok=True)
+            (generation / "manifest.json").write_text(
+                json.dumps({"run": {"generation_id": "generation-fixture"}})
+            )
+            (incident / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "crop-impact-incident-generation-v3/1",
+                        "run": {
+                            "status": "complete",
+                            "source_generation_id": "generation-fixture",
+                        },
+                    }
+                )
+            )
+            (job / "status").write_text("0\n")
+            (job / "state.json").write_text(
+                json.dumps({"paths": {"incident_dir": str(incident)}})
+            )
+            (logs / "latest_incident_v3_job.txt").write_text(f"{job}\n")
+            env_file = Path(temporary) / ".env.vm"
+            env_file.write_text(
+                "\n".join(
+                    (
+                        f"ROOT={root}",
+                        f"PYTHON={sys.executable}",
+                        f"GEN={generation}",
+                    )
+                )
+                + "\n"
+            )
+            compatible = subprocess.run(
+                [str(SCRIPT), "check-v3", str(env_file)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(compatible.returncode, 0, compatible.stderr)
+            self.assertIn(f"INCIDENT_DIR={incident}", compatible.stdout)
+
+            manifest = json.loads((generation / "manifest.json").read_text())
+            manifest["run"]["generation_id"] = "different-generation"
+            (generation / "manifest.json").write_text(json.dumps(manifest))
+            mismatch = subprocess.run(
+                [str(SCRIPT), "check-v3", str(env_file)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(mismatch.returncode, 2)
+            self.assertIn("no successful V3 release matches GEN", mismatch.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
