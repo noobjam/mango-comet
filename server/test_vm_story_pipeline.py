@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -127,6 +128,22 @@ class VmStoryPipelineTests(unittest.TestCase):
             )
             self.assertEqual(mismatch.returncode, 2)
             self.assertIn("no successful V3 release matches GEN", mismatch.stderr)
+
+    def test_explicit_node_path_is_validated(self) -> None:
+        node = shutil.which("node")
+        self.assertIsNotNone(node)
+        with tempfile.TemporaryDirectory() as temporary:
+            env_file = Path(temporary) / ".env.vm"
+            env_file.write_text(f"NODE={node}\n")
+            result = subprocess.run(
+                [str(SCRIPT), "check-node", str(env_file)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"NODE={node}", result.stdout)
+            self.assertRegex(result.stdout, r"NODE_VERSION=v\d+")
 
 
 if __name__ == "__main__":

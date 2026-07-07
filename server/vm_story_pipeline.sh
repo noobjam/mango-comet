@@ -11,6 +11,7 @@ Usage:
   server/vm_story_pipeline.sh launch [ENV_FILE]
   server/vm_story_pipeline.sh status [ENV_FILE]
   server/vm_story_pipeline.sh logs [ENV_FILE]
+  server/vm_story_pipeline.sh check-node [ENV_FILE]
   server/vm_story_pipeline.sh check-v3 [ENV_FILE]
   server/vm_story_pipeline.sh stop-server [ENV_FILE]
 
@@ -102,7 +103,7 @@ stop_managed_server() {
 
 preflight() {
   for name in \
-    REPO PYTHON ROOT GEN ECHO FULL_2025 FULL_2026 ACQ_2026 \
+    REPO PYTHON NODE ROOT GEN ECHO FULL_2025 FULL_2026 ACQ_2026 \
     BUILD_V3_IF_MISSING V3_BASELINE_THROUGH \
     AVAILABILITY_MODE V4_FIRST_RELEASE REPLACE_MANAGED_SERVER \
     DUCKDB_THREADS DUCKDB_MEMORY_LIMIT HEARTBEAT_SECONDS \
@@ -116,11 +117,15 @@ preflight() {
   require_dir REPO
   require_dir ROOT
   require_file PYTHON
+  require_file NODE
   require_file ECHO
   require_file FULL_2025
   require_file FULL_2026
   require_file ACQ_2026
   [[ -x "$PYTHON" ]] || fail "PYTHON is not executable: $PYTHON"
+  [[ -x "$NODE" ]] || fail "NODE is not executable: $NODE"
+  [[ "$("$NODE" --version 2>/dev/null || true)" == v* ]] || \
+    fail "NODE does not point to a working Node.js executable: $NODE"
   [[ -f "$GEN/manifest.json" ]] || fail "generation manifest is missing: $GEN/manifest.json"
   [[ "$AVAILABILITY_MODE" == reconstructed || "$AVAILABILITY_MODE" == strict ]] || \
     fail "AVAILABILITY_MODE must be reconstructed or strict"
@@ -148,7 +153,6 @@ preflight() {
     [[ -x "$RAPIDS_PYTHON" ]] || fail "RAPIDS_PYTHON is not executable"
   fi
   command -v git >/dev/null || fail "git is not available"
-  command -v node >/dev/null || fail "node is not available"
   command -v curl >/dev/null || fail "curl is not available"
   command -v flock >/dev/null || fail "flock is not available"
   cd "$REPO"
@@ -192,6 +196,7 @@ ensure_v3_incident_dir() {
     --root "$ROOT" \
     --generation-dir "$GEN" \
     --python "$PYTHON" \
+    --node "$NODE" \
     --baseline-through "$V3_BASELINE_THROUGH" \
     --first-release \
     --threads "$DUCKDB_THREADS" \
@@ -376,6 +381,7 @@ run_pipeline() {
     --released-at "$released_at" \
     "${release_args[@]}" \
     --python "$PYTHON" \
+    --node "$NODE" \
     --threads "$DUCKDB_THREADS" \
     --memory-limit "$DUCKDB_MEMORY_LIMIT" \
     --temp-dir "$ROOT/duckdb_tmp" \
@@ -491,6 +497,13 @@ case "$command" in
     [[ -d "$ROOT" ]] || fail "ROOT does not exist: $ROOT"
     tag=$(latest_tag)
     tail -f "$(pipeline_base "$tag").log"
+    ;;
+  check-node)
+    require_value NODE
+    [[ -x "$NODE" ]] || fail "NODE is not executable: $NODE"
+    version=$("$NODE" --version 2>/dev/null || true)
+    [[ "$version" == v* ]] || fail "NODE is not a working Node.js executable: $NODE"
+    printf 'NODE=%s\nNODE_VERSION=%s\n' "$NODE" "$version"
     ;;
   check-v3)
     require_value ROOT

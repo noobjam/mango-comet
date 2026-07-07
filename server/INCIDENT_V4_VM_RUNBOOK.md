@@ -12,6 +12,9 @@ For this VM, prefer `server/vm_story_pipeline.sh`. It reads the gitignored
 matching V3 story spine when none exists, builds a fresh V4/2 release, validates
 it, writes the generated `server/.env`, starts the viewer, runs the latency
 benchmark, and optionally runs GPU motif discovery.
+`PYTHON`, `NODE`, and `RAPIDS_PYTHON` are explicit executable paths in that
+file, so reconnecting with a different shell `PATH` cannot silently select a
+different runtime.
 It deliberately stops at `AWAITING_MANDATORY_MOTIF_REVIEW`: expert review and
 sealed calibration/holdout labels cannot be honestly auto-generated.
 
