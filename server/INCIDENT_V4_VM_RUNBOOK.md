@@ -93,8 +93,8 @@ export REPLAY_JOB=$(cat "$ROOT/logs/latest_incident_story_replay_v4_job.txt")
 ```
 
 While the context stage is running, status includes
-`checkpoint_progress.context_replay.completed_partitions` and the expected
-partition count. The build log also records start/completion and elapsed time
+`checkpoint_progress.context_replay.completed_partitions` and the total
+nonempty partition count. The build log also records start/completion and elapsed time
 for every partition. Only numbered checkpoints with a complete `manifest.json`
 are reusable after interruption; status deliberately reports in-progress
 context partitions as `partial_work_reusable_on_resume=false`.

@@ -909,9 +909,16 @@ def _replay_checkpoint_progress(
     completed = len(
         list((root / "output" / "event_state_snapshots").glob("part-*.parquet"))
     )
+    actual_partitions = {
+        path.name
+        for ledger in ("crop", "pressure", "s2")
+        for path in (root / "input" / ledger).glob("replay_partition=*")
+        if path.is_dir()
+    }
     progress["context_replay"] = {
         "completed_partitions": completed,
-        "expected_partitions": expected_partitions,
+        "total_partitions": len(actual_partitions),
+        "configured_partitions": expected_partitions,
         "partial_work_reusable_on_resume": False,
     }
     return progress

@@ -46,6 +46,12 @@ class IncidentStoryReplayV4RunnerTests(unittest.TestCase):
                 / "event_state_snapshots"
             )
             output.mkdir(parents=True)
+            input_root = output.parents[1] / "input"
+            for ledger in ("crop", "pressure", "s2"):
+                for index in range(4):
+                    (input_root / ledger / f"replay_partition={index}").mkdir(
+                        parents=True
+                    )
             for index in range(3):
                 (output / f"part-{index:04d}.parquet").write_bytes(b"part")
 
@@ -57,7 +63,8 @@ class IncidentStoryReplayV4RunnerTests(unittest.TestCase):
                     "completed_stages": ["01_context"],
                     "context_replay": {
                         "completed_partitions": 3,
-                        "expected_partitions": 64,
+                        "total_partitions": 4,
+                        "configured_partitions": 64,
                         "partial_work_reusable_on_resume": False,
                     },
                 },
