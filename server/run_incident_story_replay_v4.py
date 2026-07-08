@@ -905,7 +905,7 @@ def _replay_checkpoint_progress(
     )
     if not roots:
         return progress
-    root = roots[-1]
+    root = max(roots, key=lambda path: path.stat().st_mtime_ns)
     completed = len(
         list((root / "output" / "event_state_snapshots").glob("part-*.parquet"))
     )
