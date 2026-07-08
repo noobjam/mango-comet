@@ -13,11 +13,14 @@ from unittest.mock import patch
 from run_incident_story_replay_v4 import (
     CHECKPOINT_SCHEMA_VERSION,
     FOCUSED_TESTS,
+    LIFECYCLE_ALGORITHM_REVISION,
+    LIFECYCLE_CHECKPOINT_NAME,
     REPLAY_MODE,
     REPLAY_SCHEMA_VERSION,
     _build_command,
     _execute,
     _export_command,
+    _implementation_sha256,
     _new_state,
     _paths,
     _require_native_viewer_manifest,
@@ -25,6 +28,7 @@ from run_incident_story_replay_v4 import (
     _run_build_stage,
     _validated_replay,
     _validated_source_adapter,
+    _verification_is_current,
     _verify_immutable_inputs,
     build_parser,
 )
@@ -32,6 +36,69 @@ from story_monitor.runner_process import RunnerError
 
 
 class IncidentStoryReplayV4RunnerTests(unittest.TestCase):
+    def test_verification_cache_is_bound_to_repository_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            server = repo / "server"
+            server.mkdir()
+            implementation = server / "workflow.py"
+            implementation.write_text("VALUE = 1\n")
+
+            first = _implementation_sha256(repo)
+            cache = server / "__pycache__"
+            cache.mkdir()
+            (cache / "workflow.pyc").write_bytes(b"ignored")
+            self.assertEqual(_implementation_sha256(repo), first)
+            state = {
+                "stages": {
+                    "python_tests": {
+                        "status": "complete",
+                        "implementation_sha256": first,
+                    }
+                }
+            }
+            self.assertTrue(
+                _verification_is_current(state, "python_tests", first)
+            )
+
+            implementation.write_text("VALUE = 2\n")
+            second = _implementation_sha256(repo)
+            self.assertNotEqual(second, first)
+            self.assertFalse(
+                _verification_is_current(state, "python_tests", second)
+            )
+
+    def test_status_marks_replaced_lifecycle_checkpoint_as_superseded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoints = Path(directory)
+            for name in ("06_scaffold", "07_lifecycle", "08_lifecycle_reconciled"):
+                path = checkpoints / name
+                path.mkdir()
+                (path / "manifest.json").write_text("{}")
+
+            self.assertEqual(
+                _replay_checkpoint_progress(checkpoints, expected_partitions=64),
+                {
+                    "completed_stages": [
+                        "06_scaffold",
+                        "08_lifecycle_reconciled",
+                    ],
+                    "superseded_stages": ["07_lifecycle"],
+                },
+            )
+            (
+                checkpoints
+                / "08_lifecycle_reconciled"
+                / "manifest.json"
+            ).unlink()
+            self.assertEqual(
+                _replay_checkpoint_progress(checkpoints, expected_partitions=64),
+                {
+                    "completed_stages": ["06_scaffold"],
+                    "superseded_stages": ["07_lifecycle"],
+                },
+            )
+
     def test_status_reports_context_partition_progress(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             checkpoints = Path(directory)
@@ -382,6 +449,15 @@ class IncidentStoryReplayV4RunnerTests(unittest.TestCase):
                         (audit / "incident_membership.parquet").read_bytes()
                     ).hexdigest(),
                 },
+                "semantics": {
+                    "lifecycle_algorithm_revision": LIFECYCLE_ALGORITHM_REVISION,
+                },
+                "checkpoints": {
+                    LIFECYCLE_CHECKPOINT_NAME: {
+                        "sha256": "checkpoint-sha",
+                        "size_bytes": 1,
+                    }
+                },
                 "validation": {
                     "passed": True,
                     "membership_counter_mismatch_count": 0,
@@ -408,6 +484,18 @@ class IncidentStoryReplayV4RunnerTests(unittest.TestCase):
                 }
             }
             self.assertEqual(_validated_replay(release, state)["status"], "valid")
+            manifest["semantics"]["lifecycle_algorithm_revision"] = "old"
+            (release / "manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "reconciled lifecycle"):
+                _validated_replay(release, state)
+            manifest["semantics"][
+                "lifecycle_algorithm_revision"
+            ] = LIFECYCLE_ALGORITHM_REVISION
+            (release / "manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
             (audit / "incident_membership.parquet").write_bytes(b"changed")
             with self.assertRaisesRegex(ValueError, "provenance"):
                 _validated_replay(release, state)

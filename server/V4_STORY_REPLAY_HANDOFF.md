@@ -4,12 +4,18 @@
 
 The requested separate path is now implemented in
 `story_monitor/incident_story_replay_v4.py` and
-`run_incident_story_replay_v4.py`. It uses seven immutable checkpoints, a
+`run_incident_story_replay_v4.py`. It uses seven active immutable checkpoints, a
 day-major multi-hazard V4 context adapter, an audit-only old-to-new crosswalk,
 and the native mode of `export_incident_viewer_v4.py`. The isolated VM entry
 point is `server/vm_story_pipeline.sh replay-v4 .env.vm`; it cannot reach the
 old evidence build, failed-job resume/continue path, server launch, benchmark,
 or motif training.
+
+Lifecycle publication uses `08_lifecycle_reconciled`. A job that already has
+the superseded `07_lifecycle` keeps it immutable for audit, reuses checkpoints
+01–06, and builds only checkpoint 08 before final publication.
+Completed verification stages are reused only when their repository-content
+fingerprint still matches, so a hotfix pull reruns tests without replaying data.
 
 This records implementation completion, not VM acceptance. The preserved
 evidence and failed job below have not been mutated. Run the new path and

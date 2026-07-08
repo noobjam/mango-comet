@@ -34,6 +34,10 @@ RUNNER_SCHEMA_VERSION = "incident-story-replay-v4-runner/1"
 REPLAY_SCHEMA_VERSION = "crop-impact-incident-story-replay-v4/1"
 REPLAY_MODE = "crop_incident_story_replay_v4"
 CHECKPOINT_SCHEMA_VERSION = "incident-story-replay-checkpoint-v4/2"
+LIFECYCLE_ALGORITHM_REVISION = (
+    "v4-native-lifecycle-routed-recovery-reconciliation-2026-07-08.1"
+)
+LIFECYCLE_CHECKPOINT_NAME = "08_lifecycle_reconciled"
 VIEWER_SCHEMA_VERSION = "crop-incident-viewer-v4/2"
 VIEWER_MODE = "crop_incident_v4_dual_clock"
 EVIDENCE_FILES = (
@@ -289,12 +293,66 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _implementation_sha256(repo_dir: Path) -> str:
+    """Bind cached verification stages to the executable repository content."""
+    repo = repo_dir.expanduser().resolve()
+    server = repo / "server"
+    suffixes = {
+        ".css",
+        ".html",
+        ".js",
+        ".json",
+        ".mjs",
+        ".py",
+        ".sh",
+        ".yaml",
+        ".yml",
+    }
+    files = sorted(
+        path
+        for path in server.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in suffixes
+        and "__pycache__" not in path.parts
+    )
+    if not files:
+        raise ValueError(f"Replay implementation inventory is empty: {server}")
+    digest = hashlib.sha256()
+    for path in files:
+        relative = path.relative_to(repo).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verification_is_current(
+    state: dict[str, Any], stage_name: str, implementation_sha256: str
+) -> bool:
+    stage = (state.get("stages") or {}).get(stage_name) or {}
+    return bool(
+        stage.get("status") == "complete"
+        and stage.get("implementation_sha256") == implementation_sha256
+    )
+
+
+def _bind_verification_revision(
+    state: dict[str, Any], stage_name: str, implementation_sha256: str
+) -> None:
+    state["stages"][stage_name]["implementation_sha256"] = implementation_sha256
+    _save(state)
+
+
 def _validated_replay(
     path: Path, state: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     manifest_path = path / "manifest.json"
     manifest = load_json(manifest_path)
     run = manifest.get("run") or {}
+    semantics = manifest.get("semantics") or {}
+    checkpoints = manifest.get("checkpoints") or {}
     validation = manifest.get("validation") or {}
     if manifest.get("schema_version") != REPLAY_SCHEMA_VERSION:
         raise ValueError("V4 replay schema_version does not match the runner")
@@ -306,6 +364,13 @@ def _validated_replay(
         raise ValueError("V4 replay final artifact validation did not pass")
     if int(validation.get("membership_counter_mismatch_count", -1)) != 0:
         raise ValueError("V4 replay membership counters do not reconcile")
+    if (
+        semantics.get("lifecycle_algorithm_revision")
+        != LIFECYCLE_ALGORITHM_REVISION
+        or LIFECYCLE_CHECKPOINT_NAME not in checkpoints
+        or "07_lifecycle" in checkpoints
+    ):
+        raise ValueError("V4 replay does not use the reconciled lifecycle checkpoint")
     row_counts = validation.get("row_counts") or {}
     if int(row_counts.get("incident_weekly_state", 0)) < 1:
         raise ValueError("V4 replay contains no incident weekly states")
@@ -619,7 +684,12 @@ def _execute(state: dict[str, Any], logger: logging.Logger) -> int:
                     _mark_stage_skipped(state, name, "--skip-tests")
         else:
             node = str(config["node"])
-            if state.get("stages", {}).get("python_tests", {}).get("status") != "complete":
+            implementation_sha256 = _implementation_sha256(
+                Path(config["repo_dir"])
+            )
+            if not _verification_is_current(
+                state, "python_tests", implementation_sha256
+            ):
                 _stage(
                     state,
                     logger,
@@ -629,7 +699,12 @@ def _execute(state: dict[str, Any], logger: logging.Logger) -> int:
                     "tests_stdout",
                     "tests_stderr",
                 )
-            if state.get("stages", {}).get("ui_tests", {}).get("status") != "complete":
+                _bind_verification_revision(
+                    state, "python_tests", implementation_sha256
+                )
+            if not _verification_is_current(
+                state, "ui_tests", implementation_sha256
+            ):
                 _stage(
                     state,
                     logger,
@@ -639,7 +714,12 @@ def _execute(state: dict[str, Any], logger: logging.Logger) -> int:
                     "ui_tests_stdout",
                     "ui_tests_stderr",
                 )
-            if state.get("stages", {}).get("ui_syntax", {}).get("status") != "complete":
+                _bind_verification_revision(
+                    state, "ui_tests", implementation_sha256
+                )
+            if not _verification_is_current(
+                state, "ui_syntax", implementation_sha256
+            ):
                 _stage(
                     state,
                     logger,
@@ -648,6 +728,9 @@ def _execute(state: dict[str, Any], logger: logging.Logger) -> int:
                     _node_syntax_command(node, Path(config["repo_dir"])),
                     "ui_syntax_stdout",
                     "ui_syntax_stderr",
+                )
+                _bind_verification_revision(
+                    state, "ui_syntax", implementation_sha256
                 )
 
         incident = Path(paths["incident_dir"])
@@ -895,7 +978,13 @@ def _replay_checkpoint_progress(
         for path in checkpoint_dir.glob("[0-9][0-9]_*/manifest.json")
         if path.is_file()
     )
+    superseded_stages: list[str] = []
+    if "07_lifecycle" in completed_stages:
+        completed_stages.remove("07_lifecycle")
+        superseded_stages.append("07_lifecycle")
     progress: dict[str, Any] = {"completed_stages": completed_stages}
+    if superseded_stages:
+        progress["superseded_stages"] = superseded_stages
     roots = sorted(
         path
         for path in checkpoint_dir.glob(

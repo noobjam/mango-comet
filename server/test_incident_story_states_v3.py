@@ -8,6 +8,7 @@ import unittest
 import pandas as pd
 
 from story_monitor.incident_story_states_v3 import (
+    _assert_unique_fresh_episode_owners,
     _augment_followup_memberships,
     _reconcile_direct_unresolved_claims,
     build_crop_story_artifacts,
@@ -1120,6 +1121,12 @@ class IncidentStoryStatesV3Tests(unittest.TestCase):
         self.assertEqual(
             edge.loc[fixture["new_incident"], "recovered_field_count"], 0
         )
+        self.assertEqual(
+            edge.loc[fixture["old_incident"], "fresh_recovery_field_count"], 1
+        )
+        self.assertEqual(
+            edge.loc[fixture["new_incident"], "fresh_recovery_field_count"], 0
+        )
         episode_rows = result.memberships[
             result.memberships["timeline_bucket"].eq(fixture["weeks"][1])
             & result.memberships["episode_id"].eq("episode-shared")
@@ -1136,6 +1143,42 @@ class IncidentStoryStatesV3Tests(unittest.TestCase):
                 (fixture["old_incident"], "recovered"),
             },
         )
+        episode_by_incident = episode_rows.set_index("incident_id")
+        source = episode_by_incident.loc[fixture["new_incident"]]
+        owner = episode_by_incident.loc[fixture["old_incident"]]
+        self.assertFalse(bool(source["fresh_response_evidence"]))
+        self.assertEqual(source["response_class"], "no_new_event_response")
+        self.assertTrue(bool(owner["fresh_response_evidence"]))
+        self.assertEqual(owner["response_class"], "recovery")
+        membership_recovery_counts = (
+            result.memberships[
+                result.memberships["fresh_response_evidence"].astype(bool)
+                & result.memberships["response_class"].eq("recovery")
+            ]
+            .groupby(["incident_id", "timeline_bucket"])["field_id"]
+            .nunique()
+        )
+        for incident_id in (fixture["old_incident"], fixture["new_incident"]):
+            self.assertEqual(
+                int(
+                    membership_recovery_counts.get(
+                        (incident_id, fixture["weeks"][1]), 0
+                    )
+                ),
+                int(edge.loc[incident_id, "fresh_recovery_field_count"]),
+            )
+        duplicate_owner = result.memberships.copy()
+        duplicate_mask = (
+            duplicate_owner["incident_id"].eq(fixture["new_incident"])
+            & duplicate_owner["timeline_bucket"].eq(fixture["weeks"][1])
+            & duplicate_owner["episode_id"].eq("episode-shared")
+        )
+        duplicate_owner.loc[duplicate_mask, "fresh_response_evidence"] = True
+        duplicate_owner.loc[duplicate_mask, "response_class"] = "recovery"
+        with self.assertRaisesRegex(
+            ValueError, "multiple crop-story owners"
+        ):
+            _assert_unique_fresh_episode_owners(duplicate_owner)
 
     def test_followup_uses_latest_causal_seed_independent_of_row_order(self) -> None:
         fixture = _unresolved_ownership_fixture("watch")

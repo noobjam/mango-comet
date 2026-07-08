@@ -61,6 +61,10 @@ CONTEXT_SCHEMA_VERSION = "incident-story-replay-context-v4/1"
 SOURCE_ADAPTER_SCHEMA_VERSION = "incident-story-replay-source-adapter-v4/1"
 MODE = "crop_incident_story_replay_v4"
 REPLAY_ALGORITHM_REVISION = "v4-native-story-replay-2026-07-07.4"
+LIFECYCLE_ALGORITHM_REVISION = (
+    "v4-native-lifecycle-routed-recovery-reconciliation-2026-07-08.1"
+)
+LIFECYCLE_CHECKPOINT_NAME = "08_lifecycle_reconciled"
 
 EVIDENCE_FILES = {
     "crop": "crop_day_context_v4.parquet",
@@ -226,10 +230,14 @@ def build_incident_story_replay_v4(
         ),
     )
     scaffold_inputs = {**exposure_inputs, "scaffold_checkpoint": _fingerprint(scaffold / "manifest.json")}
+    lifecycle_inputs = {
+        **scaffold_inputs,
+        "lifecycle_algorithm_revision": LIFECYCLE_ALGORITHM_REVISION,
+    }
     lifecycle = _checkpoint(
-        checkpoint_dir / "07_lifecycle",
-        stage_name="lifecycle",
-        inputs=scaffold_inputs,
+        checkpoint_dir / LIFECYCLE_CHECKPOINT_NAME,
+        stage_name="lifecycle_reconciled",
+        inputs=lifecycle_inputs,
         builder=lambda stage: _build_lifecycle_checkpoint(
             context,
             cells,
@@ -260,6 +268,15 @@ def build_incident_story_replay_v4(
         evidence_validation=evidence_validation,
         source_policy=source_policy,
         tracker_policy=tracker_policy,
+        active_checkpoints={
+            "01_context": context,
+            "02_baseline": baseline,
+            "03_cells": cells,
+            "04_components": components,
+            "05_exposures": exposures,
+            "06_scaffold": scaffold,
+            LIFECYCLE_CHECKPOINT_NAME: lifecycle,
+        },
     )
     manifest = _read_json(output_dir / "manifest.json")
     return {
@@ -954,6 +971,7 @@ def _publish_release(
     evidence_validation: dict[str, Any],
     source_policy: IncidentPolicyV4,
     tracker_policy: IncidentPolicyV3,
+    active_checkpoints: dict[str, Path],
 ) -> None:
     if output_dir.exists() or output_dir.is_symlink():
         raise FileExistsError(f"Immutable V4 replay output already exists: {output_dir}")
@@ -1002,10 +1020,26 @@ def _publish_release(
             compression="zstd",
         )
         validation = validate_final_artifact_directory(stage)
-        mismatch_count = _membership_counter_mismatches(stage)
+        mismatch_details = _membership_counter_mismatch_details(stage)
+        mismatch_count = _membership_counter_mismatch_count(mismatch_details)
         if mismatch_count:
+            metric_counts = ", ".join(
+                f"{metric}={count}"
+                for metric, count in mismatch_details["metric"]
+                .value_counts(sort=False)
+                .sort_index()
+                .items()
+            )
+            examples = "; ".join(
+                f"{row.incident_id}@{pd.Timestamp(row.timeline_bucket).date()}:"
+                f"{row.metric} weekly={row.weekly_count} membership={row.membership_count}"
+                for row in mismatch_details.head(6).itertuples(index=False)
+            )
             raise ValueError(
-                f"V4 replay weekly/member counter reconciliation has {mismatch_count} mismatches"
+                "V4 replay weekly/member counter reconciliation has "
+                f"{mismatch_count} mismatched incident-weeks across "
+                f"{len(mismatch_details)} counters; metrics[{metric_counts}]; "
+                f"examples[{examples}]"
             )
         artifact_names = sorted(path.name for path in stage.iterdir() if path.is_file())
         source_run = evidence_manifest.get("run") or {}
@@ -1018,6 +1052,7 @@ def _publish_release(
                 tracker_policy.source_sha256,
                 baseline_through,
                 REPLAY_ALGORITHM_REVISION,
+                LIFECYCLE_ALGORITHM_REVISION,
             ),
             length=20,
         )
@@ -1066,6 +1101,7 @@ def _publish_release(
                 "decision_identity_clock": "max_effective_and_knowledge_time",
                 "motif_models_reused": False,
                 "replay_algorithm_revision": REPLAY_ALGORITHM_REVISION,
+                "lifecycle_algorithm_revision": LIFECYCLE_ALGORITHM_REVISION,
             },
             "evidence_validation": evidence_validation,
             "validation": {
@@ -1078,12 +1114,23 @@ def _publish_release(
                 ),
             },
             "checkpoints": {
-                path.name: _fingerprint(path / "manifest.json")
-                for path in sorted(checkpoint_dir.iterdir())
-                if path.is_dir() and (path / "manifest.json").is_file()
+                name: _fingerprint(path / "manifest.json")
+                for name, path in sorted(active_checkpoints.items())
             },
             "artifacts": artifact_hashes(stage, artifact_names),
         }
+        superseded_lifecycle = checkpoint_dir / "07_lifecycle"
+        if (
+            superseded_lifecycle.is_dir()
+            and (superseded_lifecycle / "manifest.json").is_file()
+        ):
+            manifest["superseded_checkpoints"] = {
+                "07_lifecycle": {
+                    **_fingerprint(superseded_lifecycle / "manifest.json"),
+                    "reason": "routed_current_recovery_attribution_reconciled",
+                    "replacement": LIFECYCLE_CHECKPOINT_NAME,
+                }
+            }
         (stage / "manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -1231,11 +1278,20 @@ def _source_adapter_manifest(
     }
 
 
-def _membership_counter_mismatches(release: Path) -> int:
+def _membership_counter_mismatch_details(release: Path) -> pd.DataFrame:
     weekly = pd.read_parquet(release / "incident_weekly_state.parquet")
     memberships = pd.read_parquet(release / "incident_membership.parquet")
     if weekly.empty:
-        return 0
+        return pd.DataFrame(
+            columns=[
+                "incident_id",
+                "timeline_bucket",
+                "metric",
+                "weekly_count",
+                "membership_count",
+                "delta",
+            ]
+        )
     keys = ["incident_id", "timeline_bucket"]
     membership = memberships.copy()
     membership["timeline_bucket"] = pd.to_datetime(membership["timeline_bucket"]).dt.normalize()
@@ -1277,7 +1333,7 @@ def _membership_counter_mismatches(release: Path) -> int:
             ].nunique(),
         ),
     ).reset_index()
-    joined = weekly.merge(grouped, on=keys, how="left", validate="one_to_one").fillna(0)
+    joined = weekly.merge(grouped, on=keys, how="left", validate="one_to_one")
     pairs = (
         ("pressure_core_field_count", "membership_pressure_core_field_count"),
         ("severe_field_count", "membership_severe_field_count"),
@@ -1286,12 +1342,58 @@ def _membership_counter_mismatches(release: Path) -> int:
         ("fresh_decline_field_count", "membership_fresh_decline_field_count"),
         ("fresh_recovery_field_count", "membership_fresh_recovery_field_count"),
     )
-    mismatch = pd.Series(False, index=joined.index)
+    details: list[pd.DataFrame] = []
     for weekly_column, membership_column in pairs:
-        mismatch |= pd.to_numeric(joined[weekly_column], errors="coerce").fillna(0).astype(int).ne(
-            pd.to_numeric(joined[membership_column], errors="coerce").fillna(0).astype(int)
+        weekly_count = (
+            pd.to_numeric(joined[weekly_column], errors="coerce")
+            .fillna(0)
+            .astype(int)
         )
-    return int(mismatch.sum())
+        membership_count = (
+            pd.to_numeric(joined[membership_column], errors="coerce")
+            .fillna(0)
+            .astype(int)
+        )
+        mismatch = weekly_count.ne(membership_count)
+        if not mismatch.any():
+            continue
+        detail = joined.loc[mismatch, keys].copy()
+        detail["metric"] = weekly_column
+        detail["weekly_count"] = weekly_count.loc[mismatch].to_numpy()
+        detail["membership_count"] = membership_count.loc[mismatch].to_numpy()
+        detail["delta"] = (
+            detail["membership_count"] - detail["weekly_count"]
+        )
+        details.append(detail)
+    if not details:
+        return pd.DataFrame(
+            columns=[
+                *keys,
+                "metric",
+                "weekly_count",
+                "membership_count",
+                "delta",
+            ]
+        )
+    return pd.concat(details, ignore_index=True).sort_values(
+        [*keys, "metric"], kind="mergesort"
+    ).reset_index(drop=True)
+
+
+def _membership_counter_mismatch_count(details: pd.DataFrame) -> int:
+    if details.empty:
+        return 0
+    return int(
+        details[["incident_id", "timeline_bucket"]]
+        .drop_duplicates()
+        .shape[0]
+    )
+
+
+def _membership_counter_mismatches(release: Path) -> int:
+    return _membership_counter_mismatch_count(
+        _membership_counter_mismatch_details(release)
+    )
 
 
 def _audit_duplicate_membership_count(path: Path) -> int:

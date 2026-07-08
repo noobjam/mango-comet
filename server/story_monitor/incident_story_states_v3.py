@@ -493,6 +493,9 @@ def finalize_crop_story_artifacts(
     catalog_records: list[dict[str, Any]] = []
     carried_membership_records: list[dict[str, Any]] = []
     owned_followup_records: list[dict[str, Any]] = []
+    rerouted_current_recoveries: set[
+        tuple[str, pd.Timestamp, str, str, str]
+    ] = set()
     emitted_keys: set[tuple[str, pd.Timestamp]] = set()
     emitted_segment_by_base_week: dict[tuple[str, pd.Timestamp], str] = {}
     redirects: dict[tuple[str, tuple[str, str, str]], str] = {}
@@ -667,6 +670,9 @@ def finalize_crop_story_artifacts(
                     if owner == source:
                         registry_current_records[owner].append(row)
                     else:
+                        rerouted_current_recoveries.add(
+                            (source, week, *evidence_key)
+                        )
                         remapped = _current_recovery_as_followup(row, owner)
                         followup_key = (owner, evidence_key)
                         previous = owned_followup_by_key.get(followup_key)
@@ -958,8 +964,11 @@ def finalize_crop_story_artifacts(
         windows = _empty_windows()
     else:
         windows = windows.sort_values("incident_id", kind="mergesort").reset_index(drop=True)
+    routed_memberships = _neutralize_rerouted_current_recoveries(
+        scaffold.memberships, rerouted_current_recoveries
+    )
     memberships = _remap_incident_weeks(
-        scaffold.memberships, emitted_segment_by_base_week
+        routed_memberships, emitted_segment_by_base_week
     )
     owned_followup_frame = (
         pd.DataFrame(owned_followup_records, columns=followup.columns)
@@ -991,6 +1000,7 @@ def finalize_crop_story_artifacts(
             kind="mergesort",
         ).reset_index(drop=True)
         _assert_unique_membership_episode_owners(memberships)
+        _assert_unique_fresh_episode_owners(memberships)
     catalog = pd.DataFrame(catalog_records)
     if not catalog.empty and not memberships.empty:
         counts = memberships.groupby("incident_id", as_index=False, sort=False).agg(
@@ -1904,6 +1914,34 @@ def _assert_unique_membership_episode_owners(memberships: pd.DataFrame) -> None:
     )
 
 
+def _assert_unique_fresh_episode_owners(memberships: pd.DataFrame) -> None:
+    """Fail if one fresh response is attributed to multiple crop stories."""
+    fresh = memberships[
+        memberships["fresh_response_evidence"].fillna(False).astype(bool)
+    ].copy()
+    if fresh.empty:
+        return
+    key = [
+        "timeline_bucket",
+        "hazard_family",
+        "field_id",
+        "crop_instance_id",
+        "episode_id",
+    ]
+    conflicts = (
+        fresh.groupby(key, dropna=False, sort=True)["incident_id"]
+        .agg(lambda values: tuple(sorted(set(str(value) for value in values))))
+    )
+    conflicts = conflicts[conflicts.map(len) > 1]
+    if conflicts.empty:
+        return
+    evidence, owners = conflicts.index[0], conflicts.iloc[0]
+    raise ValueError(
+        "Fresh response evidence has multiple crop-story owners: "
+        f"evidence={evidence}, owners={','.join(owners)}"
+    )
+
+
 def _segment_start_evidence(current: pd.DataFrame) -> bool:
     if current.empty:
         return False
@@ -1956,6 +1994,72 @@ def _remap_incident_weeks(
     output = output[output["incident_id"].notna()].copy()
     output["timeline_bucket"] = weeks.loc[output.index]
     return output.reset_index(drop=True)
+
+
+def _neutralize_rerouted_current_recoveries(
+    memberships: pd.DataFrame,
+    rerouted: set[tuple[str, pd.Timestamp, str, str, str]],
+) -> pd.DataFrame:
+    """Keep source footprint context without publishing a second recovery claim."""
+    if not rerouted:
+        return memberships.copy()
+    output = memberships.copy().reset_index(drop=True)
+    key_columns = [
+        "incident_id",
+        "timeline_bucket",
+        "field_id",
+        "crop_instance_id",
+        "episode_id",
+    ]
+    missing = sorted(set(key_columns) - set(output.columns))
+    if missing:
+        raise ValueError(
+            "Cannot reconcile routed current recoveries; memberships are missing: "
+            + ", ".join(missing)
+        )
+    normalized = output.loc[:, key_columns].copy()
+    normalized["timeline_bucket"] = pd.to_datetime(
+        normalized["timeline_bucket"], errors="raise"
+    ).dt.normalize()
+    for name in (
+        "incident_id",
+        "field_id",
+        "crop_instance_id",
+        "episode_id",
+    ):
+        normalized[name] = normalized[name].astype(str)
+    membership_index = pd.MultiIndex.from_frame(normalized)
+    if not membership_index.is_unique:
+        raise ValueError(
+            "Cannot reconcile routed current recoveries against non-canonical memberships"
+        )
+    requested = pd.MultiIndex.from_tuples(
+        sorted(rerouted), names=key_columns
+    )
+    positions = membership_index.get_indexer(requested)
+    if (positions < 0).any():
+        missing_keys = [
+            requested[index]
+            for index, position in enumerate(positions)
+            if position < 0
+        ]
+        raise ValueError(
+            "Routed current recovery has no source membership: "
+            + repr(missing_keys[:3])
+        )
+    source_rows = output.iloc[positions]
+    is_fresh = source_rows["fresh_response_evidence"].fillna(False).astype(bool)
+    is_recovery = (
+        source_rows["response_class"].fillna("").astype(str).str.lower().eq("recovery")
+    )
+    if not bool((is_fresh & is_recovery).all()):
+        raise ValueError(
+            "Routed current recovery source is not canonical fresh recovery evidence"
+        )
+    source_indexes = output.index[positions]
+    output.loc[source_indexes, "fresh_response_evidence"] = False
+    output.loc[source_indexes, "response_class"] = "no_new_event_response"
+    return output
 
 
 def _evidence_key(row: Mapping[str, Any]) -> tuple[str, str, str]:

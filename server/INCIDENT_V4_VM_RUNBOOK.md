@@ -79,7 +79,7 @@ server/vm_story_pipeline.sh replay-v4-status .env.vm
 
 The wrapper does not prepare evidence, resume the old job, start a server, run
 benchmarks, or train motifs. The runner writes a fresh
-`jobs/incident_story_replay_v4_<tag>` job, seven stage checkpoints, a new
+`jobs/incident_story_replay_v4_<tag>` job, seven active stage checkpoints, a new
 `releases/incidents_v4_replay_<tag>` story release, an
 `old_to_new_incident_crosswalk.parquet`, and a native
 `releases/incident_viewer_v4_replay_<tag>` bundle. Resume only this new job:
@@ -98,6 +98,14 @@ nonempty partition count. The build log also records start/completion and elapse
 for every partition. Only numbered checkpoints with a complete `manifest.json`
 are reusable after interruption; status deliberately reports in-progress
 context partitions as `partial_work_reusable_on_resume=false`.
+
+The corrected lifecycle stage is `08_lifecycle_reconciled`. Jobs created before
+the routed-recovery attribution fix may also retain an immutable
+`07_lifecycle`; status reports it under `superseded_stages`, and resume reuses
+checkpoints 01–06 while building only checkpoint 08. The release manifest binds
+01–06 and 08 as active inputs and records 07 separately for audit.
+Verification stages are repository-content-bound, so pulling this correction
+reruns the focused Python/UI checks before the cached checkpoints are resumed.
 
 Status `0` means the final native viewer passed its server smoke gate and its
 lifecycle reconciliation has zero contradictions and zero membership-counter

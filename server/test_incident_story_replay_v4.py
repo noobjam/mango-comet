@@ -20,7 +20,11 @@ from story_monitor.incident_policy_v4 import load_incident_policy_v4
 from story_monitor.incident_release_v4 import CORRECTION_POLICY
 from story_monitor.incident_story_replay_v4 import (
     CHECKPOINT_SCHEMA_VERSION,
+    LIFECYCLE_ALGORITHM_REVISION,
+    LIFECYCLE_CHECKPOINT_NAME,
     SCHEMA_VERSION,
+    _membership_counter_mismatch_details,
+    _membership_counter_mismatches,
     _replay_partition_ids,
     build_incident_story_replay_v4,
 )
@@ -28,6 +32,47 @@ from story_monitor.incident_viewer_v4 import export_incident_viewer_v4
 
 
 class IncidentStoryReplayV4Tests(unittest.TestCase):
+    def test_counter_reconciliation_reports_metric_and_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            week = pd.Timestamp("2026-01-05")
+            pd.DataFrame(
+                [
+                    {
+                        "incident_id": "incident-source",
+                        "timeline_bucket": week,
+                        "pressure_core_field_count": 0,
+                        "severe_field_count": 0,
+                        "watch_frontier_field_count": 1,
+                        "impact_lag_field_count": 0,
+                        "fresh_decline_field_count": 0,
+                        "fresh_recovery_field_count": 0,
+                    }
+                ]
+            ).to_parquet(root / "incident_weekly_state.parquet", index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "incident_id": "incident-source",
+                        "timeline_bucket": week,
+                        "field_id": "field-1",
+                        "membership_role": "watch_frontier",
+                        "event_state": "RECOVERING",
+                        "fresh_response_evidence": True,
+                        "response_class": "recovery",
+                    }
+                ]
+            ).to_parquet(root / "incident_membership.parquet", index=False)
+
+            details = _membership_counter_mismatch_details(root)
+
+            self.assertEqual(_membership_counter_mismatches(root), 1)
+            self.assertEqual(len(details), 1)
+            self.assertEqual(details.iloc[0]["metric"], "fresh_recovery_field_count")
+            self.assertEqual(int(details.iloc[0]["weekly_count"]), 0)
+            self.assertEqual(int(details.iloc[0]["membership_count"]), 1)
+            self.assertEqual(int(details.iloc[0]["delta"]), 1)
+
     def test_partition_worklist_includes_orphan_pressure_and_s2_buckets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -103,13 +148,37 @@ class IncidentStoryReplayV4Tests(unittest.TestCase):
                     >= pd.to_datetime(member_max, utc=True)
                 ).all()
             )
-            for index in range(1, 8):
-                checkpoint = next(checkpoints.glob(f"{index:02d}_*"))
+            expected_checkpoints = {
+                "01_context": "context",
+                "02_baseline": "baseline",
+                "03_cells": "cells",
+                "04_components": "components",
+                "05_exposures": "exposures",
+                "06_scaffold": "scaffold",
+                LIFECYCLE_CHECKPOINT_NAME: "lifecycle_reconciled",
+            }
+            for name, stage in expected_checkpoints.items():
+                checkpoint = checkpoints / name
                 payload = json.loads((checkpoint / "manifest.json").read_text())
                 self.assertEqual(
                     payload["schema_version"], CHECKPOINT_SCHEMA_VERSION
                 )
                 self.assertEqual(payload["run"]["status"], "complete")
+                self.assertEqual(payload["stage"], stage)
+            lifecycle_manifest = json.loads(
+                (
+                    checkpoints
+                    / LIFECYCLE_CHECKPOINT_NAME
+                    / "manifest.json"
+                ).read_text()
+            )
+            self.assertEqual(
+                lifecycle_manifest["inputs"]["lifecycle_algorithm_revision"],
+                LIFECYCLE_ALGORITHM_REVISION,
+            )
+            self.assertEqual(
+                set(manifest["checkpoints"]), set(expected_checkpoints)
+            )
 
             viewer = root / "viewer-v4-native"
             viewer_result = export_incident_viewer_v4(
@@ -150,6 +219,10 @@ class IncidentStoryReplayV4Tests(unittest.TestCase):
                 "valid",
             )
 
+            shutil.move(
+                checkpoints / LIFECYCLE_CHECKPOINT_NAME,
+                checkpoints / "07_lifecycle",
+            )
             second_output = root / "incidents-v4-replay-copy"
             second = build_incident_story_replay_v4(
                 evidence,
@@ -164,6 +237,17 @@ class IncidentStoryReplayV4Tests(unittest.TestCase):
                 replay_partitions=2,
             )
             self.assertEqual(result["generation_id"], second["generation_id"])
+            second_manifest = json.loads(
+                (second_output / "manifest.json").read_text()
+            )
+            self.assertIn("07_lifecycle", second_manifest["superseded_checkpoints"])
+            self.assertEqual(
+                second_manifest["superseded_checkpoints"]["07_lifecycle"][
+                    "replacement"
+                ],
+                LIFECYCLE_CHECKPOINT_NAME,
+            )
+            self.assertNotIn("07_lifecycle", second_manifest["checkpoints"])
             pd.testing.assert_frame_equal(
                 pd.read_parquet(output / "incident_weekly_state.parquet"),
                 pd.read_parquet(second_output / "incident_weekly_state.parquet"),
