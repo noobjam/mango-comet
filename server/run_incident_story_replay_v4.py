@@ -863,7 +863,8 @@ def _pid_exists(pid: int) -> bool:
 
 
 def read_job_state(job_dir: Path) -> dict[str, Any]:
-    state = load_json(job_dir.expanduser().resolve() / "state.json")
+    resolved_job = job_dir.expanduser().resolve()
+    state = load_json(resolved_job / "state.json")
     active = state.get("active_process") or {}
     if state.get("status") != "running":
         state["liveness"] = "terminal"
@@ -873,7 +874,47 @@ def read_job_state(job_dir: Path) -> dict[str, Any]:
         state["liveness"] = "runner_alive"
     else:
         state["liveness"] = "stale"
+    checkpoint_dir = Path(
+        (state.get("paths") or {}).get("checkpoint_dir")
+        or resolved_job / "checkpoints"
+    )
+    state["checkpoint_progress"] = _replay_checkpoint_progress(
+        checkpoint_dir,
+        expected_partitions=int(
+            (state.get("config") or {}).get("replay_partitions") or 0
+        ),
+    )
     return state
+
+
+def _replay_checkpoint_progress(
+    checkpoint_dir: Path, *, expected_partitions: int
+) -> dict[str, Any]:
+    completed_stages = sorted(
+        path.parent.name
+        for path in checkpoint_dir.glob("[0-9][0-9]_*/manifest.json")
+        if path.is_file()
+    )
+    progress: dict[str, Any] = {"completed_stages": completed_stages}
+    roots = sorted(
+        path
+        for path in checkpoint_dir.glob(
+            ".01_context-*/01_context/.replay-partitions"
+        )
+        if path.is_dir()
+    )
+    if not roots:
+        return progress
+    root = roots[-1]
+    completed = len(
+        list((root / "output" / "event_state_snapshots").glob("part-*.parquet"))
+    )
+    progress["context_replay"] = {
+        "completed_partitions": completed,
+        "expected_partitions": expected_partitions,
+        "partial_work_reusable_on_resume": False,
+    }
+    return progress
 
 
 def _latest_job(root: Path) -> Path:

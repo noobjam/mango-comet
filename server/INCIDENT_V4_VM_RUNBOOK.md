@@ -79,7 +79,7 @@ server/vm_story_pipeline.sh replay-v4-status .env.vm
 
 The wrapper does not prepare evidence, resume the old job, start a server, run
 benchmarks, or train motifs. The runner writes a fresh
-`jobs/incident_story_replay_v4_<tag>` job, seven resumable checkpoints, a new
+`jobs/incident_story_replay_v4_<tag>` job, seven stage checkpoints, a new
 `releases/incidents_v4_replay_<tag>` story release, an
 `old_to_new_incident_crosswalk.parquet`, and a native
 `releases/incident_viewer_v4_replay_<tag>` bundle. Resume only this new job:
@@ -91,6 +91,13 @@ export REPLAY_JOB=$(cat "$ROOT/logs/latest_incident_story_replay_v4_job.txt")
 "$PYTHON" server/run_incident_story_replay_v4.py status \
   --job-dir "$REPLAY_JOB"
 ```
+
+While the context stage is running, status includes
+`checkpoint_progress.context_replay.completed_partitions` and the expected
+partition count. The build log also records start/completion and elapsed time
+for every partition. Only numbered checkpoints with a complete `manifest.json`
+are reusable after interruption; status deliberately reports in-progress
+context partitions as `partial_work_reusable_on_resume=false`.
 
 Status `0` means the final native viewer passed its server smoke gate and its
 lifecycle reconciliation has zero contradictions and zero membership-counter

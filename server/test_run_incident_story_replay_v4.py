@@ -21,6 +21,7 @@ from run_incident_story_replay_v4 import (
     _new_state,
     _paths,
     _require_native_viewer_manifest,
+    _replay_checkpoint_progress,
     _run_build_stage,
     _validated_replay,
     _validated_source_adapter,
@@ -31,6 +32,37 @@ from story_monitor.runner_process import RunnerError
 
 
 class IncidentStoryReplayV4RunnerTests(unittest.TestCase):
+    def test_status_reports_context_partition_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoints = Path(directory)
+            (checkpoints / "01_context").mkdir()
+            (checkpoints / "01_context" / "manifest.json").write_text("{}")
+            output = (
+                checkpoints
+                / ".01_context-work"
+                / "01_context"
+                / ".replay-partitions"
+                / "output"
+                / "event_state_snapshots"
+            )
+            output.mkdir(parents=True)
+            for index in range(3):
+                (output / f"part-{index:04d}.parquet").write_bytes(b"part")
+
+            self.assertEqual(
+                _replay_checkpoint_progress(
+                    checkpoints, expected_partitions=64
+                ),
+                {
+                    "completed_stages": ["01_context"],
+                    "context_replay": {
+                        "completed_partitions": 3,
+                        "expected_partitions": 64,
+                        "partial_work_reusable_on_resume": False,
+                    },
+                },
+            )
+
     def test_parser_paths_and_subprocess_commands_are_deterministic(self) -> None:
         args = build_parser().parse_args(
             [

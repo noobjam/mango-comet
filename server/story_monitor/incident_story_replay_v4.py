@@ -10,7 +10,9 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sys
 from tempfile import TemporaryDirectory
+import time
 from typing import Any, Callable, Iterator
 
 import duckdb
@@ -412,11 +414,17 @@ def _materialize_partitioned_replay(
     partition_ids = _replay_partition_ids(input_root)
     if not partition_ids:
         raise ValueError("V4 evidence contains no replay input partitions")
+    print(
+        f"V4 replay input partitioning complete: {len(partition_ids)} partitions",
+        file=sys.stderr,
+        flush=True,
+    )
     empty_inputs = {
         name: _empty_parquet_frame(evidence_dir / filename)
         for name, filename in EVIDENCE_FILES.items()
     }
-    for partition_id in partition_ids:
+    for position, partition_id in enumerate(partition_ids, start=1):
+        partition_started = time.monotonic()
         frames: dict[str, pd.DataFrame] = {}
         for name in EVIDENCE_FILES:
             directory = input_root / name / f"replay_partition={partition_id}"
@@ -425,6 +433,14 @@ def _materialize_partitioned_replay(
                 if directory.is_dir()
                 else empty_inputs[name].copy()
             )
+        print(
+            "V4 replay partition "
+            f"{position}/{len(partition_ids)} id={partition_id} started "
+            f"crop={len(frames['crop'])} pressure={len(frames['pressure'])} "
+            f"s2={len(frames['s2'])}",
+            file=sys.stderr,
+            flush=True,
+        )
         replay = replay_daily_episodes_v4(
             frames["crop"],
             frames["pressure"],
@@ -463,6 +479,13 @@ def _materialize_partitioned_replay(
         )
         for name in diagnostic_keys:
             diagnostics[name] += int(replay.diagnostics[name])
+        print(
+            "V4 replay partition "
+            f"{position}/{len(partition_ids)} id={partition_id} complete "
+            f"elapsed_seconds={time.monotonic() - partition_started:.1f}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     destinations = {
         "daily_episode_state": stage / "daily_episode_state_v4.parquet",

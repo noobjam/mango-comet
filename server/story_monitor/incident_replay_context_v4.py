@@ -129,6 +129,11 @@ def replay_daily_episodes_v4(
     pressures = _normalize_pressure(pressure, source_policy)
     responses, rejected_response_count = _normalize_responses(acquisitions)
     _validate_crop_ownership(crops, pressures, responses)
+    identity_salt = (
+        tracker_policy.identity_namespace,
+        _effective_policy_sha256(tracker_policy),
+        _effective_policy_sha256(source_policy),
+    )
 
     crop_lookup = _crop_lookup(crops)
     pressure_groups = {
@@ -155,8 +160,12 @@ def replay_daily_episodes_v4(
     quiet_close_days = int(tracker_policy.quiet_close_weeks) * 7
     for key in keys:
         field_id, crop_instance_id = (str(key[0]), str(key[1]))
-        group_pressure = pressure_groups.get(key, _empty_pressure())
-        group_responses = response_groups.get(key, _empty_responses())
+        group_pressure = pressure_groups.get(key)
+        if group_pressure is None:
+            group_pressure = pressures.iloc[0:0]
+        group_responses = response_groups.get(key)
+        if group_responses is None:
+            group_responses = responses.iloc[0:0]
         crop_history = crop_lookup.get(key)
         if crop_history is None or crop_history.empty:
             raise ValueError(
@@ -176,8 +185,7 @@ def replay_daily_episodes_v4(
             crop_history,
             group_pressure,
             group_responses,
-            source_policy=source_policy,
-            tracker_policy=tracker_policy,
+            identity_salt=identity_salt,
             quiet_close_days=quiet_close_days,
         )
         daily_rows.extend(group_daily)
@@ -211,8 +219,7 @@ def _replay_crop_instance(
     pressure: pd.DataFrame,
     responses: pd.DataFrame,
     *,
-    source_policy: IncidentPolicyV4,
-    tracker_policy: IncidentPolicyV3,
+    identity_salt: tuple[str, str, str],
     quiet_close_days: int,
 ) -> tuple[
     list[dict[str, Any]],
@@ -222,15 +229,18 @@ def _replay_crop_instance(
     int,
     int,
 ]:
-    pressure_by_day = {
-        pd.Timestamp(day).date(): group
-        for day, group in pressure.groupby("decision_date", sort=True)
-    }
-    responses_by_day = {
-        pd.Timestamp(day).date(): group
-        for day, group in responses.groupby("decision_date", sort=True)
-    }
+    pressure_by_day: dict[date, list[dict[str, Any]]] = defaultdict(list)
+    for row in pressure.to_dict("records"):
+        pressure_by_day[pd.Timestamp(row["decision_date"]).date()].append(row)
+    responses_by_day: dict[date, list[dict[str, Any]]] = defaultdict(list)
+    ordered_responses = responses.sort_values(
+        ["decision_date", "spectral_source_date", "knowledge_time", "acquisition_id"],
+        kind="mergesort",
+    )
+    for row in ordered_responses.to_dict("records"):
+        responses_by_day[pd.Timestamp(row["decision_date"]).date()].append(row)
     days = sorted(set(pressure_by_day) | set(responses_by_day))
+    crop_by_day = _crop_states_as_of(crop_history, days)
     histories: dict[str, deque[int]] = defaultdict(lambda: deque(maxlen=3))
     active: dict[str, _Runtime] = {}
     daily_rows: list[dict[str, Any]] = []
@@ -241,9 +251,9 @@ def _replay_crop_instance(
     ambiguous_recoveries = 0
 
     for decision_date in days:
-        pressure_day = pressure_by_day.get(decision_date, _empty_pressure())
-        response_day = responses_by_day.get(decision_date, _empty_responses())
-        crop = _crop_as_of(crop_history, decision_date)
+        pressure_rows = pressure_by_day.get(decision_date, [])
+        response_rows = responses_by_day.get(decision_date, [])
+        crop = crop_by_day.get(decision_date)
         if crop is None:
             raise ValueError(
                 "V4 replay would use crop ownership before it was knowable: "
@@ -251,16 +261,12 @@ def _replay_crop_instance(
             )
 
         lanes: dict[str, dict[str, Any]] = {}
-        for row in pressure_day.to_dict("records"):
+        for row in pressure_rows:
             hazard = str(row["hazard_family"])
             lanes[hazard] = row
             if bool(row["pressure_observed"]):
                 histories[hazard].append(int(row["pressure_rank"]))
 
-        response_rows = response_day.sort_values(
-            ["spectral_source_date", "knowledge_time", "acquisition_id"],
-            kind="mergesort",
-        ).to_dict("records")
         targeted: dict[str, list[dict[str, Any]]] = defaultdict(list)
         provisional = {
             hazard: (
@@ -319,9 +325,7 @@ def _replay_crop_instance(
             identity = stable_id(
                 "episode_v4",
                 (
-                    tracker_policy.identity_namespace,
-                    _effective_policy_sha256(tracker_policy),
-                    _effective_policy_sha256(source_policy),
+                    *identity_salt,
                     field_id,
                     crop_instance_id,
                     hazard,
@@ -810,16 +814,34 @@ def _crop_lookup(frame: pd.DataFrame) -> dict[tuple[str, str], pd.DataFrame]:
     return output
 
 
-def _crop_as_of(frame: pd.DataFrame, decision_date: date) -> dict[str, Any] | None:
-    eligible = frame[frame["decision_date"].dt.date <= decision_date]
-    if eligible.empty:
-        return None
-    # Arrival order controls when a row becomes eligible, but once eligible the
-    # latest effective crop observation remains authoritative.  A late-arriving
-    # older row must not roll a known crop stage backward.
-    return eligible.sort_values(
-        ["observation_date", "knowledge_time"], kind="mergesort"
-    ).iloc[-1].to_dict()
+def _crop_states_as_of(
+    frame: pd.DataFrame, decision_dates: list[date]
+) -> dict[date, dict[str, Any]]:
+    """Select latest-effective known crop rows in one linear arrival scan."""
+    arrivals = frame.sort_values(
+        ["decision_date", "observation_date", "knowledge_time"],
+        kind="mergesort",
+    ).to_dict("records")
+    states: dict[date, dict[str, Any]] = {}
+    best: dict[str, Any] | None = None
+    best_key: tuple[int, int] | None = None
+    index = 0
+    for decision_date in decision_dates:
+        while index < len(arrivals):
+            candidate = arrivals[index]
+            if pd.Timestamp(candidate["decision_date"]).date() > decision_date:
+                break
+            candidate_key = (
+                pd.Timestamp(candidate["observation_date"]).value,
+                pd.Timestamp(candidate["knowledge_time"]).value,
+            )
+            if best_key is None or candidate_key > best_key:
+                best = candidate
+                best_key = candidate_key
+            index += 1
+        if best is not None:
+            states[decision_date] = best
+    return states
 
 
 def _representative_response(
@@ -925,14 +947,6 @@ def _validate_replay_outputs(
         invalid_missing = missing_weather & daily["pressure_rank"].notna()
         if invalid_missing.any():
             raise ValueError("Missing V4 pressure was converted to a zero pressure rank")
-
-
-def _empty_pressure() -> pd.DataFrame:
-    return pd.DataFrame(columns=list(_PRESSURE_COLUMNS | {"decision_date"}))
-
-
-def _empty_responses() -> pd.DataFrame:
-    return pd.DataFrame(columns=list(_S2_COLUMNS | {"decision_date"}))
 
 
 _DAILY_COLUMNS = (
