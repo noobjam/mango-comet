@@ -28,9 +28,11 @@ in [`FIELD_STORIES_V1.md`](FIELD_STORIES_V1.md). It composes concurrent and
 sequential V4 hazard lanes into one fixed-location field/crop concern interval,
 without clustering or machine learning. It is executable and canonically
 tested, and `run_field_stories_v1.py` can publish a standalone immutable Parquet
-release from completed V4 evidence. It is not yet wired into the viewer; V4
-remains the promoted operational contract until that integration is designed
-and validated.
+release from completed V4 evidence. On the VM,
+`vm_field_stories_v1.sh run` updates the checkout and launches that release as
+one detached, logged command. It is not yet wired into the viewer; V4 remains
+the promoted operational contract until that integration is designed and
+validated.
 
 ## Crop-impact Incident V3 foundation
 

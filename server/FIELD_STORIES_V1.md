@@ -98,37 +98,32 @@ hash-partitions all three ledgers once by field/crop ownership, composes each
 partition, and atomically publishes four globally sorted Parquet artifacts plus
 a hash-bound `manifest.json`. Existing output directories are never replaced.
 
-On the current VM, the gitignored `.env.vm` already provides the repository,
-Python, evidence, run-root, partition, and DuckDB settings used below:
+On the current VM, the gitignored `.env.vm` provides the repository, Python,
+evidence, run-root, partition, and DuckDB settings. Pull once to install the
+wrapper:
 
 ```bash
 cd /mnt/KSA-Oasis/El-Mohammed/mango-comet
 git pull --ff-only origin main
-
-set -a
-source .env.vm
-set +a
-
-: "${PYTHON:?missing PYTHON in .env.vm}"
-: "${ROOT:?missing ROOT in .env.vm}"
-: "${V4_EVIDENCE_DIR:?missing V4_EVIDENCE_DIR in .env.vm}"
-
-export FIELD_STORY_TAG=$(date -u +%Y%m%dT%H%M%SZ)
-export FIELD_STORY_DIR="$ROOT/releases/field_stories_v1_$FIELD_STORY_TAG"
-
-"$PYTHON" server/run_field_stories_v1.py \
-  --evidence-dir "$V4_EVIDENCE_DIR" \
-  --output-dir "$FIELD_STORY_DIR" \
-  --partitions "${V4_REPLAY_PARTITIONS:-64}" \
-  --threads "${DUCKDB_THREADS:-8}" \
-  --memory-limit "${DUCKDB_MEMORY_LIMIT:-32GB}" \
-  --temp-dir "$ROOT/duckdb_tmp"
-
-test -f "$FIELD_STORY_DIR/manifest.json"
-"$PYTHON" -c \
-  'import json,sys; m=json.load(open(sys.argv[1])); assert m["status"] == "complete"; print(json.dumps(m["artifacts"], indent=2, sort_keys=True))' \
-  "$FIELD_STORY_DIR/manifest.json"
 ```
+
+After that, every new release is one command. `run` pulls `origin/main`, restarts
+the updated wrapper, performs preflight checks, and launches the build under
+`nohup` with durable PID, status, log, and output pointers:
+
+```bash
+server/vm_field_stories_v1.sh run
+```
+
+Inspect it without reconstructing paths:
+
+```bash
+server/vm_field_stories_v1.sh status
+server/vm_field_stories_v1.sh logs
+```
+
+Pass an explicit environment file after the action only when it is not the
+default repository `.env.vm`.
 
 The release is intentionally not a viewer bundle. Do not point
 `STORY_MAP_RUN_DIR` at it.
@@ -154,7 +149,10 @@ Run the canonical deterministic cases:
 
 ```bash
 cd server
-python -m unittest -v test_field_stories_v1.py
+python -m unittest -v \
+  test_field_stories_v1.py \
+  test_run_field_stories_v1.py \
+  test_vm_field_stories_v1.py
 ```
 
 The suite covers concurrent and sequential hazards, stage changes, complete
