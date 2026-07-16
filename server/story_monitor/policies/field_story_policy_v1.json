@@ -1,0 +1,17 @@
+{
+  "policy_schema_version": "field-story-policy-v1/1",
+  "policy_version": "field-story-v1.0.0-uncalibrated",
+  "calibration_status": "STARTER_THRESHOLDS_UNCALIBRATED_REQUIRES_AGRONOMIST_VALIDATION",
+  "description": "Deterministic multi-hazard field/crop story rules. These thresholds are provisional operating choices, not biological constants.",
+  "confirmation": {
+    "window_observed_days": 3,
+    "minimum_elevated_days": 2,
+    "severe_pressure_rank": 4
+  },
+  "closure": {
+    "quiet_observed_days": 7,
+    "candidate_expiry_observed_days": 3,
+    "maximum_data_gap_days": 7,
+    "maximum_recovery_observed_days": 28
+  }
+}

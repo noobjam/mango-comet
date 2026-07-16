@@ -23,6 +23,15 @@ Learned motifs are a separate immutable diagnostic workflow: they cannot change
 story identity and cannot appear as approved labels without expert review,
 calibration, and sealed holdout replay.
 
+The repository also contains an isolated deterministic field-story foundation
+in [`FIELD_STORIES_V1.md`](FIELD_STORIES_V1.md). It composes concurrent and
+sequential V4 hazard lanes into one fixed-location field/crop concern interval,
+without clustering or machine learning. It is executable and canonically
+tested, and `run_field_stories_v1.py` can publish a standalone immutable Parquet
+release from completed V4 evidence. It is not yet wired into the viewer; V4
+remains the promoted operational contract until that integration is designed
+and validated.
+
 ## Crop-impact Incident V3 foundation
 
 [`CROP_INCIDENT_STORIES_V3.md`](CROP_INCIDENT_STORIES_V3.md) is the current
